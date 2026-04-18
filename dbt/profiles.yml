@@ -1,0 +1,12 @@
+dbt_profile:
+  outputs:
+    prod:
+      type: postgres
+      host: "{{ env_var('DBT_POSTGRES_HOST') }}"
+      user: "{{ env_var('DBT_POSTGRES_USER') }}"
+      pass: "{{ env_var('DBT_POSTGRES_PW') }}"
+      port: 5432
+      dbname: "{{ env_var('DBT_POSTGRES_DB') }}"
+      schema: analytics
+      threads: 4
+  target: prod

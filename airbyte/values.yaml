@@ -1,0 +1,12 @@
+global:
+  edition: community
+
+airbyte-keycloak:
+  enabled: true
+  extraEnvVars:
+    - name: KC_HTTP_RELATIVE_PATH
+      value: /auth
+    - name: KC_COOKIES_SAMESITE
+      value: lax
+    - name: KC_HTTPS_PORT
+      value: "8080"

@@ -1,0 +1,13 @@
+FROM python:3.9-slim
+
+# Install dependency untuk dbt dan postgres
+RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+
+# Install dbt-postgres
+RUN pip install --no-cache-dir dbt-postgres
+
+# Set working directory
+WORKDIR /usr/app/dbt
+
+# Jalankan dbt run sebagai default command
+CMD ["dbt", "run", "--profiles-dir", "."]

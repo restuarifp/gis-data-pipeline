@@ -1,0 +1,16 @@
+name: 'warehouse_profil_warga'
+version: '1.0.0'
+config-version: 2
+
+profile: 'dbt_profile'
+
+model-paths: ["models"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  warehouse_profil_warga:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: view

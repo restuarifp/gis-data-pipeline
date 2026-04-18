@@ -1,0 +1,32 @@
+# PostgreSQL data
+postgres-data/
+
+# Metabase data
+metabase-data/
+
+# DBT
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+
+# OnlyOffice (named volumes, but just in case)
+onlyoffice-data/
+onlyoffice-log/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Docker override files
+docker-compose.override.yml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
