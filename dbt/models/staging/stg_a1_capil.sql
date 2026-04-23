@@ -15,5 +15,6 @@ SELECT
     ) }},
     'A1' AS kantor_id
 FROM {{ source('raw', 'raw_a1') }} r
+WHERE r."No_" IS NOT NULL
 INNER JOIN latest_gen lg 
     ON r._airbyte_generation_id = lg.last_gen
