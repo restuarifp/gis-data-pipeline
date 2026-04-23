@@ -3,7 +3,16 @@ WITH latest_gen AS (
     FROM {{ source('raw', 'raw_a1') }}
 )
 SELECT
-    r.*,
+    {{ dbt_utils.star(
+        source('raw', 'raw_a1'),
+        except=[
+            'No_'
+            '_airbyte_raw_id',
+            '_airbyte_extracted_at',
+            '_airbyte_meta',
+            '_airbyte_generation_id',
+        ]
+    ) }},
     'A1' AS kantor_id
 FROM {{ source('raw', 'raw_a1') }} r
 INNER JOIN latest_gen lg 

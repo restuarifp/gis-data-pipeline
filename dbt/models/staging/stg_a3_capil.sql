@@ -7,9 +7,12 @@ SELECT
         source('raw', 'raw_a3'),
         except=[
             'No_'
+            '_airbyte_raw_id',
+            '_airbyte_extracted_at',
+            '_airbyte_meta',
+            '_airbyte_generation_id',
         ]
     ) }},
-    CAST(r."No_" AS NUMERIC),
     'A3' AS kantor_id
 FROM {{ source('raw', 'raw_a3') }} r
 INNER JOIN latest_gen lg 
