@@ -7,3 +7,15 @@ sources:
     tables:
       - name: raw_a1
       - name: raw_a2
+      - name: raw_a3
+      - name: raw_b1
+      - name: raw_b2
+      - name: raw_b3
+      - name: raw_b4
+      - name: raw_b5
+      - name: raw_c1
+      - name: raw_c2
+      - name: raw_c3
+      - name: raw_c4
+      - name: raw_c5
+      - name: raw_c6
