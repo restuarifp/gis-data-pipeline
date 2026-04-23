@@ -6,7 +6,7 @@ SELECT
     {{ dbt_utils.star(
         source('raw', 'raw_b5'),
         except=[
-            'No_'
+            'No_',
             '_airbyte_raw_id',
             '_airbyte_extracted_at',
             '_airbyte_meta',
