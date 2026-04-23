@@ -17,3 +17,4 @@ SELECT
 FROM {{ source('raw', 'raw_c4') }} r
 INNER JOIN latest_gen lg 
     ON r._airbyte_generation_id = lg.last_gen
+WHERE r."K" IS NOT NULL
