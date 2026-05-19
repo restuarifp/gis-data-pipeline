@@ -14,6 +14,8 @@ SELECT
             'Alamat_Negara',
             'Alamat_Kabupaten',
             'Alamat_Kecamatan',
+            'Instansi_Pekerjaan',
+            'Nama_Lengkap',
         ]
     ) }},
     LOWER(r."Alamat_Negara") AS "Alamat_Negara",
