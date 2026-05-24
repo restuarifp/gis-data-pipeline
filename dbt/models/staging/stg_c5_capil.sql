@@ -11,8 +11,16 @@ SELECT
             '_airbyte_extracted_at',
             '_airbyte_meta',
             '_airbyte_generation_id',
+            'Alamat_Negara',
+            'Alamat_Kabupaten',
+            'Alamat_Kecamatan',
+            'Instansi_Pekerjaan',
+            'Nama_Lengkap',
         ]
     ) }},
+    LOWER(r."Alamat_Negara") AS "Alamat_Negara",
+    LOWER(r."Alamat_Kabupaten") AS "Alamat_Kabupaten",
+    LOWER(r."Alamat_Kecamatan") AS "Alamat_Kecamatan",
     'C5' AS kantor_id
 FROM {{ source('raw', 'raw_c5') }} r
 INNER JOIN latest_gen lg 
