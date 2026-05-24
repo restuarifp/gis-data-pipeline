@@ -68,6 +68,10 @@ services:
     volumes:
       - oo_data:/var/www/onlyoffice/Data
       - oo_log:/var/log/onlyoffice
+      - oo_cache:/var/lib/onlyoffice
+      - oo_db:/var/lib/postgresql
+    networks:
+      - gisnet
 
 networks:
   gisnet:
@@ -76,3 +80,5 @@ networks:
 volumes:
   oo_data:
   oo_log:
+  oo_cache:
+  oo_db:
