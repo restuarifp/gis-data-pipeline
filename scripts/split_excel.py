@@ -136,6 +136,18 @@ def upload(folder: str, filename: str, content: bytes) -> None:
     resp.raise_for_status()
 
 
+def delete_file(folder: str, filename: str) -> None:
+    path = str(PurePosixPath(folder) / filename)
+    resp = SESSION.delete(_url(path))
+    if resp.status_code not in (200, 204, 404):
+        resp.raise_for_status()
+
+
+def list_xlsx_by_prefix(folder: str, prefix: str) -> list[str]:
+    """Kembalikan nama file .xlsx di folder yang diawali prefix tertentu."""
+    return [f for f in list_xlsx(folder) if f.startswith(prefix)]
+
+
 # ── Excel split ─────────────────────────────────────────────────────────────
 
 def _copy_sheet(src, dst) -> None:
@@ -212,6 +224,10 @@ def process_source(source_path: str) -> None:
 
     log.info("  Ditemukan %d file: %s", len(files), files)
 
+    # Kumpulkan semua hasil split ke memory dulu.
+    # Jika ada file yang gagal diproses, batalkan seluruh kantor ini
+    # daripada menghapus file lama lalu upload sebagian.
+    pending: dict[str, bytes] = {}  # {dest_filename: bytes}
     for filename in files:
         stem = filename[:-5]  # hapus .xlsx
         log.info("  Memproses: %s", filename)
@@ -219,14 +235,32 @@ def process_source(source_path: str) -> None:
             content = download(source_path, filename)
             sheets = split_workbook(content)
             log.info("    %d sheet: %s", len(sheets), list(sheets))
-
             for safe_sheet, sheet_bytes in sheets.items():
-                dest_name = f"{nama_kantor}__{stem}__{safe_sheet}.xlsx"
-                upload(DEST_PATH, dest_name, sheet_bytes)
-                log.info("    ✓ Upload: %s", dest_name)
-
+                pending[f"{nama_kantor}__{stem}__{safe_sheet}.xlsx"] = sheet_bytes
         except Exception as exc:
             log.error("    ✗ Gagal memproses %s: %s", filename, exc, exc_info=True)
+            log.error("  Batalkan upload untuk kantor %s", nama_kantor)
+            return
+
+    # Semua file berhasil di-split — hapus file lama di destination
+    prefix = f"{nama_kantor}__"
+    old_files = list_xlsx_by_prefix(DEST_PATH, prefix)
+    if old_files:
+        log.info("  Hapus %d file lama: %s", len(old_files), old_files)
+        for old_name in old_files:
+            try:
+                delete_file(DEST_PATH, old_name)
+                log.info("    🗑 Dihapus: %s", old_name)
+            except Exception as exc:
+                log.error("    ✗ Gagal hapus %s: %s", old_name, exc, exc_info=True)
+
+    # Upload file baru
+    for dest_name, sheet_bytes in pending.items():
+        try:
+            upload(DEST_PATH, dest_name, sheet_bytes)
+            log.info("    ✓ Upload: %s", dest_name)
+        except Exception as exc:
+            log.error("    ✗ Gagal upload %s: %s", dest_name, exc, exc_info=True)
 
 
 def run_once() -> None:
