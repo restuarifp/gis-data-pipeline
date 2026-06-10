@@ -62,11 +62,17 @@ _raw_sources = (
 if not _raw_sources:
     raise ValueError("Set NEXTCLOUD_SOURCE_PATHS (atau NEXTCLOUD_SOURCE_PATH) di .env")
 
+print(f"[split-excel] RAW SOURCE: {repr(_raw_sources)}", flush=True)
+
 SOURCE_PATHS: list[str] = [
     unquote(p.strip())
     for p in re.split(r"[,\n]", _raw_sources)
     if p.strip()
 ]
+
+print(f"[split-excel] PARSED {len(SOURCE_PATHS)} path(s):", flush=True)
+for i, p in enumerate(SOURCE_PATHS, 1):
+    print(f"[split-excel]   [{i}] {repr(p)}", flush=True)
 
 # Hanya ambil origin (scheme + host) dari NEXTCLOUD_URL,
 # menghindari dobel path jika user menyertakan /remote.php/... di URL.
