@@ -28,6 +28,7 @@ from pathlib import PurePosixPath
 import requests
 from dotenv import load_dotenv
 from openpyxl import load_workbook, Workbook
+from urllib.parse import urlparse
 
 load_dotenv()
 
@@ -50,10 +51,11 @@ SOURCE_PATH        = os.environ["NEXTCLOUD_SOURCE_PATH"]   # /Laporan/
 DEST_PATH          = os.environ["NEXTCLOUD_DEST_PATH"]     # /Laporan-Split/
 SCHEDULE_MINUTES   = int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "60"))
 
-WEBDAV_BASE = (
-    f"{NEXTCLOUD_URL.rstrip('/')}"
-    f"/remote.php/dav/files/{NEXTCLOUD_USER}"
-)
+# Hanya ambil origin (scheme + host) dari NEXTCLOUD_URL,
+# menghindari dobel path jika user menyertakan /remote.php/... di URL.
+_parsed = urlparse(NEXTCLOUD_URL)
+_origin = f"{_parsed.scheme}://{_parsed.netloc}"
+WEBDAV_BASE = f"{_origin}/remote.php/dav/files/{NEXTCLOUD_USER}"
 
 SESSION = requests.Session()
 SESSION.auth = (NEXTCLOUD_USER, NEXTCLOUD_PASSWORD)
@@ -62,7 +64,17 @@ SESSION.headers.update({"Content-Type": "application/xml; charset=utf-8"})
 # ── WebDAV helpers ─────────────────────────────────────────────────────────
 
 def _url(remote_path: str) -> str:
-    return f"{WEBDAV_BASE}/{remote_path.strip('/')}"
+    """
+    Bangun URL WebDAV lengkap.
+    Toleran terhadap path yang diawali /{username}/ (Nextcloud kadang
+    menampilkan path dalam format tersebut di UI) — prefix username
+    dibuang karena WEBDAV_BASE sudah menyertakannya.
+    """
+    normalized = remote_path.lstrip("/")
+    user_prefix = f"{NEXTCLOUD_USER}/"
+    if normalized.startswith(user_prefix):
+        normalized = normalized[len(user_prefix):]
+    return f"{WEBDAV_BASE}/{normalized}"
 
 
 def list_xlsx(folder: str) -> list[str]:
@@ -81,10 +93,8 @@ def list_xlsx(folder: str) -> list[str]:
     ns = {"d": "DAV:"}
     tree = ET.fromstring(resp.content)
 
-    # Bangun prefix href folder agar bisa difilter
-    folder_href = str(
-        PurePosixPath("/remote.php/dav/files") / NEXTCLOUD_USER / folder.strip("/")
-    )
+    # Gunakan _url() agar normalisasi username-prefix konsisten
+    folder_href = urlparse(_url(folder)).path.rstrip("/")
 
     results = []
     for node in tree.findall(".//d:response", ns):
