@@ -55,6 +55,17 @@ services:
     networks:
       - gisnet
 
+  split-excel:
+    build:
+      context: .
+      dockerfile: Dockerfile.split-excel
+    container_name: split_excel
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - gisnet
+
   onlyoffice-docs:
     image: onlyoffice/documentserver:9.3.1.1
     container_name: onlyoffice-docs

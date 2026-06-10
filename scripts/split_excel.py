@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""
+split_excel.py
+
+Mengambil file .xlsx dari folder sumber di Nextcloud (via WebDAV),
+memisahkan setiap sheet menjadi file tersendiri, lalu mengupload
+hasilnya ke folder tujuan agar bisa dibaca Airbyte per-sheet.
+
+Naming convention output:
+  laporan_kantor_A.xlsx  →  laporan_kantor_A__Sheet1.xlsx
+                             laporan_kantor_A__Sheet2.xlsx
+
+Mode:
+  python split_excel.py           -- jalankan sekali lalu keluar
+  python split_excel.py --watch   -- loop berkala (SCHEDULE_INTERVAL_MINUTES)
+"""
+
+import io
+import logging
+import os
+import re
+import sys
+import time
+import xml.etree.ElementTree as ET
+from copy import copy
+from pathlib import PurePosixPath
+
+import requests
+from dotenv import load_dotenv
+from openpyxl import load_workbook, Workbook
+
+load_dotenv()
+
+# ── Logging ────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+log = logging.getLogger(__name__)
+
+# ── Config ─────────────────────────────────────────────────────────────────
+
+NEXTCLOUD_URL      = os.environ["NEXTCLOUD_URL"]           # https://cloud.example.com
+NEXTCLOUD_USER     = os.environ["NEXTCLOUD_USER"]
+NEXTCLOUD_PASSWORD = os.environ["NEXTCLOUD_PASSWORD"]
+SOURCE_PATH        = os.environ["NEXTCLOUD_SOURCE_PATH"]   # /Laporan/
+DEST_PATH          = os.environ["NEXTCLOUD_DEST_PATH"]     # /Laporan-Split/
+SCHEDULE_MINUTES   = int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "60"))
+
+WEBDAV_BASE = (
+    f"{NEXTCLOUD_URL.rstrip('/')}"
+    f"/remote.php/dav/files/{NEXTCLOUD_USER}"
+)
+
+SESSION = requests.Session()
+SESSION.auth = (NEXTCLOUD_USER, NEXTCLOUD_PASSWORD)
+SESSION.headers.update({"Content-Type": "application/xml; charset=utf-8"})
+
+# ── WebDAV helpers ─────────────────────────────────────────────────────────
+
+def _url(remote_path: str) -> str:
+    return f"{WEBDAV_BASE}/{remote_path.strip('/')}"
+
+
+def list_xlsx(folder: str) -> list[str]:
+    """Kembalikan daftar nama file .xlsx di folder WebDAV (tidak rekursif)."""
+    resp = SESSION.request(
+        "PROPFIND",
+        _url(folder),
+        headers={"Depth": "1"},
+        data=b"""<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop><d:displayname/><d:resourcetype/></d:prop>
+</d:propfind>""",
+    )
+    resp.raise_for_status()
+
+    ns = {"d": "DAV:"}
+    tree = ET.fromstring(resp.content)
+
+    # Bangun prefix href folder agar bisa difilter
+    folder_href = str(
+        PurePosixPath("/remote.php/dav/files") / NEXTCLOUD_USER / folder.strip("/")
+    )
+
+    results = []
+    for node in tree.findall(".//d:response", ns):
+        href = (node.findtext("d:href", namespaces=ns) or "").rstrip("/")
+        name = href.split("/")[-1]
+        # Lewati folder itu sendiri dan entri non-.xlsx
+        if href.endswith(folder_href):
+            continue
+        if name.lower().endswith(".xlsx"):
+            results.append(name)
+    return results
+
+
+def download(folder: str, filename: str) -> bytes:
+    path = str(PurePosixPath(folder) / filename)
+    resp = SESSION.get(_url(path))
+    resp.raise_for_status()
+    return resp.content
+
+
+def ensure_folder(folder: str) -> None:
+    """Buat folder via MKCOL; abaikan jika sudah ada (405)."""
+    resp = SESSION.request("MKCOL", _url(folder))
+    if resp.status_code not in (201, 301, 405):
+        resp.raise_for_status()
+
+
+def upload(folder: str, filename: str, content: bytes) -> None:
+    path = str(PurePosixPath(folder) / filename)
+    resp = SESSION.put(_url(path), data=content)
+    resp.raise_for_status()
+
+
+# ── Excel split ─────────────────────────────────────────────────────────────
+
+def _copy_sheet(src, dst) -> None:
+    """Salin nilai sel, style dasar, lebar kolom, tinggi baris, dan merged cells."""
+    for row in src.iter_rows():
+        for cell in row:
+            dst_cell = dst.cell(row=cell.row, column=cell.column, value=cell.value)
+            if cell.has_style:
+                dst_cell.font           = copy(cell.font)
+                dst_cell.border         = copy(cell.border)
+                dst_cell.fill           = copy(cell.fill)
+                dst_cell.number_format  = cell.number_format
+                dst_cell.protection     = copy(cell.protection)
+                dst_cell.alignment      = copy(cell.alignment)
+
+    for col, dim in src.column_dimensions.items():
+        dst.column_dimensions[col].width = dim.width
+
+    for row_num, dim in src.row_dimensions.items():
+        dst.row_dimensions[row_num].height = dim.height
+
+    for merge in src.merged_cells.ranges:
+        dst.merge_cells(str(merge))
+
+
+def _safe_name(sheet_name: str) -> str:
+    """Ganti karakter tidak aman untuk nama file dengan underscore."""
+    return re.sub(r"[^\w\-]", "_", sheet_name).strip("_") or "Sheet"
+
+
+def split_workbook(content: bytes) -> dict[str, bytes]:
+    """
+    Pisahkan workbook per sheet.
+    Kembalikan dict: {safe_sheet_name: xlsx_bytes}
+    data_only=True agar formula diganti nilai tersimpan terakhir.
+    """
+    wb = load_workbook(io.BytesIO(content), data_only=True)
+    output: dict[str, bytes] = {}
+
+    for sheet_name in wb.sheetnames:
+        new_wb = Workbook()
+        new_ws = new_wb.active
+        new_ws.title = sheet_name
+        _copy_sheet(wb[sheet_name], new_ws)
+
+        buf = io.BytesIO()
+        new_wb.save(buf)
+        output[_safe_name(sheet_name)] = buf.getvalue()
+
+    return output
+
+
+# ── Proses utama ────────────────────────────────────────────────────────────
+
+def run_once() -> None:
+    log.info("=== Mulai run split-excel ===")
+    log.info("  Sumber : %s", SOURCE_PATH)
+    log.info("  Tujuan : %s", DEST_PATH)
+
+    try:
+        ensure_folder(DEST_PATH)
+    except Exception as exc:
+        log.error("Gagal memastikan folder tujuan ada: %s", exc)
+        return
+
+    try:
+        files = list_xlsx(SOURCE_PATH)
+    except Exception as exc:
+        log.error("Gagal membaca folder sumber: %s", exc)
+        return
+
+    if not files:
+        log.info("Tidak ada file .xlsx di folder sumber")
+        return
+
+    log.info("Ditemukan %d file: %s", len(files), files)
+
+    for filename in files:
+        stem = filename[:-5]  # hapus .xlsx
+        log.info("Memproses: %s", filename)
+        try:
+            content = download(SOURCE_PATH, filename)
+            sheets = split_workbook(content)
+            log.info("  %d sheet: %s", len(sheets), list(sheets))
+
+            for safe_sheet, sheet_bytes in sheets.items():
+                dest_name = f"{stem}__{safe_sheet}.xlsx"
+                upload(DEST_PATH, dest_name, sheet_bytes)
+                log.info("  ✓ Upload: %s", dest_name)
+
+        except Exception as exc:
+            log.error("  ✗ Gagal memproses %s: %s", filename, exc, exc_info=True)
+
+    log.info("=== Run selesai ===")
+
+
+def main() -> None:
+    if "--watch" in sys.argv:
+        log.info("Mode watch aktif, interval: %d menit", SCHEDULE_MINUTES)
+        while True:
+            run_once()
+            log.info("Tunggu %d menit...", SCHEDULE_MINUTES)
+            time.sleep(SCHEDULE_MINUTES * 60)
+    else:
+        run_once()
+
+
+if __name__ == "__main__":
+    main()
