@@ -7,8 +7,10 @@ memisahkan setiap sheet menjadi file tersendiri, lalu mengupload
 hasilnya ke folder tujuan agar bisa dibaca Airbyte per-sheet.
 
 Naming convention output:
-  laporan_kantor_A.xlsx  →  laporan_kantor_A__Sheet1.xlsx
-                             laporan_kantor_A__Sheet2.xlsx
+  source: /Uploads/Finance/kantorA/laporan.xlsx  (sheet: Pendapatan)
+  dest  : kantorA__laporan__Pendapatan.xlsx
+
+  nama_kantor diambil dari komponen terakhir path sumber.
 
 Mode:
   python split_excel.py           -- jalankan sekali lalu keluar
@@ -47,9 +49,15 @@ log = logging.getLogger(__name__)
 NEXTCLOUD_URL      = os.environ["NEXTCLOUD_URL"]           # https://cloud.example.com
 NEXTCLOUD_USER     = os.environ["NEXTCLOUD_USER"]
 NEXTCLOUD_PASSWORD = os.environ["NEXTCLOUD_PASSWORD"]
-SOURCE_PATH        = os.environ["NEXTCLOUD_SOURCE_PATH"]   # /Laporan/
 DEST_PATH          = os.environ["NEXTCLOUD_DEST_PATH"]     # /Laporan-Split/
 SCHEDULE_MINUTES   = int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "60"))
+
+# Daftar folder sumber, pisahkan dengan koma.
+# Nama kantor diambil dari komponen terakhir tiap path.
+# Contoh: /hood/Uploads/Finance/kantorA,/hood/Uploads/Finance/kantorB
+SOURCE_PATHS: list[str] = [
+    p.strip() for p in os.environ["NEXTCLOUD_SOURCE_PATHS"].split(",") if p.strip()
+]
 
 # Hanya ambil origin (scheme + host) dari NEXTCLOUD_URL,
 # menghindari dobel path jika user menyertakan /remote.php/... di URL.
@@ -182,10 +190,49 @@ def split_workbook(content: bytes) -> dict[str, bytes]:
 
 # ── Proses utama ────────────────────────────────────────────────────────────
 
+def _kantor_name(source_path: str) -> str:
+    """Ambil komponen terakhir path sebagai nama kantor."""
+    return source_path.rstrip("/").split("/")[-1]
+
+
+def process_source(source_path: str) -> None:
+    """Proses semua .xlsx di satu folder sumber."""
+    nama_kantor = _kantor_name(source_path)
+    log.info("── Sumber: %s  (kantor: %s)", source_path, nama_kantor)
+
+    try:
+        files = list_xlsx(source_path)
+    except Exception as exc:
+        log.error("  Gagal membaca folder: %s", exc)
+        return
+
+    if not files:
+        log.info("  Tidak ada file .xlsx")
+        return
+
+    log.info("  Ditemukan %d file: %s", len(files), files)
+
+    for filename in files:
+        stem = filename[:-5]  # hapus .xlsx
+        log.info("  Memproses: %s", filename)
+        try:
+            content = download(source_path, filename)
+            sheets = split_workbook(content)
+            log.info("    %d sheet: %s", len(sheets), list(sheets))
+
+            for safe_sheet, sheet_bytes in sheets.items():
+                dest_name = f"{nama_kantor}__{stem}__{safe_sheet}.xlsx"
+                upload(DEST_PATH, dest_name, sheet_bytes)
+                log.info("    ✓ Upload: %s", dest_name)
+
+        except Exception as exc:
+            log.error("    ✗ Gagal memproses %s: %s", filename, exc, exc_info=True)
+
+
 def run_once() -> None:
     log.info("=== Mulai run split-excel ===")
-    log.info("  Sumber : %s", SOURCE_PATH)
-    log.info("  Tujuan : %s", DEST_PATH)
+    log.info("  Sumber  : %s", SOURCE_PATHS)
+    log.info("  Tujuan  : %s", DEST_PATH)
 
     try:
         ensure_folder(DEST_PATH)
@@ -193,33 +240,8 @@ def run_once() -> None:
         log.error("Gagal memastikan folder tujuan ada: %s", exc)
         return
 
-    try:
-        files = list_xlsx(SOURCE_PATH)
-    except Exception as exc:
-        log.error("Gagal membaca folder sumber: %s", exc)
-        return
-
-    if not files:
-        log.info("Tidak ada file .xlsx di folder sumber")
-        return
-
-    log.info("Ditemukan %d file: %s", len(files), files)
-
-    for filename in files:
-        stem = filename[:-5]  # hapus .xlsx
-        log.info("Memproses: %s", filename)
-        try:
-            content = download(SOURCE_PATH, filename)
-            sheets = split_workbook(content)
-            log.info("  %d sheet: %s", len(sheets), list(sheets))
-
-            for safe_sheet, sheet_bytes in sheets.items():
-                dest_name = f"{stem}__{safe_sheet}.xlsx"
-                upload(DEST_PATH, dest_name, sheet_bytes)
-                log.info("  ✓ Upload: %s", dest_name)
-
-        except Exception as exc:
-            log.error("  ✗ Gagal memproses %s: %s", filename, exc, exc_info=True)
+    for source_path in SOURCE_PATHS:
+        process_source(source_path)
 
     log.info("=== Run selesai ===")
 
