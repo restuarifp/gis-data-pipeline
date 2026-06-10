@@ -30,7 +30,7 @@ from pathlib import PurePosixPath
 import requests
 from dotenv import load_dotenv
 from openpyxl import load_workbook, Workbook
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 load_dotenv()
 
@@ -49,14 +49,16 @@ log = logging.getLogger(__name__)
 NEXTCLOUD_URL      = os.environ["NEXTCLOUD_URL"]           # https://cloud.example.com
 NEXTCLOUD_USER     = os.environ["NEXTCLOUD_USER"]
 NEXTCLOUD_PASSWORD = os.environ["NEXTCLOUD_PASSWORD"]
-DEST_PATH          = os.environ["NEXTCLOUD_DEST_PATH"]     # /Laporan-Split/
+DEST_PATH          = unquote(os.environ["NEXTCLOUD_DEST_PATH"].strip())
 SCHEDULE_MINUTES   = int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "60"))
 
-# Daftar folder sumber, pisahkan dengan koma.
+# Daftar folder sumber — pisahkan dengan koma atau newline.
 # Nama kantor diambil dari komponen terakhir tiap path.
-# Contoh: /hood/Uploads/Finance/kantorA,/hood/Uploads/Finance/kantorB
+# unquote() menangani path URL-encoded (%20, dll.) dari Nextcloud UI.
 SOURCE_PATHS: list[str] = [
-    p.strip() for p in os.environ["NEXTCLOUD_SOURCE_PATHS"].split(",") if p.strip()
+    unquote(p.strip())
+    for p in re.split(r"[,\n]", os.environ["NEXTCLOUD_SOURCE_PATHS"])
+    if p.strip()
 ]
 
 # Hanya ambil origin (scheme + host) dari NEXTCLOUD_URL,
@@ -265,8 +267,10 @@ def process_source(source_path: str) -> None:
 
 def run_once() -> None:
     log.info("=== Mulai run split-excel ===")
-    log.info("  Sumber  : %s", SOURCE_PATHS)
     log.info("  Tujuan  : %s", DEST_PATH)
+    log.info("  Sumber  : %d folder", len(SOURCE_PATHS))
+    for i, p in enumerate(SOURCE_PATHS, 1):
+        log.info("    [%d] %s", i, p)
 
     try:
         ensure_folder(DEST_PATH)
