@@ -98,21 +98,43 @@ dbt/
 ├── dbt_project.yml
 ├── profiles.yml
 ├── packages.yml          # optional
+├── macros/
+│   └── finance_helpers.sql      # source_relation_exists() + stg_finance_rekap()/stg_finance_rincian() SQL generators
 └── models/
     ├── staging/
     │   ├── sources.yml
-    │   └── stg_<kantor_id>_capil.sql
+    │   ├── stg_<kantor_id>_capil.sql
+    │   └── finance/
+    │       ├── stg_<kantor_id>_finance_rekap.sql
+    │       └── stg_<kantor_id>_finance_rincian.sql
     └── marts/
-        └── mart_capil.sql
+        ├── mart_capil.sql
+        └── finance/
+            ├── mart_finance_rekap.sql
+            └── mart_finance_rincian.sql
 ```
 
-### Adding a new branch office (kantor perwakilan)
+### Adding a new branch office (kantor perwakilan) — capil
 
 1. Create a new Airbyte connection → destination table `raw_<kantor_id>`
 2. Add the table to `models/staging/sources.yml`
 3. Create `models/staging/stg_<kantor_id>_capil.sql` (copy existing, update source and `kantor_id`)
 4. Add `UNION ALL SELECT * FROM {{ ref('stg_<kantor_id>_capil') }}` to `models/marts/mart_capil.sql`
 5. Run `dbt run`
+
+### Adding a new branch office — finance
+
+Finance raw tables (`raw_<kantor_id>_finance_rekap` / `_rincian`) are synced by Airbyte per office and may not exist yet for offices that haven't run a sync. The staging models handle this gracefully via `source_relation_exists()` in `macros/finance_helpers.sql`: if the raw table is physically missing, the model falls back to an empty result set with the same columns/types instead of failing with "relation does not exist". This keeps `mart_finance_rekap`/`mart_finance_rincian` (a `UNION ALL` across every known office, same pattern as `mart_capil.sql`) always runnable, contributing 0 rows for offices without data yet.
+
+To onboard a new office once its Airbyte sync exists:
+
+1. Add `raw_<kantor_id>_finance_rekap` and `raw_<kantor_id>_finance_rincian` to `models/staging/sources.yml` under the `raw` source
+2. Create `models/staging/finance/stg_<kantor_id>_finance_rekap.sql` containing just `{{ stg_finance_rekap('<kantor_id>') }}`
+3. Create `models/staging/finance/stg_<kantor_id>_finance_rincian.sql` containing just `{{ stg_finance_rincian('<kantor_id>') }}`
+4. Add both to the `UNION ALL` lists in `models/marts/finance/mart_finance_rekap.sql` and `mart_finance_rincian.sql`
+5. Run `dbt run` — no need to wait for the Airbyte sync to land first; the model compiles either way
+
+If a future office's Excel template has different finance columns, update the column lists in both branches of `stg_finance_rekap`/`stg_finance_rincian` in `macros/finance_helpers.sql` (the "exists" and "missing" branches must always match column-for-column, or the `UNION ALL` in the mart breaks).
 
 ---
 
