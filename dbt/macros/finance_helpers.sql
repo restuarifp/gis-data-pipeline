@@ -5,22 +5,15 @@
     tabel fisiknya sama sekali (bukan cuma tabel kosong), jadi mereferensikan
     source() secara langsung akan gagal dengan "relation does not exist".
 
-    execute == False saat `dbt parse` / `dbt ls` (tidak ada koneksi DB) -> selalu
-    anggap tidak ada, supaya validasi offline tetap jalan tanpa DB.
+    adapter.get_relation() mengembalikan None saat execute==False (dbt parse/ls)
+    maupun saat tabel tidak ada, sehingga tidak perlu guard execute manual.
 #}
-    {% if execute %}
-        {% set query %}
-            select 1
-            from information_schema.tables
-            where table_schema = '{{ relation.schema }}'
-              and table_name = '{{ relation.identifier }}'
-            limit 1
-        {% endset %}
-        {% set results = run_query(query) %}
-        {{ return(results.rows | length > 0) }}
-    {% else %}
-        {{ return(false) }}
-    {% endif %}
+    {% set existing = adapter.get_relation(
+        database=relation.database,
+        schema=relation.schema,
+        identifier=relation.identifier
+    ) %}
+    {{ return(existing is not none) }}
 {% endmacro %}
 
 
@@ -65,54 +58,102 @@ WHERE FALSE
 #}
     {% set src = source('raw', 'raw_' ~ kantor_id ~ '_finance_rincian') %}
     {% if source_relation_exists(src) %}
+WITH latest_gen AS (
+    SELECT MAX(_airbyte_generation_id) AS last_gen
+    FROM {{ src }}
+)
 SELECT
     '{{ kantor_id | upper }}' AS kantor_id,
-    r."TUNAI" AS tunai,
-    r."WAJIB" AS wajib,
-    r."NOMINAL" AS nominal,
     r."INSTANSI" AS instansi,
-    r."TUNAI_FI" AS tunai_fi,
-    r."TUNAI_AQQ" AS tunai_aqq,
-    r."TUNAI_FDY" AS tunai_fdy,
+    r."JUMLAH_WARGA" AS jumlah_warga,
+
+    r."WAJIB_IFQ" AS wajib_ifq,
     r."TUNAI_IFQ" AS tunai_ifq,
-    r."TUNAI_LQT" AS tunai_lqt,
-    r."TUNAI_SDQ" AS tunai_sdq,
-    r."TUNAI_SNK" AS tunai_snk,
-    r."TUNAI_ZKT" AS tunai_zkt,
-    r."NOMINAL_FI" AS nominal_fi,
-    r."NOMINAL_AQQ" AS nominal_aqq,
-    r."NOMINAL_FDY" AS nominal_fdy,
     r."NOMINAL_IFQ" AS nominal_ifq,
+
+    r."WAJIB_FI" AS wajib_fi,
+    r."TUNAI_FI" AS tunai_fi,
+    r."NOMINAL_FI" AS nominal_fi,
+
+    r."WAJIB_AQQ" AS wajib_aqq,
+    r."TUNAI_AQQ" AS tunai_aqq,
+    r."NOMINAL_AQQ" AS nominal_aqq,
+
+    r."WAJIB_FDY" AS wajib_fdy,
+    r."TUNAI_FDY" AS tunai_fdy,
+    r."NOMINAL_FDY" AS nominal_fdy,
+
+    r."WAJIB_LQT" AS wajib_lqt,
+    r."TUNAI_LQT" AS tunai_lqt,
     r."NOMINAL_LQT" AS nominal_lqt,
+
+    r."WAJIB_SDQ" AS wajib_sdq,
+    r."TUNAI_SDQ" AS tunai_sdq,
     r."NOMINAL_SDQ" AS nominal_sdq,
+
+    r."WAJIB_SNK" AS wajib_snk,
+    r."TUNAI_SNK" AS tunai_snk,
+    r."NOMINAL_SNK" AS nominal_snk,
+
+    r."WAJIB_ZKT" AS wajib_zkt,
+    r."TUNAI_ZKT" AS tunai_zkt,
     r."NOMINAL_ZKT" AS nominal_zkt,
-    r."JUMLAH_WAJIB" AS jumlah_wajib,
-    r."JUMLAH_WARGA" AS jumlah_warga
+
+    r."WAJIB_ZM" AS wajib_zm,
+    r."TUNAI_ZM" AS tunai_zm,
+    r."NOMINAL_ZM" AS nominal_zm,
+
+    r."WAJIB_TDY" AS wajib_tdy,
+    r."TUNAI_TDY" AS tunai_tdy,
+    r."NOMINAL_TDY" AS nominal_tdy
 FROM {{ src }} r
+INNER JOIN latest_gen lg
+    ON r._airbyte_generation_id = lg.last_gen
     {% else %}
 SELECT
     '{{ kantor_id | upper }}'::varchar AS kantor_id,
-    NULL::varchar AS tunai,
-    NULL::varchar AS wajib,
-    NULL::varchar AS nominal,
     NULL::varchar AS instansi,
-    NULL::numeric AS tunai_fi,
-    NULL::numeric AS tunai_aqq,
-    NULL::numeric AS tunai_fdy,
+    NULL::numeric AS jumlah_warga,
+
+    NULL::numeric AS wajib_ifq,
     NULL::numeric AS tunai_ifq,
-    NULL::numeric AS tunai_lqt,
-    NULL::numeric AS tunai_sdq,
-    NULL::numeric AS tunai_snk,
-    NULL::numeric AS tunai_zkt,
-    NULL::numeric AS nominal_fi,
-    NULL::numeric AS nominal_aqq,
-    NULL::numeric AS nominal_fdy,
     NULL::numeric AS nominal_ifq,
+
+    NULL::numeric AS wajib_fi,
+    NULL::numeric AS tunai_fi,
+    NULL::numeric AS nominal_fi,
+
+    NULL::numeric AS wajib_aqq,
+    NULL::numeric AS tunai_aqq,
+    NULL::numeric AS nominal_aqq,
+
+    NULL::numeric AS wajib_fdy,
+    NULL::numeric AS tunai_fdy,
+    NULL::numeric AS nominal_fdy,
+
+    NULL::numeric AS wajib_lqt,
+    NULL::numeric AS tunai_lqt,
     NULL::numeric AS nominal_lqt,
+
+    NULL::numeric AS wajib_sdq,
+    NULL::numeric AS tunai_sdq,
     NULL::numeric AS nominal_sdq,
+
+    NULL::numeric AS wajib_snk,
+    NULL::numeric AS tunai_snk,
+    NULL::numeric AS nominal_snk,
+
+    NULL::numeric AS wajib_zkt,
+    NULL::numeric AS tunai_zkt,
     NULL::numeric AS nominal_zkt,
-    NULL::numeric AS jumlah_wajib,
-    NULL::numeric AS jumlah_warga
+
+    NULL::numeric AS wajib_zm,
+    NULL::numeric AS tunai_zm,
+    NULL::numeric AS nominal_zm,
+
+    NULL::numeric AS wajib_tdy,
+    NULL::numeric AS tunai_tdy,
+    NULL::numeric AS nominal_tdy
 WHERE FALSE
     {% endif %}
 {% endmacro %}
