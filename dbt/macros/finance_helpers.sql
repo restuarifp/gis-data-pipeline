@@ -99,9 +99,9 @@ SELECT
     r."TUNAI_ZKT" AS tunai_zkt,
     r."NOMINAL_ZKT" AS nominal_zkt,
 
-    r."WAJIB_ZM" AS wajib_zm,
-    r."TUNAI_ZM" AS tunai_zm,
-    r."NOMINAL_ZM" AS nominal_zm,
+    r."WAJIB_ZF" AS wajib_zf,
+    r."TUNAI_ZF" AS tunai_zf,
+    r."NOMINAL_ZF" AS nominal_zf,
 
     r."WAJIB_TDY" AS wajib_tdy,
     r."TUNAI_TDY" AS tunai_tdy,
