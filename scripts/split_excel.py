@@ -21,13 +21,11 @@ import io
 import logging
 import os
 import re
-import subprocess
 import sys
-import tempfile
 import time
 import xml.etree.ElementTree as ET
 from copy import copy
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 
 import requests
 from dotenv import load_dotenv
@@ -53,7 +51,11 @@ NEXTCLOUD_USER     = os.environ["NEXTCLOUD_USER"]
 NEXTCLOUD_PASSWORD = os.environ["NEXTCLOUD_PASSWORD"]
 DEST_PATH          = unquote(os.environ["NEXTCLOUD_DEST_PATH"].strip())
 SCHEDULE_MINUTES   = int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "60"))
-LIBREOFFICE_TIMEOUT_SECONDS = int(os.getenv("LIBREOFFICE_TIMEOUT_SECONDS", "120"))
+
+# Retry saat file tujuan terkunci (HTTP 423 Locked) — mis. OnlyOffice/klien lain
+# sedang memegang lock atas file di folder tujuan.
+WEBDAV_MAX_RETRIES           = int(os.getenv("WEBDAV_MAX_RETRIES", "5"))
+WEBDAV_RETRY_BACKOFF_SECONDS = float(os.getenv("WEBDAV_RETRY_BACKOFF_SECONDS", "3"))
 
 # Dukung kedua nama variabel (NEXTCLOUD_SOURCE_PATHS dan NEXTCLOUD_SOURCE_PATH).
 # Pisahkan dengan koma atau newline; unquote() handle path URL-encoded (%20, dll.).
@@ -148,15 +150,37 @@ def ensure_folder(folder: str) -> None:
         resp.raise_for_status()
 
 
+def _request_with_retry(method: str, url: str, **kwargs) -> requests.Response:
+    """
+    Jalankan request WebDAV, ulangi khusus saat 423 Locked dengan backoff linear.
+    Lock biasanya transient (OnlyOffice melepas setelah beberapa detik), jadi
+    retry singkat cukup untuk menembus jendela terkunci tanpa menyisakan file basi.
+    """
+    resp = None
+    for attempt in range(1, WEBDAV_MAX_RETRIES + 1):
+        resp = SESSION.request(method, url, **kwargs)
+        if resp.status_code != 423:
+            return resp
+        if attempt < WEBDAV_MAX_RETRIES:
+            wait = WEBDAV_RETRY_BACKOFF_SECONDS * attempt
+            log.warning(
+                "    ⏳ 423 Locked (%s), percobaan %d/%d — tunggu %.0fs: %s",
+                method, attempt, WEBDAV_MAX_RETRIES, wait, url,
+            )
+            time.sleep(wait)
+    return resp
+
+
 def upload(folder: str, filename: str, content: bytes) -> None:
+    """Upload/overwrite file via PUT (menimpa file lama tanpa perlu DELETE dulu)."""
     path = str(PurePosixPath(folder) / filename)
-    resp = SESSION.put(_url(path), data=content)
+    resp = _request_with_retry("PUT", _url(path), data=content)
     resp.raise_for_status()
 
 
 def delete_file(folder: str, filename: str) -> None:
     path = str(PurePosixPath(folder) / filename)
-    resp = SESSION.delete(_url(path))
+    resp = _request_with_retry("DELETE", _url(path))
     if resp.status_code not in (200, 204, 404):
         resp.raise_for_status()
 
@@ -166,66 +190,14 @@ def list_xlsx_by_prefix(folder: str, prefix: str) -> list[str]:
     return [f for f in list_xlsx(folder) if f.startswith(prefix)]
 
 
-# ── Excel recalculate ────────────────────────────────────────────────────────
-
-def recalculate_xlsx(content: bytes) -> bytes:
-    """
-    Buka workbook dengan LibreOffice headless lalu simpan ulang sebagai xlsx.
-    Ini memaksa semua formula dihitung ulang sehingga cached value-nya fresh,
-    sebelum dibaca dengan openpyxl data_only=True (yang hanya membaca cached
-    value, tidak pernah menghitung formula sendiri). Tanpa langkah ini,
-    perubahan pada file yang di-save tanpa recalculate penuh (mis. mode
-    kalkulasi manual) bisa menghasilkan data basi di hasil split.
-    """
-    with tempfile.TemporaryDirectory(prefix="split-excel-recalc-") as tmpdir:
-        src_dir = Path(tmpdir) / "src"
-        out_dir = Path(tmpdir) / "out"
-        profile_dir = Path(tmpdir) / "lo_profile"
-        src_dir.mkdir()
-        out_dir.mkdir()
-
-        src_path = src_dir / "input.xlsx"
-        src_path.write_bytes(content)
-
-        cmd = [
-            "soffice",
-            "--headless",
-            "--norestore",
-            "--nologo",
-            "--nofirststartwizard",
-            f"-env:UserInstallation=file://{profile_dir}",
-            "--convert-to", "xlsx",
-            "--outdir", str(out_dir),
-            str(src_path),
-        ]
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=LIBREOFFICE_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"LibreOffice timeout setelah {LIBREOFFICE_TIMEOUT_SECONDS}s"
-            ) from exc
-
-        out_path = out_dir / "input.xlsx"
-        if result.returncode != 0 or not out_path.exists():
-            stderr = result.stderr.decode(errors="replace")[:500]
-            raise RuntimeError(
-                f"LibreOffice gagal recalculate (rc={result.returncode}): {stderr}"
-            )
-
-        return out_path.read_bytes()
-
-
 # ── Excel split ─────────────────────────────────────────────────────────────
 
 def _copy_sheet(src, dst) -> list[str]:
     """
     Salin nilai sel, style dasar, lebar kolom, tinggi baris, dan merged cells.
     Kembalikan daftar koordinat sel yang masih berupa formula (bukan nilai) —
-    artinya cached value-nya tidak tersedia meski sudah di-recalculate.
+    artinya cached value-nya tidak tersedia (file di-save tanpa menyimpan hasil
+    hitung formula), sehingga tidak bisa disalin sebagai angka.
     """
     leftover_formulas: list[str] = []
     for row in src.iter_rows():
@@ -263,8 +235,7 @@ def split_workbook(content: bytes) -> dict[str, bytes]:
     """
     Pisahkan workbook per sheet.
     Kembalikan dict: {safe_sheet_name: xlsx_bytes}
-    data_only=True agar formula diganti nilai tersimpan terakhir (nilai yang
-    fresh, karena caller sudah memanggil recalculate_xlsx() terlebih dulu).
+    data_only=True agar formula diganti nilai tersimpan terakhir (cached value).
     """
     wb = load_workbook(io.BytesIO(content), data_only=True)
     output: dict[str, bytes] = {}
@@ -295,8 +266,11 @@ def _kantor_name(source_path: str) -> str:
     return source_path.rstrip("/").split("/")[-1]
 
 
-def process_source(source_path: str) -> None:
-    """Proses semua .xlsx di satu folder sumber."""
+def process_source(source_path: str) -> bool:
+    """
+    Proses semua .xlsx di satu folder sumber.
+    Kembalikan True jika semua sheet berhasil di-upload, False jika ada kegagalan.
+    """
     nama_kantor = _kantor_name(source_path)
     log.info("── Sumber: %s  (kantor: %s)", source_path, nama_kantor)
 
@@ -304,11 +278,11 @@ def process_source(source_path: str) -> None:
         files = list_xlsx(source_path)
     except Exception as exc:
         log.error("  Gagal membaca folder: %s", exc)
-        return
+        return False
 
     if not files:
         log.info("  Tidak ada file .xlsx")
-        return
+        return True
 
     log.info("  Ditemukan %d file: %s", len(files), files)
 
@@ -321,7 +295,6 @@ def process_source(source_path: str) -> None:
         log.info("  Memproses: %s", filename)
         try:
             content = download(source_path, filename)
-            content = recalculate_xlsx(content)
             sheets = split_workbook(content)
             log.info("    %d sheet: %s", len(sheets), list(sheets))
             for safe_sheet, sheet_bytes in sheets.items():
@@ -329,30 +302,48 @@ def process_source(source_path: str) -> None:
         except Exception as exc:
             log.error("    ✗ Gagal memproses %s: %s", filename, exc, exc_info=True)
             log.error("  Batalkan upload untuk kantor %s", nama_kantor)
-            return
+            return False
 
-    # Semua file berhasil di-split — hapus file lama di destination
+    # Upload (overwrite) DULU sebelum menghapus apa pun. PUT menimpa file lama,
+    # jadi kalau ada file terkunci (423) dan gagal walau sudah retry, file lama
+    # tetap utuh — kita tidak menyisakan folder kosong sebagian atau data campuran.
+    failed: list[str] = []
+    for dest_name, sheet_bytes in pending.items():
+        try:
+            upload(DEST_PATH, dest_name, sheet_bytes)
+            log.info("    ✓ Upload: %s", dest_name)
+        except Exception as exc:
+            failed.append(dest_name)
+            log.error("    ✗ Gagal upload %s: %s", dest_name, exc, exc_info=True)
+
+    if failed:
+        log.error(
+            "  ✗ %d/%d file GAGAL di-upload untuk kantor %s (kemungkinan terkunci "
+            "OnlyOffice). File lama TIDAK dihapus agar tidak menyisakan data basi "
+            "yang campur baru+lama: %s",
+            len(failed), len(pending), nama_kantor, failed,
+        )
+        return False
+
+    # Semua upload sukses — hapus file lama dengan prefix sama yang TIDAK lagi
+    # diproduksi (mis. sheet dihapus/rename di sumber). File yang di-overwrite
+    # tidak perlu dihapus karena PUT sudah menimpanya.
     prefix = f"{nama_kantor}__"
-    old_files = list_xlsx_by_prefix(DEST_PATH, prefix)
-    if old_files:
-        log.info("  Hapus %d file lama: %s", len(old_files), old_files)
-        for old_name in old_files:
+    stale = [f for f in list_xlsx_by_prefix(DEST_PATH, prefix) if f not in pending]
+    if stale:
+        log.info("  Hapus %d file usang: %s", len(stale), stale)
+        for old_name in stale:
             try:
                 delete_file(DEST_PATH, old_name)
                 log.info("    🗑 Dihapus: %s", old_name)
             except Exception as exc:
                 log.error("    ✗ Gagal hapus %s: %s", old_name, exc, exc_info=True)
 
-    # Upload file baru
-    for dest_name, sheet_bytes in pending.items():
-        try:
-            upload(DEST_PATH, dest_name, sheet_bytes)
-            log.info("    ✓ Upload: %s", dest_name)
-        except Exception as exc:
-            log.error("    ✗ Gagal upload %s: %s", dest_name, exc, exc_info=True)
+    return True
 
 
-def run_once() -> None:
+def run_once() -> bool:
+    """Jalankan satu siklus untuk semua sumber. True jika semua sukses."""
     log.info("=== Mulai run split-excel ===")
     log.info("  Tujuan  : %s", DEST_PATH)
     log.info("  Sumber  : %d folder", len(SOURCE_PATHS))
@@ -363,12 +354,18 @@ def run_once() -> None:
         ensure_folder(DEST_PATH)
     except Exception as exc:
         log.error("Gagal memastikan folder tujuan ada: %s", exc)
-        return
+        return False
 
+    ok = True
     for source_path in SOURCE_PATHS:
-        process_source(source_path)
+        if not process_source(source_path):
+            ok = False
 
-    log.info("=== Run selesai ===")
+    if ok:
+        log.info("=== Run selesai (semua sukses) ===")
+    else:
+        log.error("=== Run selesai DENGAN KEGAGALAN — lihat error di atas ===")
+    return ok
 
 
 def main() -> None:
@@ -379,7 +376,7 @@ def main() -> None:
             log.info("Tunggu %d menit...", SCHEDULE_MINUTES)
             time.sleep(SCHEDULE_MINUTES * 60)
     else:
-        run_once()
+        sys.exit(0 if run_once() else 1)
 
 
 if __name__ == "__main__":

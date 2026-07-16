@@ -80,13 +80,15 @@ Nextcloud (WebDAV)
 
 ### split-excel service (`scripts/split_excel.py`)
 
-Configured via `.env` (required: `NEXTCLOUD_URL`, `NEXTCLOUD_USER`, `NEXTCLOUD_PASSWORD`, `NEXTCLOUD_SOURCE_PATHS`, `NEXTCLOUD_DEST_PATH`; optional: `SCHEDULE_INTERVAL_MINUTES` default 60, `LIBREOFFICE_TIMEOUT_SECONDS` default 120).
+Configured via `.env` (required: `NEXTCLOUD_URL`, `NEXTCLOUD_USER`, `NEXTCLOUD_PASSWORD`, `NEXTCLOUD_SOURCE_PATHS`, `NEXTCLOUD_DEST_PATH`; optional: `SCHEDULE_INTERVAL_MINUTES` default 60, `WEBDAV_MAX_RETRIES` default 5, `WEBDAV_RETRY_BACKOFF_SECONDS` default 3).
 
 - Accepts multiple source paths via `NEXTCLOUD_SOURCE_PATHS` (comma or newline separated)
 - Output naming: `{kantor_name}__{file_stem}__{safe_sheet_name}.xlsx`
 - Atomic per-office: if any sheet fails to process, the whole office is skipped and old files are not deleted
-- `--watch` flag enables polling loop; without it, runs once and exits
-- Each downloaded file is recalculated via headless LibreOffice (`recalculate_xlsx()`, requires the `libreoffice-calc` package installed in `Dockerfile.split-excel`) before splitting, so formula cells get fresh cached values instead of whatever was last cached when the source was saved. `split_workbook()` reads with `data_only=True` and copies only resolved values (never formula strings) into the split output; if a cell still has no cached value after recalculation, its coordinates are logged as a warning instead of leaking `=...` text downstream.
+- `--watch` flag enables polling loop; without it, runs once and exits (exit code 1 if any upload failed)
+- `split_workbook()` reads with `data_only=True` and copies only resolved values (never formula strings) into the split output; if a cell has no cached value (formula saved without a stored result), its coordinates are logged as a warning instead of leaking `=...` text downstream.
+- **Upload-first, then prune:** each office's sheets are uploaded via PUT (overwrite) *before* anything is deleted, so a lock failure can't leave the destination half-empty. Only stale files (prefix matches but no longer produced) are deleted afterward. If any upload still fails after retries, old files are kept and `process_source` returns failure.
+- **423 Locked retry:** WebDAV `PUT`/`DELETE` retry on HTTP 423 (`_request_with_retry`, linear backoff, `WEBDAV_MAX_RETRIES` × `WEBDAV_RETRY_BACKOFF_SECONDS`). Destination files get locked when OnlyOffice/another client holds them open; keep the OnlyOffice-watched folder separate from `NEXTCLOUD_DEST_PATH` to avoid this.
 
 ## Adding a New Branch Office
 
