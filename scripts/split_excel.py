@@ -21,11 +21,13 @@ import io
 import logging
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from copy import copy
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 import requests
 from dotenv import load_dotenv
@@ -51,6 +53,7 @@ NEXTCLOUD_USER     = os.environ["NEXTCLOUD_USER"]
 NEXTCLOUD_PASSWORD = os.environ["NEXTCLOUD_PASSWORD"]
 DEST_PATH          = unquote(os.environ["NEXTCLOUD_DEST_PATH"].strip())
 SCHEDULE_MINUTES   = int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "60"))
+LIBREOFFICE_TIMEOUT_SECONDS = int(os.getenv("LIBREOFFICE_TIMEOUT_SECONDS", "120"))
 
 # Dukung kedua nama variabel (NEXTCLOUD_SOURCE_PATHS dan NEXTCLOUD_SOURCE_PATH).
 # Pisahkan dengan koma atau newline; unquote() handle path URL-encoded (%20, dll.).
@@ -163,13 +166,74 @@ def list_xlsx_by_prefix(folder: str, prefix: str) -> list[str]:
     return [f for f in list_xlsx(folder) if f.startswith(prefix)]
 
 
+# ── Excel recalculate ────────────────────────────────────────────────────────
+
+def recalculate_xlsx(content: bytes) -> bytes:
+    """
+    Buka workbook dengan LibreOffice headless lalu simpan ulang sebagai xlsx.
+    Ini memaksa semua formula dihitung ulang sehingga cached value-nya fresh,
+    sebelum dibaca dengan openpyxl data_only=True (yang hanya membaca cached
+    value, tidak pernah menghitung formula sendiri). Tanpa langkah ini,
+    perubahan pada file yang di-save tanpa recalculate penuh (mis. mode
+    kalkulasi manual) bisa menghasilkan data basi di hasil split.
+    """
+    with tempfile.TemporaryDirectory(prefix="split-excel-recalc-") as tmpdir:
+        src_dir = Path(tmpdir) / "src"
+        out_dir = Path(tmpdir) / "out"
+        profile_dir = Path(tmpdir) / "lo_profile"
+        src_dir.mkdir()
+        out_dir.mkdir()
+
+        src_path = src_dir / "input.xlsx"
+        src_path.write_bytes(content)
+
+        cmd = [
+            "soffice",
+            "--headless",
+            "--norestore",
+            "--nologo",
+            "--nofirststartwizard",
+            f"-env:UserInstallation=file://{profile_dir}",
+            "--convert-to", "xlsx",
+            "--outdir", str(out_dir),
+            str(src_path),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=LIBREOFFICE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"LibreOffice timeout setelah {LIBREOFFICE_TIMEOUT_SECONDS}s"
+            ) from exc
+
+        out_path = out_dir / "input.xlsx"
+        if result.returncode != 0 or not out_path.exists():
+            stderr = result.stderr.decode(errors="replace")[:500]
+            raise RuntimeError(
+                f"LibreOffice gagal recalculate (rc={result.returncode}): {stderr}"
+            )
+
+        return out_path.read_bytes()
+
+
 # ── Excel split ─────────────────────────────────────────────────────────────
 
-def _copy_sheet(src, dst) -> None:
-    """Salin nilai sel, style dasar, lebar kolom, tinggi baris, dan merged cells."""
+def _copy_sheet(src, dst) -> list[str]:
+    """
+    Salin nilai sel, style dasar, lebar kolom, tinggi baris, dan merged cells.
+    Kembalikan daftar koordinat sel yang masih berupa formula (bukan nilai) —
+    artinya cached value-nya tidak tersedia meski sudah di-recalculate.
+    """
+    leftover_formulas: list[str] = []
     for row in src.iter_rows():
         for cell in row:
-            dst_cell = dst.cell(row=cell.row, column=cell.column, value=cell.value)
+            value = cell.value
+            if isinstance(value, str) and value.startswith("="):
+                leftover_formulas.append(cell.coordinate)
+            dst_cell = dst.cell(row=cell.row, column=cell.column, value=value)
             if cell.has_style:
                 dst_cell.font           = copy(cell.font)
                 dst_cell.border         = copy(cell.border)
@@ -187,6 +251,8 @@ def _copy_sheet(src, dst) -> None:
     for merge in src.merged_cells.ranges:
         dst.merge_cells(str(merge))
 
+    return leftover_formulas
+
 
 def _safe_name(sheet_name: str) -> str:
     """Ganti karakter tidak aman untuk nama file dengan underscore."""
@@ -197,7 +263,8 @@ def split_workbook(content: bytes) -> dict[str, bytes]:
     """
     Pisahkan workbook per sheet.
     Kembalikan dict: {safe_sheet_name: xlsx_bytes}
-    data_only=True agar formula diganti nilai tersimpan terakhir.
+    data_only=True agar formula diganti nilai tersimpan terakhir (nilai yang
+    fresh, karena caller sudah memanggil recalculate_xlsx() terlebih dulu).
     """
     wb = load_workbook(io.BytesIO(content), data_only=True)
     output: dict[str, bytes] = {}
@@ -206,7 +273,13 @@ def split_workbook(content: bytes) -> dict[str, bytes]:
         new_wb = Workbook()
         new_ws = new_wb.active
         new_ws.title = sheet_name
-        _copy_sheet(wb[sheet_name], new_ws)
+        leftover_formulas = _copy_sheet(wb[sheet_name], new_ws)
+        if leftover_formulas:
+            log.warning(
+                "    ⚠ Sheet '%s': %d sel formula tanpa cached value (tersimpan "
+                "sebagai teks formula, bukan nilai): %s",
+                sheet_name, len(leftover_formulas), leftover_formulas[:10],
+            )
 
         buf = io.BytesIO()
         new_wb.save(buf)
@@ -248,6 +321,7 @@ def process_source(source_path: str) -> None:
         log.info("  Memproses: %s", filename)
         try:
             content = download(source_path, filename)
+            content = recalculate_xlsx(content)
             sheets = split_workbook(content)
             log.info("    %d sheet: %s", len(sheets), list(sheets))
             for safe_sheet, sheet_bytes in sheets.items():

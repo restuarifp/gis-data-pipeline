@@ -1,6 +1,11 @@
 FROM python:3.12-slim
 
+# libreoffice-calc menyediakan biner `soffice`, dipakai untuk memaksa
+# recalculate formula (buka + hitung ulang + simpan) sebelum file dibaca
+# dengan openpyxl data_only=True. Tanpa ini, cached value formula bisa basi.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    libreoffice-calc \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

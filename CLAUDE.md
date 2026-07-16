@@ -80,12 +80,13 @@ Nextcloud (WebDAV)
 
 ### split-excel service (`scripts/split_excel.py`)
 
-Configured via `.env` (required: `NEXTCLOUD_URL`, `NEXTCLOUD_USER`, `NEXTCLOUD_PASSWORD`, `NEXTCLOUD_SOURCE_PATHS`, `NEXTCLOUD_DEST_PATH`; optional: `SCHEDULE_INTERVAL_MINUTES`, default 60).
+Configured via `.env` (required: `NEXTCLOUD_URL`, `NEXTCLOUD_USER`, `NEXTCLOUD_PASSWORD`, `NEXTCLOUD_SOURCE_PATHS`, `NEXTCLOUD_DEST_PATH`; optional: `SCHEDULE_INTERVAL_MINUTES` default 60, `LIBREOFFICE_TIMEOUT_SECONDS` default 120).
 
 - Accepts multiple source paths via `NEXTCLOUD_SOURCE_PATHS` (comma or newline separated)
 - Output naming: `{kantor_name}__{file_stem}__{safe_sheet_name}.xlsx`
 - Atomic per-office: if any sheet fails to process, the whole office is skipped and old files are not deleted
 - `--watch` flag enables polling loop; without it, runs once and exits
+- Each downloaded file is recalculated via headless LibreOffice (`recalculate_xlsx()`, requires the `libreoffice-calc` package installed in `Dockerfile.split-excel`) before splitting, so formula cells get fresh cached values instead of whatever was last cached when the source was saved. `split_workbook()` reads with `data_only=True` and copies only resolved values (never formula strings) into the split output; if a cell still has no cached value after recalculation, its coordinates are logged as a warning instead of leaking `=...` text downstream.
 
 ## Adding a New Branch Office
 
