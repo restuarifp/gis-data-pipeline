@@ -11,6 +11,7 @@ A geospatial-based remote worker data warehouse stack using PostgreSQL/PostGIS, 
 | `postgres-db` | `postgis/postgis:latest` | `5432` | PostgreSQL + PostGIS database |
 | `metabase` | `metabase/metabase:latest` | `3000` | Data visualization dashboard |
 | `dbt` | Custom (Dockerfile.dbt) | — | Data transformation (CLI only) |
+| `split-excel` | Custom (Dockerfile.split-excel) | — | Splits Nextcloud Excel sheets into per-sheet files |
 | `onlyoffice-docs` | `onlyoffice/documentserver:9.3.1.1` | `8080` | Document server |
 
 ---
@@ -135,6 +136,55 @@ To onboard a new office once its Airbyte sync exists:
 5. Run `dbt run` — no need to wait for the Airbyte sync to land first; the model compiles either way
 
 If a future office's Excel template has different finance columns, update the column lists in both branches of `stg_finance_rekap`/`stg_finance_rincian` in `macros/finance_helpers.sql` (the "exists" and "missing" branches must always match column-for-column, or the `UNION ALL` in the mart breaks).
+
+---
+
+## Split-Excel Service
+
+The `split-excel` service (`scripts/split_excel.py`) fetches `.xlsx` files from Nextcloud source folders via WebDAV, splits each sheet into a separate file, and uploads the results to a destination folder (to be picked up by Airbyte).
+
+### Configuration
+
+Set the following in `.env` (loaded via `env_file` in `docker-compose.yml`):
+
+```env
+# Required
+NEXTCLOUD_URL=<nextcloud base url>
+NEXTCLOUD_USER=<user>
+NEXTCLOUD_PASSWORD=<password>
+NEXTCLOUD_SOURCE_PATHS=<comma or newline separated source folders>
+NEXTCLOUD_DEST_PATH=<destination folder>
+
+# Optional
+SCHEDULE_INTERVAL_MINUTES=60        # polling interval in --watch mode
+WEBDAV_MAX_RETRIES=5                # retries on HTTP 423 (Locked)
+WEBDAV_RETRY_BACKOFF_SECONDS=3      # linear backoff between retries
+```
+
+### Run once (manual)
+
+Runs a single pass and exits (exit code 1 if any upload failed):
+
+```bash
+docker compose run --rm split-excel python split_excel.py
+```
+
+### Run as a watcher (background service)
+
+The container's default command is `python split_excel.py --watch`, which polls every `SCHEDULE_INTERVAL_MINUTES`:
+
+```bash
+# Start (builds the image on first run)
+docker compose up -d split-excel
+
+# Follow logs
+docker compose logs -f split-excel
+
+# Stop
+docker compose stop split-excel
+```
+
+> Keep the OnlyOffice-watched folder separate from `NEXTCLOUD_DEST_PATH` — files opened in OnlyOffice get WebDAV-locked (HTTP 423) and uploads/deletes will need to retry.
 
 ---
 
