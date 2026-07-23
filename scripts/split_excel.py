@@ -7,10 +7,11 @@ memisahkan setiap sheet menjadi file tersendiri, lalu mengupload
 hasilnya ke folder tujuan agar bisa dibaca Airbyte per-sheet.
 
 Naming convention output:
-  source: /Uploads/Finance/kantorA/laporan.xlsx  (sheet: Pendapatan)
-  dest  : kantorA__laporan__Pendapatan.xlsx
+  source: /Uploads/kantorA/Finance/finance.xlsx  (sheet: Pendapatan)
+  dest  : kantorA__finance__Pendapatan.xlsx
 
-  nama_kantor diambil dari komponen terakhir path sumber.
+  nama_kantor diambil dari komponen path tepat di atas subfolder 'Finance'
+  (lihat _kantor_name); untuk struktur tanpa 'Finance', dipakai komponen terakhir.
 
 Mode:
   python split_excel.py           -- jalankan sekali lalu keluar
@@ -127,12 +128,23 @@ def list_xlsx(folder: str) -> list[str]:
     results = []
     for node in tree.findall(".//d:response", ns):
         href = (node.findtext("d:href", namespaces=ns) or "").rstrip("/")
-        name = href.split("/")[-1]
-        # Lewati folder itu sendiri dan entri non-.xlsx
+        # href sudah URL-encoded (mis. %20); decode agar cocok dengan nama asli
+        name = unquote(href.split("/")[-1])
+        # Lewati folder itu sendiri
         if href.endswith(folder_href):
             continue
-        if name.lower().endswith(".xlsx"):
-            results.append(name)
+        # Lewati direktori (resourcetype berisi <d:collection/>) — hanya file yang diproses
+        if node.find(".//d:resourcetype/d:collection", ns) is not None:
+            continue
+        # HANYA file .xlsx asli — abaikan format lain (.xls, .csv, .pdf, dst.)
+        if not name.lower().endswith(".xlsx"):
+            log.info("    ⏭ Lewati (bukan .xlsx): %s", name)
+            continue
+        # Abaikan file lock/temp Office (mis. ~$laporan.xlsx) yang bukan workbook valid
+        if name.startswith("~$") or name.startswith("."):
+            log.info("    ⏭ Lewati (file temp/lock): %s", name)
+            continue
+        results.append(name)
     return results
 
 
@@ -262,8 +274,20 @@ def split_workbook(content: bytes) -> dict[str, bytes]:
 # ── Proses utama ────────────────────────────────────────────────────────────
 
 def _kantor_name(source_path: str) -> str:
-    """Ambil komponen terakhir path sebagai nama kantor."""
-    return source_path.rstrip("/").split("/")[-1]
+    """
+    Ambil nama kantor dari path folder sumber.
+
+    Struktur folder: <nama kantor>/Finance/finance.xlsx — folder yang di-scan
+    adalah <nama kantor>/Finance, sehingga nama kantor = komponen tepat DI ATAS
+    subfolder 'Finance'. Jika komponen terakhir bukan 'Finance' (mis. struktur
+    capil <nama kantor>/), komponen terakhir dipakai apa adanya.
+    """
+    parts = [p for p in source_path.strip("/").split("/") if p]
+    if not parts:
+        return "unknown"
+    if len(parts) >= 2 and parts[-1].lower() == "finance":
+        return parts[-2]
+    return parts[-1]
 
 
 def process_source(source_path: str) -> bool:
