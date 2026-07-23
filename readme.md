@@ -161,6 +161,12 @@ WEBDAV_MAX_RETRIES=5                # retries on HTTP 423 (Locked)
 WEBDAV_RETRY_BACKOFF_SECONDS=3      # linear backoff between retries
 ```
 
+> **Important:** After changing `.env`, recreate the container — a plain `restart` does **not** reload environment variables, so the service keeps running with stale paths/credentials:
+>
+> ```bash
+> docker compose up -d --force-recreate split-excel
+> ```
+
 ### Run once (manual)
 
 Runs a single pass and exits (exit code 1 if any upload failed):
