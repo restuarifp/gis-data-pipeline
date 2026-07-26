@@ -1,5 +1,5 @@
-WITH latest_gen AS (
-    SELECT MAX(_airbyte_generation_id) AS last_gen
+WITH latest_pull AS (
+    SELECT MAX(_airbyte_extracted_at) AS last_extracted_at
     FROM {{ source('raw', 'raw_c4') }}
 )
 SELECT
@@ -23,6 +23,6 @@ SELECT
     LOWER(r."Alamat_Kecamatan") AS "Alamat_Kecamatan",
     'C4' AS kantor_id
 FROM {{ source('raw', 'raw_c4') }} r
-INNER JOIN latest_gen lg 
-    ON r._airbyte_generation_id = lg.last_gen
+INNER JOIN latest_pull lp
+    ON r._airbyte_extracted_at = lp.last_extracted_at
 WHERE r."K" IS NOT NULL

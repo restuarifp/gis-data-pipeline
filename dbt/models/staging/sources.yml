@@ -19,6 +19,7 @@ sources:
       - name: raw_c4
       - name: raw_c5
       - name: raw_c6
+      - name: raw_tester
       # Finance: tabel mungkin belum ada secara fisik untuk kantor yang
       # belum disinkronkan Airbyte. Lihat macro source_relation_exists
       # di macros/finance_helpers.sql untuk cara modelnya menangani ini.
@@ -46,5 +47,7 @@ sources:
       - name: raw_c3_finance_rincian
       - name: raw_c4_finance_rekap
       - name: raw_c4_finance_rincian
+      - name: raw_c5_finance_rincian
+      - name: raw_c6_finance_rincian
       - name: raw_tester_finance_rekap
       - name: raw_tester_finance_rincian
