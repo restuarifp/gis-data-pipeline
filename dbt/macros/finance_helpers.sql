@@ -29,7 +29,7 @@
     Jika tabel raw kantor tersebut belum ada, kembalikan result set kosong
     dengan kolom & tipe yang sama persis, supaya UNION ALL di mart tidak pernah patah.
 #}
-    {% set src = source('raw', 'raw_' ~ kantor_id ~ '_finance_rekap') %}
+    {% set src = source('raw', 'raw_finance_rekap_' ~ kantor_id) %}
     {% if source_relation_exists(src) %}
 WITH latest_pull AS (
     SELECT MAX(_airbyte_extracted_at) AS last_extracted_at
@@ -77,7 +77,7 @@ WHERE FALSE
     Jika tabel raw kantor tersebut belum ada, kembalikan result set kosong
     dengan kolom & tipe yang sama persis, supaya UNION ALL di mart tidak pernah patah.
 #}
-    {% set src = source('raw', 'raw_' ~ kantor_id ~ '_finance_rincian') %}
+    {% set src = source('raw', 'raw_finance_rincian_' ~ kantor_id) %}
     {% set capil = source('raw', 'raw_' ~ kantor_id) %}
     {% if source_relation_exists(src) %}
     {% set capil_exists = source_relation_exists(capil) %}

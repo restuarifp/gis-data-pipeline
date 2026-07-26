@@ -51,7 +51,7 @@ Nextcloud (WebDAV)
             separate file, uploads to destination folder
     └── Airbyte
             Syncs per-sheet .xlsx files into PostgreSQL as raw_<kantor_id> tables
-            (capil) and raw_<kantor_id>_finance_rekap / _rincian tables (finance)
+            (capil) and raw_finance_rekap_<kantor_id> / raw_finance_rincian_<kantor_id> tables (finance)
     └── dbt (dbt/)
             staging/ views → mart/ views in the analytics schema
     └── Metabase (port 3000)
@@ -82,7 +82,7 @@ Nextcloud (WebDAV)
 
 **`stg_finance_rincian` columns:** mirror the finance file exactly — `INSTANSI`, then `TUNAI_*` and `NOMINAL_*` for the 10 jenis (FI, ZF, AQQ, FDY, IFQ, LQT, SDQ, SNK, TDY, ZKT). There are **no** `WAJIB_*` columns in the file and no `JUMLAH_WARGA`; the only wajib column is the derived `wajib_ifq` below.
 
-**Derived `wajib_ifq`:** In `stg_finance_rincian`, `wajib_ifq` is *not* read from the finance file — it is computed from the office's capil table (`raw_<kantor_id>`): `COUNT(*)` of latest-pull rows per instansi where `LMG = INSTANSI` and `Status_Tabungan = 'Paham'` (COALESCE to 0 when an instansi has no capil match). This makes `stg_finance_rincian` depend on **both** `raw_<kantor_id>_finance_rincian` **and** `raw_<kantor_id>`; the capil source must be declared in `sources.yml` for every office passed to the macro. If the capil table doesn't physically exist yet, `wajib_ifq` falls back to `NULL` (guarded by `source_relation_exists`).
+**Derived `wajib_ifq`:** In `stg_finance_rincian`, `wajib_ifq` is *not* read from the finance file — it is computed from the office's capil table (`raw_<kantor_id>`): `COUNT(*)` of latest-pull rows per instansi where `LMG = INSTANSI` and `Status_Tabungan = 'Paham'` (COALESCE to 0 when an instansi has no capil match). This makes `stg_finance_rincian` depend on **both** `raw_finance_rincian_<kantor_id>` **and** `raw_<kantor_id>`; the capil source must be declared in `sources.yml` for every office passed to the macro. If the capil table doesn't physically exist yet, `wajib_ifq` falls back to `NULL` (guarded by `source_relation_exists`).
 
 ### split-excel service (`scripts/split_excel.py`)
 
@@ -108,7 +108,7 @@ Configured via `.env` (required: `NEXTCLOUD_URL`, `NEXTCLOUD_USER`, `NEXTCLOUD_P
 
 ### Finance
 
-1. Add `raw_<kantor_id>_finance_rekap` and `raw_<kantor_id>_finance_rincian` to `sources.yml`
+1. Add `raw_finance_rekap_<kantor_id>` and `raw_finance_rincian_<kantor_id>` to `sources.yml`
 2. Create `models/staging/finance/stg_<kantor_id>_finance_rekap.sql` → `{{ stg_finance_rekap('<kantor_id>') }}`
 3. Create `models/staging/finance/stg_<kantor_id>_finance_rincian.sql` → `{{ stg_finance_rincian('<kantor_id>') }}`
 4. Add both `ref()` calls to their respective marts
