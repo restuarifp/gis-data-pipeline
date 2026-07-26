@@ -25,5 +25,3 @@ UNION ALL
 SELECT * FROM {{ ref('stg_c5_finance_rincian') }}
 UNION ALL
 SELECT * FROM {{ ref('stg_c6_finance_rincian') }}
-UNION ALL
-SELECT * FROM {{ ref('stg_tester_finance_rincian') }}

@@ -21,5 +21,3 @@ UNION ALL
 SELECT * FROM {{ ref('stg_c3_finance_rekap') }}
 UNION ALL
 SELECT * FROM {{ ref('stg_c4_finance_rekap') }}
-UNION ALL
-SELECT * FROM {{ ref('stg_tester_finance_rekap') }}
