@@ -5,15 +5,22 @@
     tabel fisiknya sama sekali (bukan cuma tabel kosong), jadi mereferensikan
     source() secara langsung akan gagal dengan "relation does not exist".
 
-    adapter.get_relation() mengembalikan None saat execute==False (dbt parse/ls)
-    maupun saat tabel tidak ada, sehingga tidak perlu guard execute manual.
+    Menggunakan query langsung ke information_schema.tables agar tidak
+    bergantung pada adapter cache dbt yang bisa belum memuat schema public.
+    Saat execute==False (dbt parse/ls), langsung return false.
 #}
-    {% set existing = adapter.get_relation(
-        database=relation.database,
-        schema=relation.schema,
-        identifier=relation.identifier
-    ) %}
-    {{ return(existing is not none) }}
+    {% if execute %}
+        {% set query %}
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = '{{ relation.schema }}'
+              AND table_name = '{{ relation.identifier }}'
+            LIMIT 1
+        {% endset %}
+        {% set result = run_query(query) %}
+        {{ return(result | length > 0) }}
+    {% else %}
+        {{ return(false) }}
+    {% endif %}
 {% endmacro %}
 
 
