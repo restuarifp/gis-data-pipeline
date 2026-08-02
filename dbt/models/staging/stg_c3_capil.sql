@@ -7,6 +7,7 @@ SELECT
         source('raw', 'raw_c3'),
         except=[
             'No_',
+            'null',
             '_airbyte_raw_id',
             '_airbyte_extracted_at',
             '_airbyte_meta',
