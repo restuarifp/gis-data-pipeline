@@ -24,7 +24,7 @@
     Kolom mengikuti file finance apa adanya: JENIS, DISETOR, DIKELOLA_KANWIL,
     PEMBULATAN_SETOR, TOTAL_100_PERSEN.
 
-    Hanya penarikan data terakhir yang ditampilkan (MAX(_airbyte_extracted_at)).
+    Hanya penarikan data terakhir yang ditampilkan (MAX(_airbyte_generation_id)).
 
     Jika tabel raw kantor tersebut belum ada, kembalikan result set kosong
     dengan kolom & tipe yang sama persis, supaya UNION ALL di mart tidak pernah patah.
@@ -32,7 +32,7 @@
     {% set src = source('raw', 'raw_finance_rekap_' ~ kantor_id) %}
     {% if source_relation_exists(src) %}
 WITH latest_pull AS (
-    SELECT MAX(_airbyte_extracted_at) AS last_extracted_at
+    SELECT MAX(_airbyte_generation_id) AS last_generation_id
     FROM {{ src }}
 )
 SELECT
@@ -44,7 +44,7 @@ SELECT
     r."TOTAL_100_PERSEN" AS total_100_persen
 FROM {{ src }} r
 INNER JOIN latest_pull lp
-    ON r._airbyte_extracted_at = lp.last_extracted_at
+    ON r._airbyte_generation_id = lp.last_generation_id
     {% else %}
 SELECT
     '{{ kantor_id | upper }}'::varchar AS kantor_id,
@@ -69,10 +69,11 @@ WHERE FALSE
     Status_Tabungan = 'Paham'.
 
     Hanya penarikan data terakhir yang ditampilkan: baris difilter ke
-    MAX(_airbyte_extracted_at). Jadi jika dalam sebulan ada beberapa kali
+    MAX(_airbyte_generation_id). Jadi jika dalam sebulan ada beberapa kali
     penarikan (sync), hanya batch paling akhir yang muncul — memakai
-    _airbyte_extracted_at, bukan _airbyte_generation_id, karena beberapa sync
-    bisa berbagi generation yang sama saat mode-nya append.
+    _airbyte_generation_id, bukan _airbyte_extracted_at, karena satu batch
+    ekstraksi yang sama bisa menghasilkan extracted_at yang berbeda-beda
+    antar baris/stream.
 
     Jika tabel raw kantor tersebut belum ada, kembalikan result set kosong
     dengan kolom & tipe yang sama persis, supaya UNION ALL di mart tidak pernah patah.
@@ -82,7 +83,7 @@ WHERE FALSE
     {% if source_relation_exists(src) %}
     {% set capil_exists = source_relation_exists(capil) %}
 WITH latest_pull AS (
-    SELECT MAX(_airbyte_extracted_at) AS last_extracted_at
+    SELECT MAX(_airbyte_generation_id) AS last_generation_id
     FROM {{ src }}
 )
 {%- if capil_exists %},
@@ -92,8 +93,8 @@ wajib_ifq_calc AS (
         COUNT(*) AS wajib_ifq
     FROM {{ capil }} c
     INNER JOIN (
-        SELECT MAX(_airbyte_extracted_at) AS last_extracted_at FROM {{ capil }}
-    ) cg ON c._airbyte_extracted_at = cg.last_extracted_at
+        SELECT MAX(_airbyte_generation_id) AS last_generation_id FROM {{ capil }}
+    ) cg ON c._airbyte_generation_id = cg.last_generation_id
     WHERE c."Status_Tabungan" = 'Paham'
     GROUP BY c."LMG"
 )
@@ -127,7 +128,7 @@ SELECT
     r."NOMINAL_ZKT" AS nominal_zkt
 FROM {{ src }} r
 INNER JOIN latest_pull lp
-    ON r._airbyte_extracted_at = lp.last_extracted_at
+    ON r._airbyte_generation_id = lp.last_generation_id
 {%- if capil_exists %}
 LEFT JOIN wajib_ifq_calc w
     ON w.instansi = r."INSTANSI"

@@ -67,7 +67,7 @@ Nextcloud (WebDAV)
 **Model layers:**
 
 - `models/staging/sources.yml` — declares all `raw.*` source tables in `capil_db.public`
-- `models/staging/stg_<kantor_id>_capil.sql` — one per office; filters to the latest data pull (`_airbyte_extracted_at = MAX(_airbyte_extracted_at)`), strips internal Airbyte columns, normalizes text fields to lowercase, adds `kantor_id` column
+- `models/staging/stg_<kantor_id>_capil.sql` — one per office; filters to the latest data pull (`_airbyte_generation_id = MAX(_airbyte_generation_id)`), strips internal Airbyte columns, normalizes text fields to lowercase, adds `kantor_id` column
 - `models/staging/finance/stg_<kantor_id>_finance_rekap.sql` / `_rincian.sql` — one-liner: `{{ stg_finance_rekap('<kantor_id>') }}` delegating to the macro
 - `models/marts/mart_capil.sql` — `UNION ALL` across every staging capil model
 - `models/marts/finance/mart_finance_rekap.sql` / `mart_finance_rincian.sql` — `UNION ALL` across every staging finance model
@@ -78,7 +78,7 @@ Nextcloud (WebDAV)
 
 **Critical invariant:** The "exists" and "missing" branches of both macros must have identical column names and types, or the `UNION ALL` in the mart breaks.
 
-**Latest-pull filter:** Every staging model (capil + finance) filters to `_airbyte_extracted_at = MAX(_airbyte_extracted_at)` so only the most recent pull is shown — a month may contain several pulls, and multiple appended syncs can share the same `_airbyte_generation_id`, so extraction time (not generation) is the reliable key.
+**Latest-pull filter:** Every staging model (capil + finance) filters to `_airbyte_generation_id = MAX(_airbyte_generation_id)` so only the most recent pull is shown — a month may contain several pulls, and a single extraction batch can produce differing `_airbyte_extracted_at` values across its rows, so the generation id (not extraction time) is the reliable batch key.
 
 **`stg_finance_rincian` columns:** mirror the finance file exactly — `INSTANSI`, then `TUNAI_*` and `NOMINAL_*` for the 10 jenis (FI, ZF, AQQ, FDY, IFQ, LQT, SDQ, SNK, TDY, ZKT). There are **no** `WAJIB_*` columns in the file and no `JUMLAH_WARGA`; the only wajib column is the derived `wajib_ifq` below.
 

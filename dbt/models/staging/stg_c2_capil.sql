@@ -1,5 +1,5 @@
 WITH latest_pull AS (
-    SELECT MAX(_airbyte_extracted_at) AS last_extracted_at
+    SELECT MAX(_airbyte_generation_id) AS last_generation_id
     FROM {{ source('raw', 'raw_c2') }}
 )
 SELECT
@@ -24,5 +24,5 @@ SELECT
     'C2' AS kantor_id
 FROM {{ source('raw', 'raw_c2') }} r
 INNER JOIN latest_pull lp
-    ON r._airbyte_extracted_at = lp.last_extracted_at
+    ON r._airbyte_generation_id = lp.last_generation_id
 WHERE r."K" IS NOT NULL
