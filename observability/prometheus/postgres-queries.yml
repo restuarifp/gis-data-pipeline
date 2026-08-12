@@ -1,0 +1,83 @@
+# Custom pipeline-level metrics for postgres_exporter.
+# Loaded via PG_EXPORTER_EXTEND_QUERY_PATH and run against EVERY auto-discovered
+# database, so queries must never name a warehouse table directly — an unresolved
+# relation aborts the whole scrape (a WHERE guard doesn't help, the planner
+# resolves the name first). Everything below reads catalog/stat views only.
+
+pipeline_raw_freshness:
+  query: |
+    SELECT
+      current_database() AS datname,
+      c.relname AS table_name,
+      COALESCE(s.n_live_tup, 0)::bigint AS live_rows,
+      EXTRACT(EPOCH FROM COALESCE(
+        GREATEST(s.last_autoanalyze, s.last_analyze, s.last_autovacuum, s.last_vacuum),
+        TIMESTAMPTZ 'epoch'
+      ))::bigint AS last_maintenance_epoch
+    FROM pg_stat_user_tables s
+    JOIN pg_class c ON c.oid = s.relid
+    WHERE c.relname LIKE 'raw\_%'
+  master: false
+  metrics:
+    - datname:
+        usage: "LABEL"
+        description: "Database the row came from (auto-discovery runs each query per database)"
+    - table_name:
+        usage: "LABEL"
+        description: "Raw Airbyte landing table"
+    - live_rows:
+        usage: "GAUGE"
+        description: "Estimated live row count (planner statistic)"
+    - last_maintenance_epoch:
+        usage: "GAUGE"
+        description: "Unix timestamp of last (auto)vacuum/analyze — proxy for last write activity"
+
+pipeline_raw_writes:
+  query: |
+    SELECT
+      current_database() AS datname,
+      c.relname AS table_name,
+      COALESCE(s.n_tup_ins, 0)::bigint AS inserts,
+      COALESCE(s.n_tup_del, 0)::bigint AS deletes
+    FROM pg_stat_user_tables s
+    JOIN pg_class c ON c.oid = s.relid
+    WHERE c.relname LIKE 'raw\_%'
+  master: false
+  metrics:
+    - datname:
+        usage: "LABEL"
+        description: "Database the row came from (auto-discovery runs each query per database)"
+    - table_name:
+        usage: "LABEL"
+        description: "Raw Airbyte landing table"
+    - inserts:
+        usage: "COUNTER"
+        description: "Rows inserted since stats reset — jumps when an Airbyte sync lands"
+    - deletes:
+        usage: "COUNTER"
+        description: "Rows deleted since stats reset"
+
+pipeline_dbt_models:
+  query: |
+    SELECT
+      current_database() AS datname,
+      COUNT(*) FILTER (WHERE n.nspname = 'analytics')::bigint AS analytics_relations,
+      COUNT(*) FILTER (WHERE n.nspname = 'analytics' AND c.relname LIKE 'stg\_%')::bigint AS staging_models,
+      COUNT(*) FILTER (WHERE n.nspname = 'analytics' AND c.relname LIKE 'mart\_%')::bigint AS mart_models
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('v', 'm', 'r')
+  master: false
+  metrics:
+    - datname:
+        usage: "LABEL"
+        description: "Database the row came from (auto-discovery runs each query per database)"
+    - analytics_relations:
+        usage: "GAUGE"
+        description: "Objects built by dbt in the analytics schema"
+    - staging_models:
+        usage: "GAUGE"
+        description: "stg_* models present"
+    - mart_models:
+        usage: "GAUGE"
+        description: "mart_* models present"

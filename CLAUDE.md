@@ -16,6 +16,11 @@ A geospatial-based remote worker data warehouse stack for tracking civil registr
 | `split-excel` | Custom Dockerfile.split-excel (Python 3.12) | — |
 | `notif-relay` | Custom Dockerfile.notif-relay (Python 3.12) | 8000 |
 | `onlyoffice-docs` | onlyoffice/documentserver:9.3.1.1 | 8080 |
+| `grafana` | grafana/grafana:latest | 3030 |
+| `prometheus` | prom/prometheus:latest | 9090 |
+| `loki` | grafana/loki:latest | 3100 |
+| `promtail` | grafana/promtail:latest | — |
+| `node-exporter` / `cadvisor` / `postgres-exporter` | Prometheus exporters | — |
 
 Services share a `gisnet` bridge network; inter-service references use Docker service names (e.g., `postgres-db`), not `localhost`.
 
@@ -36,6 +41,9 @@ docker compose run --rm split-excel python split_excel.py
 
 # Start the notif-relay (Airbyte webhook → Telegram); listens on :8000
 docker compose up -d notif-relay
+
+# Start the observability stack (Grafana on :3030, admin/admin by default)
+docker compose --profile observability up -d
 
 # Stop services (data preserved)
 docker compose down
@@ -108,6 +116,18 @@ The **Relay Notifikasi** (see `CONTEXT.md`): a tiny stdlib-only HTTP server that
 - **One Job = one message.** Airbyte fires one webhook per Job (not per Stream), so the relay emits one Telegram message per call.
 - Accepts any POST path (health check on `GET /`). `format_message()` is defensive: it reads the structured `data` object of Airbyte's custom webhook, falls back to a Slack-style `{text}` field, and dumps raw JSON for unknown shapes. All interpolated values are HTML-escaped (`parse_mode=HTML`).
 - Airbyte is **not** in this compose stack — point its webhook notification at `http://<host>:8000/` (the relay publishes host port 8000 on `gisnet`).
+
+### Observability (`observability/`)
+
+Grafana + Prometheus + Loki behind the `observability` compose profile, so the
+default `docker compose up -d` is unaffected. See `observability/README.md` for
+the full picture. Two rules matter when touching
+`observability/prometheus/postgres-queries.yml`: queries must never reference a
+warehouse table by name (they run against every auto-discovered database, and one
+unresolved relation 500s the entire `/metrics` endpoint — a `to_regclass` guard
+does *not* help), and every query must emit a `datname` label or duplicate
+metric/label pairs 500 it just the same. Grafana datasources and dashboards are
+file-provisioned; UI edits are not written back to the repo.
 
 ## Adding a New Branch Office
 
