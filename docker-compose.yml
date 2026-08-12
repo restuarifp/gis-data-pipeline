@@ -71,7 +71,10 @@ services:
       context: .
       dockerfile: Dockerfile.notif-relay
     container_name: notif_relay
-    restart: unless-stopped
+    # on-failure (not unless-stopped): a missing TELEGRAM_* in .env is a config
+    # error, and retrying it forever just floods the logs. Real crashes still
+    # get 3 restarts.
+    restart: on-failure:3
     env_file:
       - .env
     ports:

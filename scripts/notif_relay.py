@@ -49,8 +49,26 @@ log = logging.getLogger("notif_relay")
 
 # ── Konfigurasi ─────────────────────────────────────────────────────────────
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
+def _wajib(nama: str) -> str:
+    """
+    Ambil env var wajib. Kalau kosong: satu baris log yang jelas lalu keluar
+    dengan kode 78 (EX_CONFIG) — bukan traceback KeyError. Compose memakai
+    restart: on-failure:3 untuk service ini, jadi salah konfigurasi berhenti
+    setelah beberapa percobaan alih-alih crash-loop tanpa henti.
+    """
+    nilai = os.getenv(nama, "").strip()
+    if not nilai:
+        log.error(
+            "%s belum diisi. Set %s di .env (lihat .env.example), lalu: "
+            "docker compose up -d notif-relay",
+            nama, nama,
+        )
+        raise SystemExit(78)
+    return nilai
+
+
+TELEGRAM_BOT_TOKEN = _wajib("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = _wajib("TELEGRAM_CHAT_ID")
 
 PORT            = int(os.getenv("NOTIF_RELAY_PORT", "8000"))
 MAX_RETRIES     = int(os.getenv("TELEGRAM_MAX_RETRIES", "3"))

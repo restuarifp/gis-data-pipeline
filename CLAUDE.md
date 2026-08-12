@@ -114,6 +114,7 @@ The **Relay Notifikasi** (see `CONTEXT.md`): a tiny stdlib-only HTTP server that
 
 - **Best-effort by design** (`docs/adr/0001-notifikasi-telegram-best-effort.md`): every `POST` replies `200` *immediately*, then the Telegram send runs in a daemon thread with linear-backoff retry. Final failure is only logged — the message is dropped, and Airbyte is never made to think the Job failed. **No notification is not proof a sync didn't run; Airbyte UI is the source of truth.**
 - **One Job = one message.** Airbyte fires one webhook per Job (not per Stream), so the relay emits one Telegram message per call.
+- **Fails fast on missing config:** an empty/absent `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` logs one clear line and exits **78** (`EX_CONFIG`). The compose restart policy is `on-failure:3`, so a misconfigured relay stops after 3 attempts instead of crash-looping. Note an *empty* value in `.env` is still a set env var — hence the explicit emptiness check, not `os.environ[...]`.
 - Accepts any POST path (health check on `GET /`). `format_message()` is defensive: it reads the structured `data` object of Airbyte's custom webhook, falls back to a Slack-style `{text}` field, and dumps raw JSON for unknown shapes. All interpolated values are HTML-escaped (`parse_mode=HTML`).
 - Airbyte is **not** in this compose stack — point its webhook notification at `http://<host>:8000/` (the relay publishes host port 8000 on `gisnet`).
 
