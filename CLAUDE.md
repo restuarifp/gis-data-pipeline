@@ -14,6 +14,7 @@ A geospatial-based remote worker data warehouse stack for tracking civil registr
 | `metabase` | metabase/metabase:latest | 3000 |
 | `dbt` | Custom Dockerfile.dbt (Python 3.9 + dbt-postgres) | CLI only |
 | `split-excel` | Custom Dockerfile.split-excel (Python 3.12) | — |
+| `notif-relay` | Custom Dockerfile.notif-relay (Python 3.12) | 8000 |
 | `onlyoffice-docs` | onlyoffice/documentserver:9.3.1.1 | 8080 |
 
 Services share a `gisnet` bridge network; inter-service references use Docker service names (e.g., `postgres-db`), not `localhost`.
@@ -32,6 +33,9 @@ docker compose run --rm dbt dbt deps           # install packages
 
 # Run split-excel once (without --watch loop)
 docker compose run --rm split-excel python split_excel.py
+
+# Start the notif-relay (Airbyte webhook → Telegram); listens on :8000
+docker compose up -d notif-relay
 
 # Stop services (data preserved)
 docker compose down
@@ -95,6 +99,15 @@ Configured via `.env` (required: `NEXTCLOUD_URL`, `NEXTCLOUD_USER`, `NEXTCLOUD_P
 - `split_workbook()` reads with `data_only=True` and copies only resolved values (never formula strings) into the split output; if a cell has no cached value (formula saved without a stored result), its coordinates are logged as a warning instead of leaking `=...` text downstream.
 - **Upload-first, then prune:** each office's sheets are uploaded via PUT (overwrite) *before* anything is deleted, so a lock failure can't leave the destination half-empty. Only stale files (prefix matches but no longer produced) are deleted afterward. If any upload still fails after retries, old files are kept and `process_source` returns failure.
 - **423 Locked retry:** WebDAV `PUT`/`DELETE` retry on HTTP 423 (`_request_with_retry`, linear backoff, `WEBDAV_MAX_RETRIES` × `WEBDAV_RETRY_BACKOFF_SECONDS`). Destination files get locked when OnlyOffice/another client holds them open; keep the OnlyOffice-watched folder separate from `NEXTCLOUD_DEST_PATH` to avoid this.
+
+### notif-relay service (`scripts/notif_relay.py`)
+
+The **Relay Notifikasi** (see `CONTEXT.md`): a tiny stdlib-only HTTP server that receives Airbyte webhook notifications and forwards them to a Telegram group. Configured via `.env` (required: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`; optional: `NOTIF_RELAY_PORT` default 8000, `TELEGRAM_MAX_RETRIES` default 3, `TELEGRAM_RETRY_BACKOFF_SECONDS` default 3).
+
+- **Best-effort by design** (`docs/adr/0001-notifikasi-telegram-best-effort.md`): every `POST` replies `200` *immediately*, then the Telegram send runs in a daemon thread with linear-backoff retry. Final failure is only logged — the message is dropped, and Airbyte is never made to think the Job failed. **No notification is not proof a sync didn't run; Airbyte UI is the source of truth.**
+- **One Job = one message.** Airbyte fires one webhook per Job (not per Stream), so the relay emits one Telegram message per call.
+- Accepts any POST path (health check on `GET /`). `format_message()` is defensive: it reads the structured `data` object of Airbyte's custom webhook, falls back to a Slack-style `{text}` field, and dumps raw JSON for unknown shapes. All interpolated values are HTML-escaped (`parse_mode=HTML`).
+- Airbyte is **not** in this compose stack — point its webhook notification at `http://<host>:8000/` (the relay publishes host port 8000 on `gisnet`).
 
 ## Adding a New Branch Office
 

@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY scripts/requirements-notif-relay.txt .
+RUN pip install --no-cache-dir -r requirements-notif-relay.txt
+
+COPY scripts/notif_relay.py .
+
+CMD ["python", "notif_relay.py"]

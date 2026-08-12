@@ -66,6 +66,19 @@ services:
     networks:
       - gisnet
 
+  notif-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile.notif-relay
+    container_name: notif_relay
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - 8000:8000
+    networks:
+      - gisnet
+
   onlyoffice-docs:
     image: onlyoffice/documentserver:9.3.1.1
     container_name: onlyoffice-docs
