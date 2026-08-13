@@ -31,6 +31,14 @@ lubang. **`NEXTCLOUD_SOURCE_HOME` yang kosong berarti tidak ada batas folder ind
 file yang sama di folder tujuan Nextcloud, jadi permintaan kedua dibalas `409` dan
 dibuang. Mengantrikan run akan menyembunyikan fakta bahwa run sebelumnya masih jalan.
 
+**Laporan hasil dikirim oleh pemantau, bukan oleh pemicu.** Relay memantau
+`/status` semua job dan mengirim satu pesan tiap `last_finished` berubah. Dengan
+begitu run terjadwal `--watch` juga dilaporkan, bukan hanya yang dipicu dari
+Telegram — dan karena hanya ada satu tempat yang melapor, run manual tidak dapat
+pesan dobel. Alternatifnya, split-excel mengirim sendiri ke Telegram saat selesai,
+ditolak: itu berarti token bot harus ikut ditaruh di container yang mengunduh dan
+memproses file dari luar.
+
 Sifat best-effort dari [ADR 0001](0001-notifikasi-telegram-best-effort.md) tetap
 berlaku untuk balasan perintah: laporan hasil job dikirim sekali dengan retry, dan
 kalau gagal hanya di-log. **Tidak adanya balasan bukan bukti job tidak jalan** —

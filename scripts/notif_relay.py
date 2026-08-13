@@ -96,9 +96,11 @@ JOBS = {
 }
 POLL_TIMEOUT   = int(os.getenv("TELEGRAM_POLL_TIMEOUT", "50"))   # long-poll getUpdates
 WATCH_INTERVAL = int(os.getenv("JOB_WATCH_INTERVAL_SECONDS", "10"))
-BOT_ENABLED    = os.getenv("TELEGRAM_BOT_ENABLED", "true").strip().lower() not in (
-    "0", "false", "no", "off",
-)
+_MATI = ("0", "false", "no", "off")
+BOT_ENABLED = os.getenv("TELEGRAM_BOT_ENABLED", "true").strip().lower() not in _MATI
+# Pemantau job: laporkan setiap run yang selesai ke grup, termasuk run terjadwal
+# split-excel yang tidak dipicu dari Telegram.
+JOB_WATCH_ENABLED = os.getenv("JOB_WATCH_ENABLED", "true").strip().lower() not in _MATI
 
 
 # ── Format pesan ────────────────────────────────────────────────────────────
@@ -260,37 +262,72 @@ def _ringkas_status(nama: str, st: dict) -> str:
     )
 
 
-def watch_job(nama: str, chat_id) -> None:
-    """
-    Pantau job sampai selesai lalu laporkan hasilnya ke chat yang memicu.
-    Dijalankan di thread daemon; error jaringan cukup di-log (best-effort, ADR 0001).
-    """
+def _lapor_selesai(nama: str, st: dict) -> None:
+    """Kirim satu pesan hasil run ke grup."""
     base = JOBS[nama]
+    durasi = _fmt_duration(st.get("duration_s"))
+    sumber = st.get("last_params", {}).get("sources")
+    rincian = ""
+    if sumber:
+        rincian = "\n" + "\n".join(f"• {html.escape(str(s))}" for s in sumber)
+
+    if st.get("last_ok"):
+        send_telegram(f"✅ <b>{nama}</b> selesai ({durasi}).{rincian}")
+        return
+
+    ekor = ""
+    try:
+        teks = requests.get(f"{base}/logs", timeout=REQUEST_TIMEOUT).text
+        ekor = "\n".join(teks.splitlines()[-15:])
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Gagal ambil log %s: %s", nama, exc)
+    pesan = f"❌ <b>{nama}</b> GAGAL ({durasi}).{rincian}"
+    if ekor:
+        pesan += f"\n<pre>{html.escape(ekor[:3000])}</pre>"
+    send_telegram(pesan)
+
+
+def watch_jobs() -> None:
+    """
+    Pantau semua job terus-menerus dan laporkan setiap run yang selesai ke grup.
+
+    Satu pemantau untuk semua asal-usul run — dipicu dari Telegram, dari jadwal
+    --watch split-excel, atau dari curl. Pendekatan poll dipilih supaya split-excel
+    tidak perlu tahu apa pun soal Telegram (token tetap hanya di relay ini).
+
+    `last_finished` dipakai sebagai penanda run: nilainya berubah tepat sekali per
+    run selesai, jadi tidak ada pesan dobel. Nilai awal diambil saat start supaya
+    run yang sudah lama selesai tidak diumumkan ulang setiap relay restart.
+    """
+    terakhir = {}
+    for nama, base in JOBS.items():
+        try:
+            terakhir[nama] = requests.get(
+                f"{base}/status", timeout=REQUEST_TIMEOUT
+            ).json().get("last_finished")
+        except Exception:  # noqa: BLE001 -- job belum siap saat relay start
+            terakhir[nama] = None
+
+    log.info("Pemantau job aktif (%s); hasil run dikirim ke grup.", ", ".join(JOBS))
+
     while True:
         time.sleep(WATCH_INTERVAL)
-        try:
-            st = requests.get(f"{base}/status", timeout=REQUEST_TIMEOUT).json()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Gagal cek status %s: %s", nama, exc)
-            return
-        if st.get("running"):
-            continue
-
-        durasi = _fmt_duration(st.get("duration_s"))
-        if st.get("last_ok"):
-            send_telegram(f"✅ <b>{nama}</b> selesai ({durasi}).", chat_id)
-        else:
-            ekor = ""
+        for nama, base in JOBS.items():
             try:
-                teks = requests.get(f"{base}/logs", timeout=REQUEST_TIMEOUT).text
-                ekor = "\n".join(teks.splitlines()[-15:])
+                st = requests.get(f"{base}/status", timeout=REQUEST_TIMEOUT).json()
             except Exception as exc:  # noqa: BLE001
-                log.warning("Gagal ambil log %s: %s", nama, exc)
-            pesan = f"❌ <b>{nama}</b> GAGAL ({durasi})."
-            if ekor:
-                pesan += f"\n<pre>{html.escape(ekor[:3000])}</pre>"
-            send_telegram(pesan, chat_id)
-        return
+                log.debug("Gagal cek status %s: %s", nama, exc)
+                continue
+
+            selesai = st.get("last_finished")
+            if selesai is None or selesai == terakhir.get(nama):
+                continue
+
+            terakhir[nama] = selesai
+            try:
+                _lapor_selesai(nama, st)
+            except Exception:  # noqa: BLE001 -- satu laporan gagal != pemantau mati
+                log.exception("Gagal melaporkan hasil %s.", nama)
 
 
 def mulai_job(nama: str, args: list, chat_id, reply_to) -> None:
@@ -319,8 +356,9 @@ def mulai_job(nama: str, args: list, chat_id, reply_to) -> None:
             rincian = "\n" + "\n".join(f"• {html.escape(s)}" for s in body["sources"])
         elif body.get("select"):
             rincian = f"\n<code>--select {html.escape(body['select'])}</code>"
+        # Hasilnya dilaporkan oleh watch_jobs(), bukan di sini — supaya run
+        # terjadwal dan run manual sama-sama dapat satu pesan, tanpa dobel.
         send_telegram(f"▶️ <b>{nama}</b> dimulai.{rincian}", chat_id, reply_to)
-        threading.Thread(target=watch_job, args=(nama, chat_id), daemon=True).start()
     elif resp.status_code == 409:
         send_telegram(f"⏳ <b>{nama}</b> masih berjalan; permintaan diabaikan.",
                       chat_id, reply_to)
@@ -495,6 +533,11 @@ def main() -> None:
         threading.Thread(target=poll_updates, daemon=True).start()
     else:
         log.info("Bot Telegram dimatikan (TELEGRAM_BOT_ENABLED=false).")
+
+    if JOB_WATCH_ENABLED:
+        threading.Thread(target=watch_jobs, daemon=True).start()
+    else:
+        log.info("Pemantau job dimatikan (JOB_WATCH_ENABLED=false).")
 
     server = ThreadingHTTPServer(("0.0.0.0", PORT), RelayHandler)
     log.info("Relay Notifikasi mendengarkan di 0.0.0.0:%d", PORT)
