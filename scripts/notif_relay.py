@@ -94,6 +94,13 @@ JOBS = {
     "split": os.getenv("SPLIT_CONTROL_URL", "http://split-excel:8080").rstrip("/"),
     "dbt":   os.getenv("DBT_CONTROL_URL", "http://dbt-runner:8080").rstrip("/"),
 }
+# Airbyte (perintah /sync). Airbyte tidak ada di compose stack ini, jadi URL-nya
+# harus yang terjangkau DARI DALAM container relay — bukan localhost.
+AIRBYTE_URL           = os.getenv("AIRBYTE_URL", "").strip().rstrip("/")
+AIRBYTE_CLIENT_ID     = os.getenv("AIRBYTE_CLIENT_ID", "").strip()
+AIRBYTE_CLIENT_SECRET = os.getenv("AIRBYTE_CLIENT_SECRET", "").strip()
+AIRBYTE_WORKSPACE_ID  = os.getenv("AIRBYTE_WORKSPACE_ID", "").strip()
+
 POLL_TIMEOUT   = int(os.getenv("TELEGRAM_POLL_TIMEOUT", "50"))   # long-poll getUpdates
 WATCH_INTERVAL = int(os.getenv("JOB_WATCH_INTERVAL_SECONDS", "10"))
 _MATI = ("0", "false", "no", "off")
@@ -230,6 +237,164 @@ def dispatch(payload: dict) -> None:
     send_telegram(text)
 
 
+# ── Airbyte Public API ──────────────────────────────────────────────────────
+
+_token_lock = threading.Lock()
+_token = {"nilai": None, "kedaluwarsa": 0.0}
+
+
+class AirbyteError(Exception):
+    """Kegagalan yang layak ditampilkan apa adanya ke operator di Telegram."""
+
+
+def airbyte_aktif() -> bool:
+    return bool(AIRBYTE_URL and AIRBYTE_CLIENT_ID and AIRBYTE_CLIENT_SECRET)
+
+
+def _ambil_token(paksa: bool = False) -> str:
+    """
+    Access token Public API, di-cache sampai mendekati kedaluwarsa.
+
+    Catatan bentuk body: field-nya `grant-type` (tanda hubung), bukan `grant_type`
+    seperti konvensi OAuth. Salah tanda hubung dibalas 401 — bukan 400 — jadi
+    gejalanya menyamar sebagai kredensial salah.
+    """
+    with _token_lock:
+        if not paksa and _token["nilai"] and time.time() < _token["kedaluwarsa"]:
+            return _token["nilai"]
+
+        try:
+            resp = requests.post(
+                f"{AIRBYTE_URL}/api/public/v1/applications/token",
+                json={
+                    "client_id": AIRBYTE_CLIENT_ID,
+                    "client_secret": AIRBYTE_CLIENT_SECRET,
+                    "grant-type": "client_credentials",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            raise AirbyteError(f"tidak bisa menghubungi Airbyte: {exc}") from exc
+
+        if not resp.ok:
+            raise AirbyteError(
+                f"gagal ambil token ({resp.status_code}): {resp.text[:200]}"
+            )
+
+        data = resp.json()
+        nilai = data.get("access_token")
+        if not nilai:
+            raise AirbyteError(f"respons token tanpa access_token: {str(data)[:200]}")
+
+        umur = float(data.get("expires_in") or 180)
+        _token["nilai"] = nilai
+        _token["kedaluwarsa"] = time.time() + max(umur - 30, 30)  # sisakan margin
+        return nilai
+
+
+def _api(metode: str, path: str, **kwargs):
+    """Panggil Public API; sekali retry dengan token baru kalau kena 401."""
+    for percobaan in (1, 2):
+        token = _ambil_token(paksa=(percobaan == 2))
+        try:
+            resp = requests.request(
+                metode,
+                f"{AIRBYTE_URL}/api/public/v1{path}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=REQUEST_TIMEOUT,
+                **kwargs,
+            )
+        except requests.RequestException as exc:
+            raise AirbyteError(f"tidak bisa menghubungi Airbyte: {exc}") from exc
+
+        if resp.status_code == 401 and percobaan == 1:
+            continue  # token kedaluwarsa lebih cepat dari perkiraan
+        if not resp.ok:
+            raise AirbyteError(f"{metode} {path} → {resp.status_code}: {resp.text[:300]}")
+        return resp.json() if resp.content else {}
+
+    raise AirbyteError("token ditolak dua kali berturut-turut")
+
+
+def daftar_koneksi() -> list:
+    params = {"limit": 100}
+    if AIRBYTE_WORKSPACE_ID:
+        params["workspaceIds"] = AIRBYTE_WORKSPACE_ID
+    return _api("GET", "/connections", params=params).get("data", [])
+
+
+def cari_koneksi(nama: str) -> dict:
+    """
+    Cocokkan nama koneksi yang diketik operator. Persis dulu, baru sebagian.
+
+    Kalau ambigu, lebih baik gagal dan menampilkan kandidat daripada menebak —
+    memicu sync koneksi yang salah berarti menulis data ke tabel kantor lain.
+    """
+    koneksi = daftar_koneksi()
+    kunci = nama.strip().lower()
+
+    persis = [k for k in koneksi if (k.get("name") or "").lower() == kunci]
+    if len(persis) == 1:
+        return persis[0]
+
+    sebagian = [k for k in koneksi if kunci in (k.get("name") or "").lower()]
+    if len(sebagian) == 1:
+        return sebagian[0]
+    if not sebagian:
+        raise AirbyteError(
+            f"koneksi {nama!r} tidak ditemukan. Ketik /sync tanpa argumen "
+            f"untuk melihat daftarnya."
+        )
+    nama_kandidat = ", ".join(k.get("name", "?") for k in sebagian[:10])
+    raise AirbyteError(f"nama {nama!r} cocok ke beberapa koneksi: {nama_kandidat}")
+
+
+def mulai_sync(args: list, chat_id, reply_to) -> None:
+    if not airbyte_aktif():
+        send_telegram(
+            "⚠️ Airbyte belum dikonfigurasi. Set <code>AIRBYTE_URL</code>, "
+            "<code>AIRBYTE_CLIENT_ID</code>, dan <code>AIRBYTE_CLIENT_SECRET</code> "
+            "di .env lalu <code>docker compose up -d notif-relay</code>.",
+            chat_id, reply_to,
+        )
+        return
+
+    try:
+        if not args:
+            koneksi = daftar_koneksi()
+            if not koneksi:
+                send_telegram("Tidak ada koneksi di Airbyte.", chat_id, reply_to)
+                return
+            baris = "\n".join(
+                f"• <code>{html.escape(k.get('name', '?'))}</code>"
+                f"{'' if k.get('status') == 'active' else ' <i>(' + html.escape(str(k.get('status'))) + ')</i>'}"
+                for k in koneksi
+            )
+            send_telegram(
+                f"<b>Koneksi Airbyte</b>\n{baris}\n\nPakai: <code>/sync nama-koneksi</code>",
+                chat_id, reply_to,
+            )
+            return
+
+        target = cari_koneksi(" ".join(args))
+        hasil = _api("POST", "/jobs", json={
+            "connectionId": target["connectionId"],
+            "jobType": "sync",
+        })
+    except AirbyteError as exc:
+        send_telegram(f"❌ Airbyte: {html.escape(str(exc))}", chat_id, reply_to)
+        return
+
+    # Laporan selesai datang lewat webhook Airbyte ke relay ini — jalur yang sudah
+    # berjalan sejak awal. Tidak ada pemantau tambahan di sini.
+    send_telegram(
+        f"▶️ Sync <b>{html.escape(target.get('name', '?'))}</b> dimulai "
+        f"(job {hasil.get('jobId', '?')}).\n"
+        f"<i>Hasilnya menyusul lewat notifikasi Airbyte.</i>",
+        chat_id, reply_to,
+    )
+
+
 # ── Bot: perintah dari grup Telegram ────────────────────────────────────────
 
 BANTUAN = (
@@ -238,6 +403,8 @@ BANTUAN = (
     "/split <i>A1/Finance</i> — hanya folder tertentu (relatif ke NEXTCLOUD_SOURCE_HOME, "
     "boleh beberapa dipisah spasi)\n"
     "/dbt — jalankan <code>dbt run</code>\n"
+    "/sync — daftar koneksi Airbyte\n"
+    "/sync <i>nama-koneksi</i> — picu sync koneksi itu\n"
     "/status — job sedang jalan atau tidak, plus hasil run terakhir\n"
     "/logs [split|dbt] — ekor log run terakhir\n"
     "/help — pesan ini"
@@ -443,6 +610,8 @@ def handle_command(message: dict) -> None:
         kirim_status(chat_id, reply_to)
     elif perintah == "logs":
         kirim_logs(args, chat_id, reply_to)
+    elif perintah == "sync":
+        mulai_sync(args, chat_id, reply_to)
     elif perintah in JOBS:
         mulai_job(perintah, args, chat_id, reply_to)
     else:

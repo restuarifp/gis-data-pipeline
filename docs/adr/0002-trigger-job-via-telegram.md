@@ -39,6 +39,15 @@ pesan dobel. Alternatifnya, split-excel mengirim sendiri ke Telegram saat selesa
 ditolak: itu berarti token bot harus ikut ditaruh di container yang mengunduh dan
 memproses file dari luar.
 
+**Airbyte (`/sync`) tidak memakai pola control server.** Airbyte punya API dan
+antrian job sendiri, jadi menambahkan lock atau server kontrol di sisi kita hanya
+menutupi state Airbyte yang sebenarnya. Laporan selesai pun tidak perlu pemantau
+baru: webhook Airbyte ke relay ini sudah berjalan sejak awal, jadi `/sync` memicu
+lewat API dan hasilnya kembali lewat jalur notifikasi yang sudah ada. Koneksi
+dicocokkan **berdasarkan nama** dari API, bukan UUID di `.env`, supaya koneksi
+baru langsung terpakai; nama yang ambigu ditolak beserta daftar kandidat, karena
+memicu sync koneksi yang salah berarti menulis ke tabel kantor lain.
+
 Sifat best-effort dari [ADR 0001](0001-notifikasi-telegram-best-effort.md) tetap
 berlaku untuk balasan perintah: laporan hasil job dikirim sekali dengan retry, dan
 kalau gagal hanya di-log. **Tidak adanya balasan bukan bukti job tidak jalan** —
