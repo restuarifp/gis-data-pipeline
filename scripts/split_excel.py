@@ -15,6 +15,8 @@ Naming convention output:
 
 Mode:
   python split_excel.py           -- jalankan sekali lalu keluar
+  python split_excel.py A2/Finance [B1/Finance ...]
+                                  -- jalankan sekali untuk folder tertentu saja
   python split_excel.py --watch   -- loop berkala (SCHEDULE_INTERVAL_MINUTES)
   python split_excel.py --serve   -- server kontrol HTTP (job_control) di gisnet,
                                      dipakai bot Telegram untuk memicu run
@@ -482,6 +484,28 @@ def validate_params(params: dict) -> dict:
 
 
 def main() -> None:
+    flag = {a for a in sys.argv[1:] if a.startswith("-")}
+    tak_dikenal = flag - {"--watch", "--serve"}
+    if tak_dikenal:
+        log.error("Opsi tidak dikenal: %s (yang ada: --watch, --serve)",
+                  ", ".join(sorted(tak_dikenal)))
+        sys.exit(2)
+
+    # Argumen non-flag = daftar folder sumber, seperti argumen /split di Telegram.
+    # Dulu argumen begini diabaikan diam-diam sehingga run tetap memakai seluruh
+    # NEXTCLOUD_SOURCE_PATHS — terlihat seolah perintahnya tidak berpengaruh.
+    argumen = [a for a in sys.argv[1:] if not a.startswith("-")]
+    pilihan = None
+    if argumen:
+        if "--watch" in flag:
+            log.error("Argumen folder tidak bisa digabung dengan --watch.")
+            sys.exit(2)
+        try:
+            pilihan = validate_params({"sources": argumen}).get("sources")
+        except ValueError as exc:
+            log.error("Argumen ditolak: %s", exc)
+            sys.exit(2)
+
     if "--serve" in sys.argv:
         import job_control
 
@@ -490,6 +514,13 @@ def main() -> None:
             lambda params: run_once(params.get("sources")),
             validate=validate_params,
             background="--watch" in sys.argv,
+            info={
+                "source_home": f"/{SOURCE_HOME}" if SOURCE_HOME else None,
+                "sources": SOURCE_PATHS,
+                "dest": DEST_PATH,
+                "interval_menit": SCHEDULE_MINUTES,
+                "fitur": "sources-arg",  # penanda kode ini sudah mendukung /split <path>
+            },
         )
         if "--watch" not in sys.argv:
             return
@@ -501,7 +532,7 @@ def main() -> None:
             log.info("Tunggu %d menit...", SCHEDULE_MINUTES)
             time.sleep(SCHEDULE_MINUTES * 60)
     else:
-        sys.exit(0 if run_once() else 1)
+        sys.exit(0 if run_once(pilihan) else 1)
 
 
 if __name__ == "__main__":

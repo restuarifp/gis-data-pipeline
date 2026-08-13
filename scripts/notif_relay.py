@@ -380,6 +380,21 @@ def kirim_status(chat_id, reply_to) -> None:
         try:
             st = requests.get(f"{base}/status", timeout=REQUEST_TIMEOUT).json()
             baris.append(_ringkas_status(nama, st))
+
+            # Config aktif ikut ditampilkan: kalau container masih memakai .env
+            # atau image lama (mis. setelah `docker compose restart`), di sinilah
+            # kelihatan — tanpa perlu akses SSH ke server.
+            info = st.get("info") or {}
+            if info.get("source_home") is not None:
+                baris.append(f"   home: <code>{html.escape(str(info['source_home']))}</code>")
+            elif "source_home" in info:
+                baris.append("   home: <i>(kosong — NEXTCLOUD_SOURCE_HOME belum di-set)</i>")
+            if info.get("sources"):
+                baris.append("   sumber: " + ", ".join(
+                    f"<code>{html.escape(str(s))}</code>" for s in info["sources"]
+                ))
+            if "fitur" not in info and nama == "split":
+                baris.append("   ⚠️ <i>image lama: argumen path pada /split belum didukung</i>")
         except Exception as exc:  # noqa: BLE001
             baris.append(f"⚠️ <b>{nama}</b>: tidak bisa dihubungi ({html.escape(str(exc)[:120])})")
     send_telegram("\n".join(baris), chat_id, reply_to)

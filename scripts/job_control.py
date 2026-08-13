@@ -61,9 +61,13 @@ class JobRunner:
     kedua ditolak (409), bukan diantrikan.
     """
 
-    def __init__(self, nama: str, fn):
+    def __init__(self, nama: str, fn, info=None):
         self.nama = nama
         self.fn = fn
+        # Config yang sedang aktif, ikut ditampilkan di /status. Gunanya untuk
+        # memastikan container benar-benar memakai .env dan kode terbaru —
+        # `docker compose restart` tidak membaca ulang .env maupun rebuild image.
+        self.info = info or {}
         self._lock = threading.Lock()
         self._running = False
         self._logs: deque = deque(maxlen=LOG_LINES)
@@ -83,6 +87,7 @@ class JobRunner:
             durasi = None
         return {
             "job": self.nama,
+            "info": self.info() if callable(self.info) else self.info,
             "running": self._running,
             "last_started": self.last_started,
             "last_finished": self.last_finished,
@@ -129,7 +134,7 @@ class JobRunner:
             self._lock.release()
 
 
-def make_handler(runner: JobRunner, validate=None):
+def _make_handler(runner: JobRunner, validate=None):
     """
     Bangun request handler untuk satu JobRunner.
 
@@ -197,15 +202,16 @@ def make_handler(runner: JobRunner, validate=None):
     return Handler
 
 
-def serve(nama: str, fn, validate=None, background: bool = False) -> JobRunner:
+def serve(nama: str, fn, validate=None, background: bool = False, info=None) -> JobRunner:
     """
     Nyalakan server kontrol untuk job `nama`.
 
     background=True menjalankannya di thread daemon (dipakai split-excel yang
     thread utamanya sudah dipegang loop --watch).
+    `info` dict/callable berisi config aktif yang ikut tampil di /status.
     """
-    runner = JobRunner(nama, fn)
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), make_handler(runner, validate))
+    runner = JobRunner(nama, fn, info)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), _make_handler(runner, validate))
     log.info("Server kontrol job '%s' mendengarkan di 0.0.0.0:%d", nama, PORT)
 
     if background:
