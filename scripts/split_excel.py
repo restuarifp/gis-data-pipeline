@@ -16,6 +16,12 @@ Naming convention output:
 Mode:
   python split_excel.py           -- jalankan sekali lalu keluar
   python split_excel.py --watch   -- loop berkala (SCHEDULE_INTERVAL_MINUTES)
+  python split_excel.py --serve   -- server kontrol HTTP (job_control) di gisnet,
+                                     dipakai bot Telegram untuk memicu run
+
+Path sumber:
+  NEXTCLOUD_SOURCE_PATHS relatif terhadap NEXTCLOUD_SOURCE_HOME (bila di-set),
+  sehingga prefix panjang tidak perlu diulang di tiap entri. Lihat resolve_source().
 """
 
 import io
@@ -24,6 +30,7 @@ import os
 import re
 import sys
 import time
+import posixpath
 import xml.etree.ElementTree as ET
 from copy import copy
 from pathlib import PurePosixPath
@@ -58,6 +65,53 @@ SCHEDULE_MINUTES   = int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "60"))
 WEBDAV_MAX_RETRIES           = int(os.getenv("WEBDAV_MAX_RETRIES", "5"))
 WEBDAV_RETRY_BACKOFF_SECONDS = float(os.getenv("WEBDAV_RETRY_BACKOFF_SECONDS", "3"))
 
+# Folder induk untuk semua path sumber. Kalau di-set, entri di
+# NEXTCLOUD_SOURCE_PATHS cukup ditulis relatif (mis. "A1/Finance").
+SOURCE_HOME = unquote(os.getenv("NEXTCLOUD_SOURCE_HOME", "").strip()).strip("/")
+
+
+def resolve_source(path: str) -> str:
+    """
+    Ubah satu entri path sumber menjadi path absolut di Nextcloud.
+
+    - SOURCE_HOME kosong  -> path dipakai apa adanya (perilaku sebelum var ini ada).
+    - path sudah di bawah SOURCE_HOME -> dibiarkan. Join-nya idempoten, jadi .env
+      lama yang menulis prefix lengkap di tiap entri tetap jalan tanpa diedit.
+    - selain itu -> digabung di bawah SOURCE_HOME.
+
+    Hasil yang keluar dari SOURCE_HOME (mis. lewat '..') ditolak: path bisa datang
+    dari argumen perintah /split di Telegram, dan itu tidak boleh bisa menunjuk ke
+    folder sembarang di akun Nextcloud.
+    """
+    bersih = posixpath.normpath(unquote(path.strip()).replace("\\", "/")).strip("/")
+    if bersih in ("", "."):
+        raise ValueError("path sumber kosong")
+
+    # normpath tidak membuang '..' yang berada di depan; tolak eksplisit. Cek ini
+    # berlaku juga saat SOURCE_HOME kosong, di mana tidak ada batas lain.
+    if bersih == ".." or bersih.startswith("../") or "/../" in bersih:
+        raise ValueError(f"path {path!r} mengandung '..'")
+
+    if not SOURCE_HOME:
+        return f"/{bersih}"
+
+    if bersih == SOURCE_HOME or bersih.startswith(f"{SOURCE_HOME}/"):
+        hasil = bersih
+    else:
+        hasil = posixpath.normpath(f"{SOURCE_HOME}/{bersih}").strip("/")
+
+    if hasil != SOURCE_HOME and not hasil.startswith(f"{SOURCE_HOME}/"):
+        raise ValueError(
+            f"path {path!r} keluar dari NEXTCLOUD_SOURCE_HOME ({SOURCE_HOME!r})"
+        )
+    return f"/{hasil}"
+
+
+def parse_sources(raw: str) -> list[str]:
+    """Pecah string koma/newline menjadi daftar path absolut."""
+    return [resolve_source(p) for p in re.split(r"[,\n]", raw) if p.strip()]
+
+
 # Dukung kedua nama variabel (NEXTCLOUD_SOURCE_PATHS dan NEXTCLOUD_SOURCE_PATH).
 # Pisahkan dengan koma atau newline; unquote() handle path URL-encoded (%20, dll.).
 _raw_sources = (
@@ -69,12 +123,18 @@ if not _raw_sources:
     raise ValueError("Set NEXTCLOUD_SOURCE_PATHS (atau NEXTCLOUD_SOURCE_PATH) di .env")
 
 print(f"[split-excel] RAW SOURCE: {repr(_raw_sources)}", flush=True)
+if SOURCE_HOME:
+    print(f"[split-excel] SOURCE HOME: /{SOURCE_HOME}", flush=True)
+else:
+    # Tanpa SOURCE_HOME, argumen /split dari Telegram bisa menunjuk folder mana pun
+    # di akun Nextcloud (selain '..', yang tetap ditolak).
+    print(
+        "[split-excel] PERINGATAN: NEXTCLOUD_SOURCE_HOME kosong — "
+        "argumen path pada POST /run tidak dibatasi ke satu folder induk.",
+        flush=True,
+    )
 
-SOURCE_PATHS: list[str] = [
-    unquote(p.strip())
-    for p in re.split(r"[,\n]", _raw_sources)
-    if p.strip()
-]
+SOURCE_PATHS: list[str] = parse_sources(_raw_sources)
 
 print(f"[split-excel] PARSED {len(SOURCE_PATHS)} path(s):", flush=True)
 for i, p in enumerate(SOURCE_PATHS, 1):
@@ -366,12 +426,20 @@ def process_source(source_path: str) -> bool:
     return True
 
 
-def run_once() -> bool:
-    """Jalankan satu siklus untuk semua sumber. True jika semua sukses."""
+def run_once(sources: list[str] | None = None) -> bool:
+    """
+    Jalankan satu siklus. True jika semua sumber sukses.
+
+    `sources` None = pakai SOURCE_PATHS dari .env (perilaku terjadwal). Daftar
+    eksplisit dipakai saat run dipicu manual, mis. `/split A1/Finance` dari
+    Telegram — path-nya sudah lewat resolve_source() di validate_params().
+    """
+    targets = sources or SOURCE_PATHS
+
     log.info("=== Mulai run split-excel ===")
     log.info("  Tujuan  : %s", DEST_PATH)
-    log.info("  Sumber  : %d folder", len(SOURCE_PATHS))
-    for i, p in enumerate(SOURCE_PATHS, 1):
+    log.info("  Sumber  : %d folder%s", len(targets), " (dipilih manual)" if sources else "")
+    for i, p in enumerate(targets, 1):
         log.info("    [%d] %s", i, p)
 
     try:
@@ -381,7 +449,7 @@ def run_once() -> bool:
         return False
 
     ok = True
-    for source_path in SOURCE_PATHS:
+    for source_path in targets:
         if not process_source(source_path):
             ok = False
 
@@ -392,7 +460,40 @@ def run_once() -> bool:
     return ok
 
 
+def validate_params(params: dict) -> dict:
+    """
+    Validasi body POST /run. Melempar ValueError -> dibalas 400 oleh job_control.
+
+    Ini satu-satunya tempat path dari luar diperiksa; bot Telegram sengaja tidak
+    ikut memvalidasi supaya tidak ada dua aturan yang bisa berbeda.
+    """
+    raw = params.get("sources")
+    if raw in (None, "", []):
+        return {}
+    if isinstance(raw, str):
+        raw = re.split(r"[,\s]+", raw)
+    if not isinstance(raw, list):
+        raise ValueError("field 'sources' harus berupa list atau string")
+
+    sources = [resolve_source(str(p)) for p in raw if str(p).strip()]
+    if not sources:
+        raise ValueError("field 'sources' kosong setelah dibersihkan")
+    return {"sources": sources}
+
+
 def main() -> None:
+    if "--serve" in sys.argv:
+        import job_control
+
+        job_control.serve(
+            "split-excel",
+            lambda params: run_once(params.get("sources")),
+            validate=validate_params,
+            background="--watch" in sys.argv,
+        )
+        if "--watch" not in sys.argv:
+            return
+
     if "--watch" in sys.argv:
         log.info("Mode watch aktif, interval: %d menit", SCHEDULE_MINUTES)
         while True:

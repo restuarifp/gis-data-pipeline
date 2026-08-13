@@ -15,6 +15,7 @@ A geospatial-based remote worker data warehouse stack for tracking civil registr
 | `dbt` | Custom Dockerfile.dbt (Python 3.9 + dbt-postgres) | CLI only |
 | `split-excel` | Custom Dockerfile.split-excel (Python 3.12) | — |
 | `notif-relay` | Custom Dockerfile.notif-relay (Python 3.12) | 8000 |
+| `dbt-runner` | Custom Dockerfile.dbt (server kontrol job) | — |
 | `onlyoffice-docs` | onlyoffice/documentserver:9.3.1.1 | 8080 |
 | `grafana` | grafana/grafana:latest | 3030 |
 | `prometheus` | prom/prometheus:latest | 9090 |
@@ -39,8 +40,12 @@ docker compose run --rm dbt dbt deps           # install packages
 # Run split-excel once (without --watch loop)
 docker compose run --rm split-excel python split_excel.py
 
-# Start the notif-relay (Airbyte webhook → Telegram); listens on :8000
+# Start the notif-relay (Airbyte webhook → Telegram + bot perintah); listens on :8000
 docker compose up -d notif-relay
+
+# Trigger a job the way the Telegram bot does (control server, gisnet-internal)
+docker run --rm --network gis-data-pipeline_gisnet curlimages/curl -s -X POST split-excel:8080/run
+docker run --rm --network gis-data-pipeline_gisnet curlimages/curl -s split-excel:8080/status
 
 # Start the observability stack (Grafana on :3030, admin/admin by default)
 docker compose --profile observability up -d
@@ -101,6 +106,8 @@ Nextcloud (WebDAV)
 Configured via `.env` (required: `NEXTCLOUD_URL`, `NEXTCLOUD_USER`, `NEXTCLOUD_PASSWORD`, `NEXTCLOUD_SOURCE_PATHS`, `NEXTCLOUD_DEST_PATH`; optional: `SCHEDULE_INTERVAL_MINUTES` default 60, `WEBDAV_MAX_RETRIES` default 5, `WEBDAV_RETRY_BACKOFF_SECONDS` default 3).
 
 - Accepts multiple source paths via `NEXTCLOUD_SOURCE_PATHS` (comma or newline separated)
+- **`NEXTCLOUD_SOURCE_HOME`** — optional parent folder; entries in `NEXTCLOUD_SOURCE_PATHS` are written relative to it (`A1/Finance`). `resolve_source()` joins them **idempotently**, so entries that already spell out the full path still work and an unset `SOURCE_HOME` reproduces the old behaviour exactly. It is also the security boundary for the `/split <path>` Telegram argument: anything containing `..` or resolving outside `SOURCE_HOME` is rejected. **An empty `SOURCE_HOME` means no folder boundary at all** (only `..` is still blocked) — the service logs a warning at startup when that's the case.
+- **Control server (`--serve`)**: `job_control.serve()` exposes `POST /run` (202 / 409 busy / 400 rejected params), `GET /status`, `GET /logs` on `JOB_CONTROL_PORT` (8080) — **gisnet only, never published to the host**. `POST /run {"sources": [...]}` runs a subset. The container CMD is `--watch --serve`, so the schedule and the on-demand path coexist.
 - Output naming: `{kantor_name}__{file_stem}__{safe_sheet_name}.xlsx`
 - Atomic per-office: if any sheet fails to process, the whole office is skipped and old files are not deleted
 - `--watch` flag enables polling loop; without it, runs once and exits (exit code 1 if any upload failed)
@@ -117,6 +124,9 @@ The **Relay Notifikasi** (see `CONTEXT.md`): a tiny stdlib-only HTTP server that
 - **Fails fast on missing config:** an empty/absent `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` logs one clear line and exits **78** (`EX_CONFIG`). The compose restart policy is `on-failure:3`, so a misconfigured relay stops after 3 attempts instead of crash-looping. Note an *empty* value in `.env` is still a set env var — hence the explicit emptiness check, not `os.environ[...]`.
 - Accepts any POST path (health check on `GET /`). `format_message()` is defensive: it reads the structured `data` object of Airbyte's custom webhook, falls back to a Slack-style `{text}` field, and dumps raw JSON for unknown shapes. All interpolated values are HTML-escaped (`parse_mode=HTML`).
 - Airbyte is **not** in this compose stack — point its webhook notification at `http://<host>:8000/` (the relay publishes host port 8000 on `gisnet`).
+- **Two-way bot** (`docs/adr/0002-trigger-job-via-telegram.md`): a `getUpdates` long-polling thread accepts `/split [path...]`, `/dbt [select]`, `/status`, `/logs [split|dbt]`, `/help`. It triggers jobs by calling the control servers over `gisnet` (`SPLIT_CONTROL_URL`, `DBT_CONTROL_URL`) — **never via the Docker socket**, because the relay eats outside input. Commands from any chat other than `TELEGRAM_CHAT_ID` are ignored silently.
+- The bot does **not** validate `/split` paths; it forwards them and surfaces the control server's `400`. Path rules live only in `resolve_source()` — two copies of a rule drift, and the looser one becomes the hole.
+- Long-polling means the token must have **no webhook** set and only **one** polling process may run per token (Telegram answers 409 otherwise). An invalid token (401/404) shuts the command loop down with one clear log line; the Airbyte webhook path keeps running.
 
 ### Observability (`observability/`)
 

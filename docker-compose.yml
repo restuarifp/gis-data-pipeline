@@ -55,6 +55,29 @@ services:
     networks:
       - gisnet
 
+  # Sama dengan service `dbt` di atas, tapi hidup terus dan hanya menjalankan
+  # server kontrol job — supaya bot Telegram bisa memicu `dbt run` tanpa akses
+  # ke Docker socket. Service `dbt` tetap untuk pemakaian CLI.
+  dbt-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.dbt
+    container_name: dbt_runner
+    restart: unless-stopped
+    working_dir: /usr/app
+    command: ["python", "dbt_control.py"]
+    volumes:
+      - ./dbt:/usr/app/dbt
+    environment:
+      - DBT_POSTGRES_HOST=postgres-db
+      - DBT_POSTGRES_USER=admin
+      - DBT_POSTGRES_PW=password123
+      - DBT_POSTGRES_DB=capil_db
+    depends_on:
+      - postgres-db
+    networks:
+      - gisnet
+
   split-excel:
     build:
       context: .

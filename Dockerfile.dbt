@@ -6,6 +6,9 @@ RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 # Install dbt-postgres
 RUN pip install --no-cache-dir dbt-postgres
 
+# Server kontrol job (dipakai service dbt-runner; stdlib saja, tanpa dependency baru)
+COPY scripts/job_control.py scripts/dbt_control.py /usr/app/
+
 # Set working directory
 WORKDIR /usr/app/dbt
 

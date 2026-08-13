@@ -13,16 +13,26 @@ pesannya hilang, Airbyte tidak pernah dibuat menganggap job bermasalah.
 
 Satu webhook (satu Job) = satu pesan Telegram.
 
+Sekaligus bot dua arah: loop long-polling getUpdates menerima perintah dari grup
+TELEGRAM_CHAT_ID (/split, /dbt, /status, /logs, /help) lalu memicu job lewat
+server kontrol HTTP internal di gisnet — bukan lewat Docker socket. Lihat
+docs/adr/0002-trigger-job-via-telegram.md dan scripts/job_control.py.
+
 Endpoint:
   POST <apa saja>   -- terima webhook Airbyte, balas 200 seketika
   GET  /            -- health check, balas 200 "ok"
 
 Konfigurasi via environment (lihat .env.example):
   TELEGRAM_BOT_TOKEN            (wajib)
-  TELEGRAM_CHAT_ID             (wajib) -- id grup/chat tujuan
+  TELEGRAM_CHAT_ID             (wajib) -- id grup/chat tujuan sekaligus satu-satunya
+                                          chat yang perintahnya dilayani
   NOTIF_RELAY_PORT             (opsional, default 8000)
   TELEGRAM_MAX_RETRIES         (opsional, default 3)
   TELEGRAM_RETRY_BACKOFF_SECONDS (opsional, default 3)
+  TELEGRAM_BOT_ENABLED         (opsional, default true) -- matikan loop perintah
+  SPLIT_CONTROL_URL            (opsional, default http://split-excel:8080)
+  DBT_CONTROL_URL              (opsional, default http://dbt-runner:8080)
+  TELEGRAM_POLL_TIMEOUT        (opsional, default 50)
 """
 
 import html
@@ -73,8 +83,22 @@ TELEGRAM_CHAT_ID   = _wajib("TELEGRAM_CHAT_ID")
 PORT            = int(os.getenv("NOTIF_RELAY_PORT", "8000"))
 MAX_RETRIES     = int(os.getenv("TELEGRAM_MAX_RETRIES", "3"))
 RETRY_BACKOFF   = float(os.getenv("TELEGRAM_RETRY_BACKOFF_SECONDS", "3"))
-TELEGRAM_API    = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+TELEGRAM_BASE   = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+TELEGRAM_API    = f"{TELEGRAM_BASE}/sendMessage"
 REQUEST_TIMEOUT = 15  # detik, per-attempt ke api.telegram.org
+
+# ── Bot (perintah dari Telegram) ────────────────────────────────────────────
+# Job yang bisa dipicu; masing-masing menjalankan server kontrol job_control di
+# gisnet. Relay TIDAK menyentuh Docker socket — lihat docs/adr/0002.
+JOBS = {
+    "split": os.getenv("SPLIT_CONTROL_URL", "http://split-excel:8080").rstrip("/"),
+    "dbt":   os.getenv("DBT_CONTROL_URL", "http://dbt-runner:8080").rstrip("/"),
+}
+POLL_TIMEOUT   = int(os.getenv("TELEGRAM_POLL_TIMEOUT", "50"))   # long-poll getUpdates
+WATCH_INTERVAL = int(os.getenv("JOB_WATCH_INTERVAL_SECONDS", "10"))
+BOT_ENABLED    = os.getenv("TELEGRAM_BOT_ENABLED", "true").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 
 
 # ── Format pesan ────────────────────────────────────────────────────────────
@@ -157,17 +181,22 @@ def format_message(payload: dict) -> str:
 
 # ── Pengiriman ke Telegram (background, best-effort) ────────────────────────
 
-def send_telegram(text: str) -> None:
+def send_telegram(text: str, chat_id=None, reply_to=None) -> None:
     """
     Kirim satu pesan ke Telegram dengan retry linear backoff.
     Dipanggil dari thread background; kegagalan final hanya di-log.
+
+    chat_id/reply_to opsional dipakai balasan perintah bot; default-nya tetap
+    grup TELEGRAM_CHAT_ID sehingga jalur notifikasi Airbyte tidak berubah.
     """
     body = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id or TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    if reply_to:
+        body["reply_to_message_id"] = reply_to
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.post(TELEGRAM_API, json=body, timeout=REQUEST_TIMEOUT)
@@ -197,6 +226,232 @@ def dispatch(payload: dict) -> None:
         log.exception("Gagal memformat payload; mengirim dump mentah.")
         text = html.escape(json.dumps(payload, ensure_ascii=False)[:3500])
     send_telegram(text)
+
+
+# ── Bot: perintah dari grup Telegram ────────────────────────────────────────
+
+BANTUAN = (
+    "<b>Perintah yang tersedia</b>\n"
+    "/split — jalankan split-excel untuk semua folder di NEXTCLOUD_SOURCE_PATHS\n"
+    "/split <i>A1/Finance</i> — hanya folder tertentu (relatif ke NEXTCLOUD_SOURCE_HOME, "
+    "boleh beberapa dipisah spasi)\n"
+    "/dbt — jalankan <code>dbt run</code>\n"
+    "/status — job sedang jalan atau tidak, plus hasil run terakhir\n"
+    "/logs [split|dbt] — ekor log run terakhir\n"
+    "/help — pesan ini"
+)
+
+
+def _fmt_waktu(ts) -> str:
+    if not ts:
+        return "-"
+    return time.strftime("%d/%m %H:%M:%S", time.localtime(ts))
+
+
+def _ringkas_status(nama: str, st: dict) -> str:
+    if st.get("running"):
+        return f"⏳ <b>{nama}</b>: berjalan ({_fmt_duration(st.get('duration_s'))})"
+    if st.get("last_finished") is None:
+        return f"💤 <b>{nama}</b>: belum pernah jalan sejak service start"
+    tanda = "✅" if st.get("last_ok") else "❌"
+    return (
+        f"{tanda} <b>{nama}</b>: selesai {_fmt_waktu(st.get('last_finished'))} "
+        f"({_fmt_duration(st.get('duration_s'))})"
+    )
+
+
+def watch_job(nama: str, chat_id) -> None:
+    """
+    Pantau job sampai selesai lalu laporkan hasilnya ke chat yang memicu.
+    Dijalankan di thread daemon; error jaringan cukup di-log (best-effort, ADR 0001).
+    """
+    base = JOBS[nama]
+    while True:
+        time.sleep(WATCH_INTERVAL)
+        try:
+            st = requests.get(f"{base}/status", timeout=REQUEST_TIMEOUT).json()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Gagal cek status %s: %s", nama, exc)
+            return
+        if st.get("running"):
+            continue
+
+        durasi = _fmt_duration(st.get("duration_s"))
+        if st.get("last_ok"):
+            send_telegram(f"✅ <b>{nama}</b> selesai ({durasi}).", chat_id)
+        else:
+            ekor = ""
+            try:
+                teks = requests.get(f"{base}/logs", timeout=REQUEST_TIMEOUT).text
+                ekor = "\n".join(teks.splitlines()[-15:])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Gagal ambil log %s: %s", nama, exc)
+            pesan = f"❌ <b>{nama}</b> GAGAL ({durasi})."
+            if ekor:
+                pesan += f"\n<pre>{html.escape(ekor[:3000])}</pre>"
+            send_telegram(pesan, chat_id)
+        return
+
+
+def mulai_job(nama: str, args: list, chat_id, reply_to) -> None:
+    """Panggil POST /run pada control server job, lalu balas ke Telegram."""
+    base = JOBS[nama]
+    body = {}
+    if nama == "split" and args:
+        # Diteruskan apa adanya — validasi path hanya hidup di resolve_source()
+        # milik split-excel, supaya tidak ada dua aturan yang bisa berbeda.
+        body["sources"] = args
+    elif nama == "dbt" and args:
+        body["select"] = " ".join(args)
+
+    try:
+        resp = requests.post(f"{base}/run", json=body, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        send_telegram(
+            f"❌ Tidak bisa menghubungi <b>{nama}</b>: {html.escape(str(exc)[:300])}",
+            chat_id, reply_to,
+        )
+        return
+
+    if resp.status_code == 202:
+        rincian = ""
+        if body.get("sources"):
+            rincian = "\n" + "\n".join(f"• {html.escape(s)}" for s in body["sources"])
+        elif body.get("select"):
+            rincian = f"\n<code>--select {html.escape(body['select'])}</code>"
+        send_telegram(f"▶️ <b>{nama}</b> dimulai.{rincian}", chat_id, reply_to)
+        threading.Thread(target=watch_job, args=(nama, chat_id), daemon=True).start()
+    elif resp.status_code == 409:
+        send_telegram(f"⏳ <b>{nama}</b> masih berjalan; permintaan diabaikan.",
+                      chat_id, reply_to)
+    else:
+        try:
+            alasan = resp.json().get("error", resp.text)
+        except ValueError:
+            alasan = resp.text
+        send_telegram(
+            f"❌ <b>{nama}</b> ditolak ({resp.status_code}): "
+            f"{html.escape(str(alasan)[:500])}",
+            chat_id, reply_to,
+        )
+
+
+def kirim_status(chat_id, reply_to) -> None:
+    baris = []
+    for nama, base in JOBS.items():
+        try:
+            st = requests.get(f"{base}/status", timeout=REQUEST_TIMEOUT).json()
+            baris.append(_ringkas_status(nama, st))
+        except Exception as exc:  # noqa: BLE001
+            baris.append(f"⚠️ <b>{nama}</b>: tidak bisa dihubungi ({html.escape(str(exc)[:120])})")
+    send_telegram("\n".join(baris), chat_id, reply_to)
+
+
+def kirim_logs(args: list, chat_id, reply_to) -> None:
+    nama = (args[0] if args else "split").lower()
+    if nama not in JOBS:
+        send_telegram(f"Job tidak dikenal: {html.escape(nama)}. "
+                      f"Pilihan: {', '.join(JOBS)}", chat_id, reply_to)
+        return
+    try:
+        teks = requests.get(f"{JOBS[nama]}/logs", timeout=REQUEST_TIMEOUT).text
+    except requests.RequestException as exc:
+        send_telegram(f"❌ Gagal ambil log {nama}: {html.escape(str(exc)[:300])}",
+                      chat_id, reply_to)
+        return
+    ekor = "\n".join(teks.splitlines()[-30:]) or "(belum ada log)"
+    send_telegram(f"<b>Log {nama}</b>\n<pre>{html.escape(ekor[:3500])}</pre>",
+                  chat_id, reply_to)
+
+
+def handle_command(message: dict) -> None:
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    teks = (message.get("text") or "").strip()
+    if not teks.startswith("/"):
+        return
+
+    # Otorisasi: bot bisa di-DM siapa saja yang tahu username-nya, jadi hanya
+    # grup TELEGRAM_CHAT_ID yang dilayani. Chat lain diabaikan diam-diam.
+    if str(chat_id) != str(TELEGRAM_CHAT_ID):
+        log.warning("Perintah %r dari chat %s diabaikan (bukan TELEGRAM_CHAT_ID).",
+                    teks.split()[0], chat_id)
+        return
+
+    bagian = teks.split()
+    perintah = bagian[0].lstrip("/").split("@", 1)[0].lower()  # /split@NamaBot
+    args = [a for a in bagian[1:] if a.strip(",")]
+    args = [a.strip(",") for a in args]
+    reply_to = message.get("message_id")
+
+    if perintah in ("help", "start"):
+        send_telegram(BANTUAN, chat_id, reply_to)
+    elif perintah == "status":
+        kirim_status(chat_id, reply_to)
+    elif perintah == "logs":
+        kirim_logs(args, chat_id, reply_to)
+    elif perintah in JOBS:
+        mulai_job(perintah, args, chat_id, reply_to)
+    else:
+        send_telegram(f"Perintah tidak dikenal: <code>/{html.escape(perintah)}</code>\n\n"
+                      f"{BANTUAN}", chat_id, reply_to)
+
+
+def poll_updates() -> None:
+    """
+    Loop long-polling getUpdates.
+
+    Dipilih ketimbang webhook karena tidak butuh URL publik/HTTPS. Konsekuensinya:
+    token ini tidak boleh punya webhook terpasang, dan hanya boleh ada satu proses
+    yang polling per token (Telegram membalas 409 kalau ada dua).
+    """
+    offset = None
+    log.info("Bot polling aktif (job: %s).", ", ".join(JOBS))
+    while True:
+        try:
+            resp = requests.get(
+                f"{TELEGRAM_BASE}/getUpdates",
+                params={
+                    "timeout": POLL_TIMEOUT,
+                    "offset": offset,
+                    "allowed_updates": json.dumps(["message"]),
+                },
+                timeout=POLL_TIMEOUT + 15,
+            )
+            if resp.status_code in (401, 404):
+                # Token salah/dicabut: retry tidak akan pernah berhasil. Hentikan
+                # loop perintah, tapi biarkan relay webhook Airbyte tetap jalan.
+                log.error(
+                    "getUpdates ditolak (%s): TELEGRAM_BOT_TOKEN tidak valid. "
+                    "Bot perintah dimatikan; relay webhook tetap berjalan.",
+                    resp.status_code,
+                )
+                return
+            if resp.status_code == 409:
+                # Ada webhook terpasang atau instance lain sedang polling token ini.
+                log.error("getUpdates konflik (409): %s", resp.text[:300])
+                time.sleep(RETRY_BACKOFF * 10)
+                continue
+            if not resp.ok:
+                log.warning("getUpdates membalas %s: %s", resp.status_code, resp.text[:300])
+                time.sleep(RETRY_BACKOFF)
+                continue
+
+            for update in resp.json().get("result", []):
+                offset = update["update_id"] + 1
+                message = update.get("message")
+                if not message:
+                    continue
+                try:
+                    handle_command(message)
+                except Exception:  # noqa: BLE001 -- satu perintah gagal != bot mati
+                    log.exception("Gagal memproses perintah.")
+        except requests.RequestException as exc:
+            log.warning("getUpdates gagal: %s", exc)
+            time.sleep(RETRY_BACKOFF)
+        except Exception:  # noqa: BLE001 -- loop bot tidak boleh menjatuhkan relay
+            log.exception("Error tak terduga di loop bot.")
+            time.sleep(RETRY_BACKOFF)
 
 
 # ── HTTP server ─────────────────────────────────────────────────────────────
@@ -236,6 +491,11 @@ class RelayHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    if BOT_ENABLED:
+        threading.Thread(target=poll_updates, daemon=True).start()
+    else:
+        log.info("Bot Telegram dimatikan (TELEGRAM_BOT_ENABLED=false).")
+
     server = ThreadingHTTPServer(("0.0.0.0", PORT), RelayHandler)
     log.info("Relay Notifikasi mendengarkan di 0.0.0.0:%d", PORT)
     try:

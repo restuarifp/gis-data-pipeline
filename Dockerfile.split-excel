@@ -5,6 +5,6 @@ WORKDIR /app
 COPY scripts/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY scripts/split_excel.py .
+COPY scripts/split_excel.py scripts/job_control.py ./
 
-CMD ["python", "split_excel.py", "--watch"]
+CMD ["python", "split_excel.py", "--watch", "--serve"]
