@@ -376,10 +376,19 @@ def _api(metode: str, path: str, **kwargs):
 
 
 def daftar_koneksi() -> list:
+    """
+    Semua koneksi, diurutkan alfabetis menurut nama.
+
+    Airbyte mengembalikannya dalam urutan yang tidak dijamin dan bisa berubah
+    antar panggilan; diurutkan di sini supaya setiap pemakainya — daftar di
+    Mini App, daftar /sync, maupun daftar kandidat saat nama ambigu — menampilkan
+    urutan yang sama dan stabil.
+    """
     params = {"limit": 100}
     if AIRBYTE_WORKSPACE_ID:
         params["workspaceIds"] = AIRBYTE_WORKSPACE_ID
-    return _api("GET", "/connections", params=params).get("data", [])
+    koneksi = _api("GET", "/connections", params=params).get("data", [])
+    return sorted(koneksi, key=lambda k: (k.get("name") or "").lower())
 
 
 def cari_koneksi(nama: str) -> dict:
