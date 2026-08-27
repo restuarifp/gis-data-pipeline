@@ -19,6 +19,19 @@ kita. Konsekuensinya: token tidak boleh punya webhook terpasang, dan hanya boleh
 
 **Otorisasi.** Bot Telegram bisa di-DM siapa saja yang tahu username-nya, jadi
 perintah dari chat selain `TELEGRAM_CHAT_ID` diabaikan diam-diam (hanya di-log).
+Pengecualiannya adalah **allowlist eksplisit** `TELEGRAM_DM_USER_IDS`: user yang
+id-nya ditulis operator di `.env` boleh memakai perintah yang sama lewat chat
+privat. Dipilih daftar id, bukan pemeriksaan keanggotaan grup, karena keanggotaan
+bisa berubah tanpa sepengetahuan siapa pun yang memegang `.env` — dan menambah
+orang ke grup notifikasi bukan tindakan yang terasa seperti memberi hak menjalankan
+job. Id yang ditolak ikut di-log supaya operator tahu angka apa yang perlu
+ditambahkan; `/id` membalas dengan id pengirim untuk keperluan yang sama.
+
+**Hasil run dikirim balik ke pemicunya.** Run yang dipicu dari chat privat membuat
+chat itu "berlangganan" satu laporan berikutnya, jadi operator DM tidak perlu
+menengok ke grup. Grup tetap menerima laporan seperti biasa dan tetap hanya
+`watch_jobs()` yang melapor — yang bertambah hanya daftar penerima, bukan jumlah
+tempat yang melapor.
 
 **Validasi path hidup di satu tempat.** Argumen `/split A1/Finance` diteruskan apa
 adanya oleh relay; yang memeriksanya hanya `resolve_source()` di `split_excel.py`,

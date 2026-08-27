@@ -18,6 +18,10 @@ TELEGRAM_CHAT_ID (/split, /dbt, /status, /logs, /help) lalu memicu job lewat
 server kontrol HTTP internal di gisnet — bukan lewat Docker socket. Lihat
 docs/adr/0002-trigger-job-via-telegram.md dan scripts/job_control.py.
 
+Selain grup, operator yang id-nya terdaftar di TELEGRAM_DM_USER_IDS boleh memakai
+perintah yang sama lewat chat privat; hasil run yang dipicu dari sana ikut dikirim
+balik ke chat privat itu, bukan hanya ke grup.
+
 Sekaligus melayani Mini App Telegram: halaman web kecil di GET /app dengan API
 JSON di /api/* yang diautentikasi lewat initData (HMAC bot token) — perintah yang
 sama dengan bot teks, tapi bisa diklik. Lihat docs/adr/0003-mini-app-telegram.md.
@@ -46,6 +50,7 @@ Konfigurasi via environment (lihat .env.example):
   MINI_APP_URL                 (opsional) -- URL HTTPS publik ke /app; kosong = Mini App mati
   MINI_APP_DIRECT_LINK         (opsional) -- https://t.me/<bot>/<app>, dipakai di grup
   MINI_APP_AUTH_MAX_AGE        (opsional, default 86400) -- umur maksimum initData (detik)
+  TELEGRAM_DM_USER_IDS         (opsional) -- id user yang boleh memakai bot lewat DM
 """
 
 import hashlib
@@ -137,6 +142,29 @@ MINI_APP_URL         = os.getenv("MINI_APP_URL", "").strip().rstrip("/")
 MINI_APP_DIRECT_LINK = os.getenv("MINI_APP_DIRECT_LINK", "").strip()
 MINI_APP_MAX_AGE     = int(os.getenv("MINI_APP_AUTH_MAX_AGE", "86400"))
 MINI_APP_FILE        = Path(os.getenv("MINI_APP_FILE", Path(__file__).with_name("miniapp.html")))
+
+
+def _daftar_id(nama: str) -> set:
+    """
+    Baca daftar id numerik dari env (dipisah koma/spasi).
+
+    Entri yang bukan angka dibuang dengan peringatan, bukan didiamkan: salah
+    ketik satu id di sini artinya seseorang mengira dirinya berwenang padahal
+    perintahnya akan diabaikan tanpa jejak.
+    """
+    hasil = set()
+    for potong in os.getenv(nama, "").replace(",", " ").split():
+        if potong.lstrip("-").isdigit():
+            hasil.add(potong)
+        else:
+            log.warning("%s: %r bukan id Telegram yang valid, dilewati.", nama, potong)
+    return hasil
+
+
+# Operator yang boleh memakai bot lewat chat privat. Grup TELEGRAM_CHAT_ID tetap
+# jalur utama (dan tetap satu-satunya penerima notifikasi Airbyte); daftar ini
+# hanya menambah pintu DM untuk orang yang id-nya memang ditulis operator di .env.
+DM_USER_IDS = _daftar_id("TELEGRAM_DM_USER_IDS")
 
 
 # ── Format pesan ────────────────────────────────────────────────────────────
@@ -531,6 +559,11 @@ def anggota_grup(user_id) -> bool:
 
 def otorisasi_webapp(init_data: str) -> dict:
     user = verifikasi_init_data(init_data)
+    # Operator DM yang terdaftar tidak perlu diverifikasi ke Telegram: id-nya
+    # sudah ditulis tangan di .env, sumber kebenaran yang lebih kuat daripada
+    # keanggotaan grup — dan panel tetap bisa dipakai kalau bot belum di grup.
+    if str(user["id"]) in DM_USER_IDS:
+        return user
     if not anggota_grup(user["id"]):
         raise WebAppError("Anda bukan anggota grup operator pipeline ini.", 403)
     return user
@@ -642,6 +675,9 @@ def api_run(body: dict, user: dict) -> dict:
 
     kode, data = picu_job(nama, params)
     if kode == 202:
+        # Panel yang dibuka operator DM: laporan hasil ikut masuk ke DM-nya.
+        if str(user.get("id")) in DM_USER_IDS:
+            langgan_hasil(nama, user["id"])
         # Diumumkan ke grup: aksi lewat panel tidak meninggalkan jejak pesan
         # seperti perintah teks, dan run yang muncul entah dari mana bikin
         # operator lain menebak-nebak.
@@ -709,6 +745,7 @@ BANTUAN = (
     "/status — job sedang jalan atau tidak, plus hasil run terakhir\n"
     "/logs [split|dbt] — ekor log run terakhir\n"
     "/app — buka Panel Pipeline (Mini App): status, tombol jalankan, log\n"
+    "/id — tampilkan user id Anda (untuk didaftarkan ke TELEGRAM_DM_USER_IDS)\n"
     "/help — pesan ini"
 )
 
@@ -731,8 +768,32 @@ def _ringkas_status(nama: str, st: dict) -> str:
     )
 
 
+_pelanggan_lock = threading.Lock()
+_pelanggan: dict = {}     # nama job -> set chat privat yang menunggu hasilnya
+
+
+def langgan_hasil(nama: str, chat_id) -> None:
+    """
+    Catat chat privat yang memicu job supaya ikut menerima laporan selesainya.
+
+    Tanpa ini, operator yang bekerja lewat DM harus menengok ke grup untuk tahu
+    hasil perintahnya sendiri. Grup tetap dapat laporan seperti biasa — pelaporan
+    tetap satu tempat (watch_jobs), yang bertambah hanya daftar penerimanya.
+    """
+    if chat_id is None or str(chat_id) == str(TELEGRAM_CHAT_ID):
+        return
+    with _pelanggan_lock:
+        _pelanggan.setdefault(nama, set()).add(chat_id)
+
+
+def _ambil_pelanggan(nama: str) -> set:
+    """Ambil sekaligus kosongkan daftar penunggu; satu run = satu laporan."""
+    with _pelanggan_lock:
+        return _pelanggan.pop(nama, set())
+
+
 def _lapor_selesai(nama: str, st: dict) -> None:
-    """Kirim satu pesan hasil run ke grup."""
+    """Kirim satu pesan hasil run ke grup (dan ke chat privat yang memicunya)."""
     base = JOBS[nama]
     durasi = _fmt_duration(st.get("duration_s"))
     sumber = st.get("last_params", {}).get("sources")
@@ -741,19 +802,21 @@ def _lapor_selesai(nama: str, st: dict) -> None:
         rincian = "\n" + "\n".join(f"• {html.escape(str(s))}" for s in sumber)
 
     if st.get("last_ok"):
-        send_telegram(f"✅ <b>{nama}</b> selesai ({durasi}).{rincian}")
-        return
+        pesan = f"✅ <b>{nama}</b> selesai ({durasi}).{rincian}"
+    else:
+        ekor = ""
+        try:
+            teks = requests.get(f"{base}/logs", timeout=REQUEST_TIMEOUT).text
+            ekor = "\n".join(teks.splitlines()[-15:])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Gagal ambil log %s: %s", nama, exc)
+        pesan = f"❌ <b>{nama}</b> GAGAL ({durasi}).{rincian}"
+        if ekor:
+            pesan += f"\n<pre>{html.escape(ekor[:3000])}</pre>"
 
-    ekor = ""
-    try:
-        teks = requests.get(f"{base}/logs", timeout=REQUEST_TIMEOUT).text
-        ekor = "\n".join(teks.splitlines()[-15:])
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Gagal ambil log %s: %s", nama, exc)
-    pesan = f"❌ <b>{nama}</b> GAGAL ({durasi}).{rincian}"
-    if ekor:
-        pesan += f"\n<pre>{html.escape(ekor[:3000])}</pre>"
     send_telegram(pesan)
+    for chat_id in _ambil_pelanggan(nama):
+        send_telegram(pesan, chat_id)
 
 
 def watch_jobs() -> None:
@@ -848,6 +911,7 @@ def mulai_job(nama: str, args: list, chat_id, reply_to) -> None:
     if kode == 202:
         # Hasilnya dilaporkan oleh watch_jobs(), bukan di sini — supaya run
         # terjadwal dan run manual sama-sama dapat satu pesan, tanpa dobel.
+        langgan_hasil(nama, chat_id)
         send_telegram(f"▶️ <b>{nama}</b> dimulai.{_rincian_params(body)}", chat_id, reply_to)
     elif kode == 409:
         send_telegram(f"⏳ <b>{nama}</b> masih berjalan; permintaan diabaikan.",
@@ -933,6 +997,23 @@ def kirim_panel(chat_id, reply_to) -> None:
     )
 
 
+def kirim_id(message: dict, chat_id, reply_to) -> None:
+    """
+    Balas dengan id pengirim dan id chat.
+
+    Ada supaya mengisi TELEGRAM_DM_USER_IDS tidak perlu bot pihak ketiga: minta
+    calon operator mengetik /id di grup, salin angkanya ke .env.
+    """
+    dari = (message.get("from") or {}).get("id")
+    send_telegram(
+        f"🪪 User id Anda: <code>{html.escape(str(dari))}</code>\n"
+        f"Chat id di sini: <code>{html.escape(str(chat_id))}</code>\n\n"
+        f"<i>Tambahkan user id itu ke <code>TELEGRAM_DM_USER_IDS</code> di .env "
+        f"agar bisa memakai bot lewat chat privat.</i>",
+        chat_id, reply_to,
+    )
+
+
 def handle_command(message: dict) -> None:
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
@@ -946,22 +1027,32 @@ def handle_command(message: dict) -> None:
     args = [a.strip(",") for a in args]
     reply_to = message.get("message_id")
 
-    # Otorisasi: bot bisa di-DM siapa saja yang tahu username-nya, jadi hanya
-    # grup TELEGRAM_CHAT_ID yang dilayani. Satu pengecualian: di chat privat,
-    # anggota grup boleh meminta tombol Mini App — tombol web_app memang tidak
-    # sah di grup. Yang bisa dilakukan di sana hanya membuka panel; setiap aksi
-    # di dalamnya tetap diverifikasi ulang lewat otorisasi_webapp().
-    if str(chat_id) != str(TELEGRAM_CHAT_ID):
-        pemakai = (message.get("from") or {}).get("id")
-        if (chat.get("type") == "private" and perintah in ("start", "app", "help")
+    pemakai = (message.get("from") or {}).get("id")
+    privat = chat.get("type") == "private"
+
+    # Otorisasi: bot bisa di-DM siapa saja yang tahu username-nya. Yang dilayani
+    # penuh hanya grup TELEGRAM_CHAT_ID dan user yang id-nya terdaftar di
+    # TELEGRAM_DM_USER_IDS. Di luar itu, chat privat milik anggota grup masih
+    # boleh meminta tombol Mini App — tombol web_app memang tidak sah di grup —
+    # dan setiap aksi di dalam panel tetap diverifikasi ulang oleh otorisasi_webapp().
+    if str(chat_id) != str(TELEGRAM_CHAT_ID) and not (privat and str(pemakai) in DM_USER_IDS):
+        if (privat and perintah in ("start", "app", "help", "id")
                 and pemakai and anggota_grup(pemakai)):
-            kirim_panel(chat_id, reply_to)
+            if perintah == "id":
+                kirim_id(message, chat_id, reply_to)
+            else:
+                kirim_panel(chat_id, reply_to)
             return
-        log.warning("Perintah %r dari chat %s diabaikan (bukan TELEGRAM_CHAT_ID).",
-                    bagian[0], chat_id)
+        # id penggunanya ikut di-log: itu yang perlu disalin operator ke
+        # TELEGRAM_DM_USER_IDS kalau memang orang ini yang berhak.
+        log.warning("Perintah %r dari chat %s (user %s) diabaikan — tambahkan id itu "
+                    "ke TELEGRAM_DM_USER_IDS bila ini operator.",
+                    bagian[0], chat_id, pemakai)
         return
 
-    if perintah == "app":
+    if perintah == "id":
+        kirim_id(message, chat_id, reply_to)
+    elif perintah == "app":
         kirim_panel(chat_id, reply_to)
     elif perintah in ("help", "start"):
         send_telegram(BANTUAN, chat_id, reply_to, tombol_mini_app(chat_id) or None)
@@ -1157,6 +1248,11 @@ class RelayHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     if BOT_ENABLED:
+        if DM_USER_IDS:
+            log.info("Perintah lewat DM diizinkan untuk user: %s", ", ".join(sorted(DM_USER_IDS)))
+        else:
+            log.info("TELEGRAM_DM_USER_IDS kosong: perintah hanya dilayani di grup "
+                     "(ketik /id di grup untuk melihat user id).")
         threading.Thread(target=poll_updates, daemon=True).start()
     else:
         log.info("Bot Telegram dimatikan (TELEGRAM_BOT_ENABLED=false).")
