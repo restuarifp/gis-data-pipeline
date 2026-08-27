@@ -40,8 +40,11 @@ docker compose run --rm dbt dbt deps           # install packages
 # Run split-excel once (without --watch loop)
 docker compose run --rm split-excel python split_excel.py
 
-# Start the notif-relay (Airbyte webhook → Telegram + bot perintah); listens on :8000
+# Start the notif-relay (Airbyte webhook → Telegram + bot perintah + Mini App); listens on :8000
 docker compose up -d notif-relay
+
+# Mini App page (needs MINI_APP_URL set; /api/* returns 401 without Telegram initData)
+curl -s localhost:8000/app | head -5
 
 # Trigger a job the way the Telegram bot does (control server, gisnet-internal)
 docker run --rm --network gis-data-pipeline_gisnet curlimages/curl -s -X POST split-excel:8080/run
@@ -131,6 +134,10 @@ The **Relay Notifikasi** (see `CONTEXT.md`): a tiny stdlib-only HTTP server that
 - **Every finished run is announced to the group**, not just Telegram-triggered ones. `watch_jobs()` polls each control server's `/status` every `JOB_WATCH_INTERVAL_SECONDS` and reports when `last_finished` changes — so the hourly `--watch` run reports too. Completion is reported *only* there (the command handler just acks `▶️ dimulai`), which is what keeps manual runs from getting two messages. `last_finished` is seeded at relay startup so a restart doesn't re-announce an old run. Disable with `JOB_WATCH_ENABLED=false`.
 - The bot does **not** validate `/split` paths; it forwards them and surfaces the control server's `400`. Path rules live only in `resolve_source()` — two copies of a rule drift, and the looser one becomes the hole.
 - Long-polling means the token must have **no webhook** set and only **one** polling process may run per token (Telegram answers 409 otherwise). An invalid token (401/404) shuts the command loop down with one clear log line; the Airbyte webhook path keeps running.
+- **Mini App** (`docs/adr/0003-mini-app-telegram.md`, page in `scripts/miniapp.html`): the relay also serves a Telegram Mini App at `GET /app` with a JSON API at `/api/*` (`state`, `logs`, `connections`, `run`, `sync`) — same capabilities as the text commands, plus source-folder chips, a dbt command picker, an Airbyte connection list, live status, and an auto-refreshing log tail. `/app` in Telegram replies with the button that opens it.
+- **Mini App auth**: every `/api/*` call re-verifies the `initData` HMAC against the bot token (`hash` and `signature` excluded from the data-check string) *and* that the user is a member of `TELEGRAM_CHAT_ID` via `getChatMember` (cached 5 min, fail-closed). There is no session or cookie — `initData` is the credential, and `MINI_APP_AUTH_MAX_AGE` (default 24h) caps its life. The page never validates `sources`/`select` itself; it forwards them and shows the control server's 400 (same rule as the text bot).
+- **Mini App needs a public HTTPS URL.** Telegram refuses `http://`, so `MINI_APP_URL` must point at a reverse proxy/tunnel that forwards to `/app`; empty = feature off. `web_app` buttons are private-chat-only, so in the group `/app` uses a direct link (`MINI_APP_DIRECT_LINK`, from BotFather `/newapp`). That's also why `/start`, `/app`, `/help` are answered in DMs — for group members only, and only to open the panel.
+- Actions taken from the panel are announced to the group ("dimulai oleh @siapa lewat Mini App"); completion is still reported only by `watch_jobs()`.
 
 ### Observability (`observability/`)
 

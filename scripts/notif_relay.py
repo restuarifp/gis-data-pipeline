@@ -18,7 +18,17 @@ TELEGRAM_CHAT_ID (/split, /dbt, /status, /logs, /help) lalu memicu job lewat
 server kontrol HTTP internal di gisnet — bukan lewat Docker socket. Lihat
 docs/adr/0002-trigger-job-via-telegram.md dan scripts/job_control.py.
 
+Sekaligus melayani Mini App Telegram: halaman web kecil di GET /app dengan API
+JSON di /api/* yang diautentikasi lewat initData (HMAC bot token) — perintah yang
+sama dengan bot teks, tapi bisa diklik. Lihat docs/adr/0003-mini-app-telegram.md.
+
 Endpoint:
+  GET  /app         -- halaman Mini App (HTML)
+  GET  /api/state   -- status semua job + config aktif (butuh initData)
+  GET  /api/logs    -- ekor log satu job (butuh initData)
+  GET  /api/connections -- daftar koneksi Airbyte (butuh initData)
+  POST /api/run     -- picu split/dbt (butuh initData)
+  POST /api/sync    -- picu sync Airbyte (butuh initData)
   POST <apa saja>   -- terima webhook Airbyte, balas 200 seketika
   GET  /            -- health check, balas 200 "ok"
 
@@ -33,15 +43,22 @@ Konfigurasi via environment (lihat .env.example):
   SPLIT_CONTROL_URL            (opsional, default http://split-excel:8080)
   DBT_CONTROL_URL              (opsional, default http://dbt-runner:8080)
   TELEGRAM_POLL_TIMEOUT        (opsional, default 50)
+  MINI_APP_URL                 (opsional) -- URL HTTPS publik ke /app; kosong = Mini App mati
+  MINI_APP_DIRECT_LINK         (opsional) -- https://t.me/<bot>/<app>, dipakai di grup
+  MINI_APP_AUTH_MAX_AGE        (opsional, default 86400) -- umur maksimum initData (detik)
 """
 
+import hashlib
+import hmac
 import html
 import json
 import logging
 import os
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -108,6 +125,18 @@ BOT_ENABLED = os.getenv("TELEGRAM_BOT_ENABLED", "true").strip().lower() not in _
 # Pemantau job: laporkan setiap run yang selesai ke grup, termasuk run terjadwal
 # split-excel yang tidak dipicu dari Telegram.
 JOB_WATCH_ENABLED = os.getenv("JOB_WATCH_ENABLED", "true").strip().lower() not in _MATI
+
+# Mini App. Telegram hanya mau membuka URL HTTPS publik, sementara relay ini
+# mendengarkan HTTP di jaringan internal — jadi MINI_APP_URL harus menunjuk ke
+# reverse proxy/tunnel yang meneruskan ke /app di sini. Kosong = fitur mati:
+# tanpa URL, tombolnya tidak akan pernah bisa dibuka.
+MINI_APP_URL         = os.getenv("MINI_APP_URL", "").strip().rstrip("/")
+# Tombol web_app hanya boleh muncul di chat privat. Di grup, satu-satunya cara
+# membuka Mini App adalah direct link t.me/<bot>/<shortname> (dibuat lewat
+# BotFather /newapp) yang dipasang sebagai tombol URL biasa.
+MINI_APP_DIRECT_LINK = os.getenv("MINI_APP_DIRECT_LINK", "").strip()
+MINI_APP_MAX_AGE     = int(os.getenv("MINI_APP_AUTH_MAX_AGE", "86400"))
+MINI_APP_FILE        = Path(os.getenv("MINI_APP_FILE", Path(__file__).with_name("miniapp.html")))
 
 
 # ── Format pesan ────────────────────────────────────────────────────────────
@@ -190,7 +219,7 @@ def format_message(payload: dict) -> str:
 
 # ── Pengiriman ke Telegram (background, best-effort) ────────────────────────
 
-def send_telegram(text: str, chat_id=None, reply_to=None) -> None:
+def send_telegram(text: str, chat_id=None, reply_to=None, reply_markup=None) -> None:
     """
     Kirim satu pesan ke Telegram dengan retry linear backoff.
     Dipanggil dari thread background; kegagalan final hanya di-log.
@@ -206,6 +235,8 @@ def send_telegram(text: str, chat_id=None, reply_to=None) -> None:
     }
     if reply_to:
         body["reply_to_message_id"] = reply_to
+    if reply_markup:
+        body["reply_markup"] = reply_markup
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.post(TELEGRAM_API, json=body, timeout=REQUEST_TIMEOUT)
@@ -395,6 +426,276 @@ def mulai_sync(args: list, chat_id, reply_to) -> None:
     )
 
 
+# ── Mini App: otentikasi initData ───────────────────────────────────────────
+
+class WebAppError(Exception):
+    """Permintaan Mini App yang ditolak; pesannya boleh tampil ke pengguna."""
+
+    def __init__(self, pesan: str, kode: int = 401):
+        super().__init__(pesan)
+        self.kode = kode
+
+
+def mini_app_aktif() -> bool:
+    return bool(MINI_APP_URL) and MINI_APP_FILE.is_file()
+
+
+def verifikasi_init_data(raw: str) -> dict:
+    """
+    Verifikasi `Telegram.WebApp.initData` sesuai spesifikasi Bot API.
+
+    Ini satu-satunya hal yang memisahkan panel ini dari siapa pun yang menebak
+    URL-nya, jadi tidak ada jalan pintas: hash dihitung ulang dengan HMAC
+    bertingkat (kunci = HMAC("WebAppData", token)) dan dibandingkan constant-time.
+    `hash` dan `signature` tidak ikut data_check_string — `signature` adalah tanda
+    tangan Ed25519 untuk validasi pihak ketiga, bukan bagian dari string ini.
+    """
+    if not raw:
+        raise WebAppError("initData kosong — buka panel ini dari Telegram.")
+
+    data = dict(urllib.parse.parse_qsl(raw, keep_blank_values=True))
+    diberikan = data.pop("hash", "")
+    data.pop("signature", None)
+    if not diberikan:
+        raise WebAppError("initData tanpa hash.")
+
+    check = "\n".join(f"{k}={data[k]}" for k in sorted(data))
+    rahasia = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).digest()
+    dihitung = hmac.new(rahasia, check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(dihitung, diberikan):
+        raise WebAppError("initData tidak sah.")
+
+    # Umur dibatasi supaya initData yang bocor (mis. dari log proxy) tidak jadi
+    # kunci permanen. Tanpa ini, hash-nya berlaku selamanya.
+    try:
+        umur = time.time() - float(data.get("auth_date") or 0)
+    except ValueError:
+        raise WebAppError("auth_date tidak valid.") from None
+    if umur > MINI_APP_MAX_AGE:
+        raise WebAppError("Sesi kedaluwarsa. Tutup panel lalu buka lagi.")
+
+    try:
+        user = json.loads(data.get("user") or "{}")
+    except json.JSONDecodeError:
+        user = {}
+    if not user.get("id"):
+        raise WebAppError("initData tanpa data pengguna.")
+    return user
+
+
+_anggota_lock  = threading.Lock()
+_anggota_cache: dict = {}   # user_id -> (boleh, kedaluwarsa)
+_ANGGOTA_TTL_OK    = 300    # detik
+_ANGGOTA_TTL_TOLAK = 30     # gagal/ditolak di-cache singkat saja
+
+
+def anggota_grup(user_id) -> bool:
+    """
+    True kalau user_id anggota TELEGRAM_CHAT_ID.
+
+    Otorisasi bot teks adalah "chat-nya harus grup itu"; padanan untuk Mini App
+    adalah "penggunanya harus anggota grup itu" — link panel bisa diteruskan
+    keluar grup, chat tidak. Jawaban Telegram di-cache sebentar supaya tiap
+    polling status tidak jadi satu getChatMember.
+    """
+    if str(user_id) == str(TELEGRAM_CHAT_ID):   # target notifikasi = chat privat
+        return True
+
+    sekarang = time.time()
+    with _anggota_lock:
+        cache = _anggota_cache.get(user_id)
+        if cache and cache[1] > sekarang:
+            return cache[0]
+
+    boleh = False
+    try:
+        resp = requests.get(
+            f"{TELEGRAM_BASE}/getChatMember",
+            params={"chat_id": TELEGRAM_CHAT_ID, "user_id": user_id},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.ok:
+            status = ((resp.json().get("result") or {}).get("status") or "").lower()
+            boleh = status in ("creator", "administrator", "member", "restricted")
+        else:
+            log.warning("getChatMember %s membalas %s: %s",
+                        user_id, resp.status_code, resp.text[:200])
+    except requests.RequestException as exc:
+        # Fail closed: kalau keanggotaan tidak bisa dipastikan, tolak.
+        log.warning("getChatMember %s gagal: %s", user_id, exc)
+
+    with _anggota_lock:
+        _anggota_cache[user_id] = (boleh, sekarang + (_ANGGOTA_TTL_OK if boleh else _ANGGOTA_TTL_TOLAK))
+    return boleh
+
+
+def otorisasi_webapp(init_data: str) -> dict:
+    user = verifikasi_init_data(init_data)
+    if not anggota_grup(user["id"]):
+        raise WebAppError("Anda bukan anggota grup operator pipeline ini.", 403)
+    return user
+
+
+def sebut(user: dict) -> str:
+    """Nama pengguna untuk pesan audit ke grup."""
+    if user.get("username"):
+        return "@" + str(user["username"])
+    nama = " ".join(filter(None, [user.get("first_name"), user.get("last_name")]))
+    return nama or f"id {user.get('id')}"
+
+
+def tombol_mini_app(chat_id) -> dict:
+    """
+    reply_markup untuk membuka Mini App, atau {} kalau tidak memungkinkan.
+
+    Tombol `web_app` hanya sah di chat privat; di grup Telegram menolaknya, jadi
+    di sana dipakai direct link (t.me/<bot>/<shortname>) sebagai tombol URL biasa.
+    """
+    if not mini_app_aktif():
+        return {}
+    privat = str(chat_id) != str(TELEGRAM_CHAT_ID) or not str(TELEGRAM_CHAT_ID).startswith("-")
+    if privat:
+        tombol = {"text": "🎛 Buka Panel", "web_app": {"url": f"{MINI_APP_URL}/app"}}
+    elif MINI_APP_DIRECT_LINK:
+        tombol = {"text": "🎛 Buka Panel", "url": MINI_APP_DIRECT_LINK}
+    else:
+        return {}
+    return {"inline_keyboard": [[tombol]]}
+
+
+def pasang_menu_button() -> None:
+    """
+    Pasang tombol menu (pojok kiri kolom ketik) di chat privat pengguna.
+
+    setChatMenuButton tanpa chat_id mengubah default untuk semua chat privat —
+    itu yang diinginkan: panel hanya bisa dibuka anggota grup, dan orang lain
+    tetap ditolak oleh otorisasi_webapp() saat halaman memanggil API.
+    """
+    if not mini_app_aktif():
+        return
+    try:
+        resp = requests.post(
+            f"{TELEGRAM_BASE}/setChatMenuButton",
+            json={"menu_button": {"type": "web_app", "text": "Panel",
+                                  "web_app": {"url": f"{MINI_APP_URL}/app"}}},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.ok:
+            log.info("Mini App aktif: %s/app", MINI_APP_URL)
+        else:
+            log.warning("setChatMenuButton gagal (%s): %s", resp.status_code, resp.text[:200])
+    except requests.RequestException as exc:
+        log.warning("setChatMenuButton gagal: %s", exc)
+
+
+# ── Mini App: API JSON ──────────────────────────────────────────────────────
+
+def status_semua_job() -> dict:
+    hasil = {}
+    for nama, base in JOBS.items():
+        try:
+            hasil[nama] = requests.get(f"{base}/status", timeout=REQUEST_TIMEOUT).json()
+        except Exception as exc:  # noqa: BLE001 -- satu job mati != panel mati
+            hasil[nama] = {"job": nama, "error": f"tidak bisa dihubungi: {str(exc)[:120]}"}
+    return hasil
+
+
+def api_state(user: dict) -> dict:
+    return {
+        "jobs": status_semua_job(),
+        "airbyte": {"enabled": airbyte_aktif()},
+        "user": {k: user.get(k) for k in ("id", "username", "first_name")},
+    }
+
+
+def api_logs(nama: str) -> dict:
+    if nama not in JOBS:
+        raise WebAppError(f"job tidak dikenal: {nama}", 400)
+    try:
+        teks = requests.get(f"{JOBS[nama]}/logs", timeout=REQUEST_TIMEOUT).text
+    except requests.RequestException as exc:
+        raise WebAppError(f"gagal ambil log: {str(exc)[:200]}", 502) from exc
+    return {"job": nama, "text": "\n".join(teks.splitlines()[-200:])}
+
+
+def api_run(body: dict, user: dict) -> dict:
+    """
+    Picu job dari Mini App. Parameter diteruskan apa adanya ke control server —
+    yang memvalidasi tetap hanya validate_params() milik service itu (ADR 0002).
+    """
+    nama = str(body.get("job") or "").lower()
+    if nama not in JOBS:
+        raise WebAppError(f"job tidak dikenal: {nama}", 400)
+
+    params = {}
+    if nama == "split":
+        sumber = body.get("sources") or []
+        if not isinstance(sumber, list):
+            raise WebAppError("sources harus berupa list", 400)
+        if sumber:
+            params["sources"] = [str(x) for x in sumber]
+    elif nama == "dbt":
+        if body.get("command"):
+            params["command"] = str(body["command"])
+        if body.get("select"):
+            params["select"] = str(body["select"])
+
+    kode, data = picu_job(nama, params)
+    if kode == 202:
+        # Diumumkan ke grup: aksi lewat panel tidak meninggalkan jejak pesan
+        # seperti perintah teks, dan run yang muncul entah dari mana bikin
+        # operator lain menebak-nebak.
+        rincian = _rincian_params(params)
+        threading.Thread(
+            target=send_telegram,
+            args=(f"▶️ <b>{nama}</b> dimulai oleh {html.escape(sebut(user))} "
+                  f"lewat Mini App.{rincian}",),
+            daemon=True,
+        ).start()
+        return {"ok": True, "message": f"{nama} dimulai. Hasilnya dilaporkan ke grup."}
+    if kode == 409:
+        raise WebAppError(f"{nama} masih berjalan.", 409)
+    raise WebAppError(str((data or {}).get("error") or f"ditolak ({kode})")[:300], 400)
+
+
+def api_connections() -> dict:
+    if not airbyte_aktif():
+        raise WebAppError("Airbyte belum dikonfigurasi.", 400)
+    try:
+        koneksi = daftar_koneksi()
+    except AirbyteError as exc:
+        raise WebAppError(str(exc)[:300], 502) from exc
+    return {"connections": [
+        {"connectionId": k.get("connectionId"), "name": k.get("name"), "status": k.get("status")}
+        for k in koneksi
+    ]}
+
+
+def api_sync(body: dict, user: dict) -> dict:
+    if not airbyte_aktif():
+        raise WebAppError("Airbyte belum dikonfigurasi.", 400)
+    connection_id = str(body.get("connection_id") or "").strip()
+    nama = str(body.get("name") or "").strip()
+    try:
+        if not connection_id:
+            if not nama:
+                raise WebAppError("connection_id atau name wajib diisi.", 400)
+            target = cari_koneksi(nama)
+            connection_id, nama = target["connectionId"], target.get("name", nama)
+        hasil = _api("POST", "/jobs", json={"connectionId": connection_id, "jobType": "sync"})
+    except AirbyteError as exc:
+        raise WebAppError(str(exc)[:300], 502) from exc
+
+    label = nama or connection_id
+    threading.Thread(
+        target=send_telegram,
+        args=(f"▶️ Sync <b>{html.escape(label)}</b> dimulai oleh "
+              f"{html.escape(sebut(user))} lewat Mini App (job {hasil.get('jobId', '?')}).",),
+        daemon=True,
+    ).start()
+    return {"ok": True, "message": f"Sync {label} dimulai (job {hasil.get('jobId', '?')})."}
+
+
 # ── Bot: perintah dari grup Telegram ────────────────────────────────────────
 
 BANTUAN = (
@@ -407,6 +708,7 @@ BANTUAN = (
     "/sync <i>nama-koneksi</i> — picu sync koneksi itu\n"
     "/status — job sedang jalan atau tidak, plus hasil run terakhir\n"
     "/logs [split|dbt] — ekor log run terakhir\n"
+    "/app — buka Panel Pipeline (Mini App): status, tombol jalankan, log\n"
     "/help — pesan ini"
 )
 
@@ -497,9 +799,35 @@ def watch_jobs() -> None:
                 log.exception("Gagal melaporkan hasil %s.", nama)
 
 
+def _rincian_params(params: dict) -> str:
+    """Baris tambahan untuk pesan Telegram: folder atau selector yang dipakai."""
+    if params.get("sources"):
+        return "\n" + "\n".join(f"• {html.escape(str(s))}" for s in params["sources"])
+    potongan = []
+    if params.get("command") and params["command"] != "run":
+        potongan.append(str(params["command"]))
+    if params.get("select"):
+        potongan.append(f"--select {params['select']}")
+    return f"\n<code>{html.escape(' '.join(potongan))}</code>" if potongan else ""
+
+
+def picu_job(nama: str, params: dict):
+    """
+    POST /run ke control server job. Balikkan (status_code, body_json_atau_None).
+
+    Dipakai bersama oleh bot teks dan Mini App supaya keduanya menempuh jalur
+    yang persis sama — termasuk 409 single-flight dan 400 dari validate_params().
+    """
+    resp = requests.post(f"{JOBS[nama]}/run", json=params, timeout=REQUEST_TIMEOUT)
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {"error": resp.text[:500]}
+    return resp.status_code, data
+
+
 def mulai_job(nama: str, args: list, chat_id, reply_to) -> None:
     """Panggil POST /run pada control server job, lalu balas ke Telegram."""
-    base = JOBS[nama]
     body = {}
     if nama == "split" and args:
         # Diteruskan apa adanya — validasi path hanya hidup di resolve_source()
@@ -509,7 +837,7 @@ def mulai_job(nama: str, args: list, chat_id, reply_to) -> None:
         body["select"] = " ".join(args)
 
     try:
-        resp = requests.post(f"{base}/run", json=body, timeout=REQUEST_TIMEOUT)
+        kode, data = picu_job(nama, body)
     except requests.RequestException as exc:
         send_telegram(
             f"❌ Tidak bisa menghubungi <b>{nama}</b>: {html.escape(str(exc)[:300])}",
@@ -517,26 +845,17 @@ def mulai_job(nama: str, args: list, chat_id, reply_to) -> None:
         )
         return
 
-    if resp.status_code == 202:
-        rincian = ""
-        if body.get("sources"):
-            rincian = "\n" + "\n".join(f"• {html.escape(s)}" for s in body["sources"])
-        elif body.get("select"):
-            rincian = f"\n<code>--select {html.escape(body['select'])}</code>"
+    if kode == 202:
         # Hasilnya dilaporkan oleh watch_jobs(), bukan di sini — supaya run
         # terjadwal dan run manual sama-sama dapat satu pesan, tanpa dobel.
-        send_telegram(f"▶️ <b>{nama}</b> dimulai.{rincian}", chat_id, reply_to)
-    elif resp.status_code == 409:
+        send_telegram(f"▶️ <b>{nama}</b> dimulai.{_rincian_params(body)}", chat_id, reply_to)
+    elif kode == 409:
         send_telegram(f"⏳ <b>{nama}</b> masih berjalan; permintaan diabaikan.",
                       chat_id, reply_to)
     else:
-        try:
-            alasan = resp.json().get("error", resp.text)
-        except ValueError:
-            alasan = resp.text
         send_telegram(
-            f"❌ <b>{nama}</b> ditolak ({resp.status_code}): "
-            f"{html.escape(str(alasan)[:500])}",
+            f"❌ <b>{nama}</b> ditolak ({kode}): "
+            f"{html.escape(str((data or {}).get('error', ''))[:500])}",
             chat_id, reply_to,
         )
 
@@ -584,18 +903,41 @@ def kirim_logs(args: list, chat_id, reply_to) -> None:
                   chat_id, reply_to)
 
 
+def kirim_panel(chat_id, reply_to) -> None:
+    """Balas dengan tombol pembuka Mini App, atau jelaskan kenapa belum bisa."""
+    if not mini_app_aktif():
+        send_telegram(
+            "⚠️ Mini App belum aktif. Set <code>MINI_APP_URL</code> (URL HTTPS publik "
+            "yang meneruskan ke <code>/app</code> di relay ini) lalu "
+            "<code>docker compose up -d notif-relay</code>.",
+            chat_id, reply_to,
+        )
+        return
+
+    markup = tombol_mini_app(chat_id)
+    if not markup:
+        # Tombol web_app dilarang di grup dan direct link belum diisi.
+        send_telegram(
+            "🎛 Panel hanya bisa dibuka dari chat privat dengan bot ini "
+            "(kirim <code>/app</code> di japri), atau lewat direct link — buat "
+            "dengan BotFather <code>/newapp</code> lalu isi "
+            "<code>MINI_APP_DIRECT_LINK</code> di .env.",
+            chat_id, reply_to,
+        )
+        return
+
+    send_telegram(
+        "🎛 <b>Panel Pipeline</b>\nStatus job, tombol jalankan, dan log — "
+        "tanpa mengetik perintah.",
+        chat_id, reply_to, markup,
+    )
+
+
 def handle_command(message: dict) -> None:
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
     teks = (message.get("text") or "").strip()
     if not teks.startswith("/"):
-        return
-
-    # Otorisasi: bot bisa di-DM siapa saja yang tahu username-nya, jadi hanya
-    # grup TELEGRAM_CHAT_ID yang dilayani. Chat lain diabaikan diam-diam.
-    if str(chat_id) != str(TELEGRAM_CHAT_ID):
-        log.warning("Perintah %r dari chat %s diabaikan (bukan TELEGRAM_CHAT_ID).",
-                    teks.split()[0], chat_id)
         return
 
     bagian = teks.split()
@@ -604,8 +946,25 @@ def handle_command(message: dict) -> None:
     args = [a.strip(",") for a in args]
     reply_to = message.get("message_id")
 
-    if perintah in ("help", "start"):
-        send_telegram(BANTUAN, chat_id, reply_to)
+    # Otorisasi: bot bisa di-DM siapa saja yang tahu username-nya, jadi hanya
+    # grup TELEGRAM_CHAT_ID yang dilayani. Satu pengecualian: di chat privat,
+    # anggota grup boleh meminta tombol Mini App — tombol web_app memang tidak
+    # sah di grup. Yang bisa dilakukan di sana hanya membuka panel; setiap aksi
+    # di dalamnya tetap diverifikasi ulang lewat otorisasi_webapp().
+    if str(chat_id) != str(TELEGRAM_CHAT_ID):
+        pemakai = (message.get("from") or {}).get("id")
+        if (chat.get("type") == "private" and perintah in ("start", "app", "help")
+                and pemakai and anggota_grup(pemakai)):
+            kirim_panel(chat_id, reply_to)
+            return
+        log.warning("Perintah %r dari chat %s diabaikan (bukan TELEGRAM_CHAT_ID).",
+                    bagian[0], chat_id)
+        return
+
+    if perintah == "app":
+        kirim_panel(chat_id, reply_to)
+    elif perintah in ("help", "start"):
+        send_telegram(BANTUAN, chat_id, reply_to, tombol_mini_app(chat_id) or None)
     elif perintah == "status":
         kirim_status(chat_id, reply_to)
     elif perintah == "logs":
@@ -679,19 +1038,103 @@ def poll_updates() -> None:
 # ── HTTP server ─────────────────────────────────────────────────────────────
 
 class RelayHandler(BaseHTTPRequestHandler):
-    def _ok(self, body: bytes = b"ok"):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+    def _kirim(self, code: int, body: bytes, ctype: str):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):  # noqa: N802 -- health check
-        self._ok()
+    def _ok(self, body: bytes = b"ok"):
+        self._kirim(200, body, "text/plain; charset=utf-8")
+
+    def _json(self, code: int, obj: dict):
+        self._kirim(code, json.dumps(obj).encode("utf-8"),
+                    "application/json; charset=utf-8")
+
+    # ── Mini App ────────────────────────────────────────────────────────────
+
+    def _halaman_mini_app(self):
+        """
+        Layani halaman panel. Dibaca dari disk tiap permintaan (file kecil, dan
+        rebuild image tidak perlu untuk mengubah tampilan saat bind-mount dipakai).
+        """
+        if not MINI_APP_URL:
+            self._kirim(404, b"Mini App tidak aktif (MINI_APP_URL kosong).",
+                        "text/plain; charset=utf-8")
+            return
+        try:
+            isi = MINI_APP_FILE.read_bytes()
+        except OSError as exc:
+            log.error("Gagal membaca %s: %s", MINI_APP_FILE, exc)
+            self._kirim(500, b"halaman Mini App tidak ditemukan",
+                        "text/plain; charset=utf-8")
+            return
+        self._kirim(200, isi, "text/html; charset=utf-8")
+
+    def _api_mini_app(self, path: str, query: dict, body: dict):
+        """
+        Jalur API panel. Setiap permintaan diverifikasi ulang dari nol —
+        tidak ada sesi, tidak ada cookie: initData-lah kredensialnya.
+        """
+        try:
+            user = otorisasi_webapp(self.headers.get("X-Telegram-Init-Data", ""))
+            if path == "/api/state":
+                return 200, api_state(user)
+            if path == "/api/logs":
+                return 200, api_logs((query.get("job") or ["split"])[0])
+            if path == "/api/connections":
+                return 200, api_connections()
+            if path == "/api/run":
+                return 200, api_run(body, user)
+            if path == "/api/sync":
+                return 200, api_sync(body, user)
+            return 404, {"error": f"endpoint tidak dikenal: {path}"}
+        except WebAppError as exc:
+            if exc.kode in (401, 403):
+                log.warning("Permintaan Mini App ditolak (%s): %s", exc.kode, exc)
+            return exc.kode, {"error": str(exc)}
+        except requests.RequestException as exc:
+            return 502, {"error": f"service tidak bisa dihubungi: {str(exc)[:200]}"}
+        except Exception:  # noqa: BLE001 -- satu permintaan gagal != relay mati
+            log.exception("Error tak terduga di API Mini App (%s).", path)
+            return 500, {"error": "kesalahan internal; cek log notif-relay"}
+
+    # ── HTTP ────────────────────────────────────────────────────────────────
+
+    def _pisah(self):
+        potong = urllib.parse.urlsplit(self.path)
+        path = potong.path.rstrip("/") or "/"
+        return path, urllib.parse.parse_qs(potong.query)
+
+    def do_GET(self):  # noqa: N802 -- health check + Mini App
+        path, query = self._pisah()
+        if path == "/app":
+            self._halaman_mini_app()
+        elif path.startswith("/api/"):
+            self._json(*self._api_mini_app(path, query, {}))
+        else:
+            self._ok()
 
     def do_POST(self):  # noqa: N802
+        path, query = self._pisah()
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
+
+        # Jalur Mini App dicek lebih dulu: sisa path apa pun tetap milik webhook
+        # Airbyte (URL-nya diisi operator dan tidak selalu "/").
+        if path.startswith("/api/"):
+            try:
+                body = json.loads(raw.decode("utf-8")) if raw.strip() else {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self._json(400, {"error": "body bukan JSON valid"})
+                return
+            if not isinstance(body, dict):
+                self._json(400, {"error": "body harus berupa object JSON"})
+                return
+            self._json(*self._api_mini_app(path, query, body))
+            return
 
         # Balas 200 SEKETIKA — Airbyte tidak boleh menunggu Telegram (ADR 0001).
         self._ok()
@@ -717,6 +1160,14 @@ def main() -> None:
         threading.Thread(target=poll_updates, daemon=True).start()
     else:
         log.info("Bot Telegram dimatikan (TELEGRAM_BOT_ENABLED=false).")
+
+    if mini_app_aktif():
+        threading.Thread(target=pasang_menu_button, daemon=True).start()
+    elif MINI_APP_URL:
+        log.warning("MINI_APP_URL di-set tapi %s tidak ada — Mini App dimatikan.",
+                    MINI_APP_FILE)
+    else:
+        log.info("Mini App dimatikan (MINI_APP_URL kosong).")
 
     if JOB_WATCH_ENABLED:
         threading.Thread(target=watch_jobs, daemon=True).start()
