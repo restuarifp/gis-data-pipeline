@@ -475,15 +475,16 @@ def verifikasi_init_data(raw: str) -> dict:
     Ini satu-satunya hal yang memisahkan panel ini dari siapa pun yang menebak
     URL-nya, jadi tidak ada jalan pintas: hash dihitung ulang dengan HMAC
     bertingkat (kunci = HMAC("WebAppData", token)) dan dibandingkan constant-time.
-    `hash` dan `signature` tidak ikut data_check_string — `signature` adalah tanda
-    tangan Ed25519 untuk validasi pihak ketiga, bukan bagian dari string ini.
+    Yang dikeluarkan dari data_check_string hanya `hash`. `signature` (tanda tangan
+    Ed25519 Bot API 8.0+ untuk validasi pihak ketiga) **ikut dihitung** — mengeluarkannya
+    membuat semua klien baru ditolak "initData tidak sah" sementara klien lama yang
+    belum mengirim field itu tetap lolos, gejala yang menyesatkan.
     """
     if not raw:
         raise WebAppError("initData kosong — buka panel ini dari Telegram.")
 
     data = dict(urllib.parse.parse_qsl(raw, keep_blank_values=True))
     diberikan = data.pop("hash", "")
-    data.pop("signature", None)
     if not diberikan:
         raise WebAppError("initData tanpa hash.")
 

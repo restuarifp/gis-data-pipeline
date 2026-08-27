@@ -15,7 +15,8 @@ menyalin token bot dan URL control server ke tempat kedua.
 "hanya chat `TELEGRAM_CHAT_ID` yang dilayani" untuk sebuah halaman web adalah
 "hanya anggota grup itu". Setiap permintaan `/api/*` memverifikasi ulang HMAC
 `initData` dengan token bot (tanpa itu, siapa pun yang tahu URL-nya bisa memicu
-job), lalu memastikan `user.id` anggota `TELEGRAM_CHAT_ID` lewat `getChatMember`
+job) — hanya `hash` yang dikeluarkan dari data-check-string, `signature` milik
+Bot API 8.0+ ikut dihitung — lalu memastikan `user.id` anggota `TELEGRAM_CHAT_ID` lewat `getChatMember`
 — jawabannya di-cache 5 menit supaya polling status tidak jadi banjir panggilan.
 Tidak ada cookie dan tidak ada sesi: `initData` adalah satu-satunya kredensial,
 dan umurnya dibatasi `MINI_APP_AUTH_MAX_AGE` (default 24 jam) supaya yang bocor
