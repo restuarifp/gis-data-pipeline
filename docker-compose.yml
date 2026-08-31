@@ -15,6 +15,30 @@ services:
     networks:
       - gisnet
 
+  metabase:
+    # Di-pin ke digest, bukan :latest — image inilah yang terakhir menulis app DB
+    # metabase_db, dan migrasi skema Metabase bersifat satu arah (tidak bisa turun
+    # versi). Dengan digest, `docker compose pull` tidak bisa menaikkannya diam-diam.
+    image: metabase/metabase@sha256:1357996e0a877530ccbdb1a1fa6d3a128e4f2f24245f0a63e37ce9e02f35307c
+    restart: always
+    container_name: metabase
+    hostname: metabase
+    ports:
+      - 3000:3000
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase_db
+      MB_DB_PORT: 5432
+      MB_DB_USER: admin
+      MB_DB_PASS: password123
+      MB_DB_HOST: postgres-db
+    volumes:
+      - ./metabase-data:/metabase-data
+    depends_on:
+      - postgres-db
+    networks:
+      - gisnet
+
   dbt:
     build:
       context: .
@@ -102,12 +126,12 @@ services:
     networks:
       - gisnet
 
-  # NOTE: Metabase and the observability stack (Prometheus, Grafana, Loki,
-  # Promtail, node-exporter, cAdvisor, postgres-exporter) used to live here.
-  # They now run machine-wide from /home/eq/development/observability and
-  # join this project via the external `gis-data-pipeline_gisnet` network.
-  # The named volumes prom_data/grafana_data/loki_data/promtail_positions are
-  # still owned by this project and are consumed there as external volumes.
+  # NOTE: Stack observability (Prometheus, Grafana, Loki, Promtail, node-exporter,
+  # cAdvisor, postgres-exporter) dulu ada di sini dan kini TIDAK dideploy di server
+  # ini sama sekali. Di mesin pengembang mereka dijalankan machine-wide dari
+  # /home/eq/development/observability lewat network eksternal gis-data-pipeline_gisnet;
+  # jalur itu tidak ada di server produksi. Metabase sempat ikut dihapus atas dasar
+  # catatan yang sama dan itu keliru — Metabase dilayani dari sini (lihat service di atas).
 
 networks:
   gisnet:
