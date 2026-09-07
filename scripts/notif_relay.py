@@ -292,7 +292,7 @@ def send_telegram(text: str, chat_id=None, reply_to=None, reply_markup=None) -> 
     log.error("Pesan Telegram dijatuhkan setelah %d percobaan (best-effort).", MAX_RETRIES)
 
 
-def kirim_dokumen(nama_file: str, isi: bytes, caption: str, chat_id=None) -> bool:
+def kirim_dokumen(nama_file: str, isi: bytes, caption: str = "", chat_id=None) -> bool:
     """
     Kirim satu file ke Telegram (sendDocument), retry sama seperti send_telegram.
 
@@ -699,20 +699,6 @@ def _parse_bulan(args: list) -> tuple:
     return bulan, tahun
 
 
-def _caption_laporan(bulan: int, tahun: int, oleh: str, catatan: list) -> str:
-    judul = f"{report_summary.BULAN_SINGKAT[bulan]} {tahun}"
-    baris = [f"📊 <b>Rekap Bulanan {html.escape(judul)}</b>",
-             f"Dibuat oleh {html.escape(oleh)}."]
-    # Angka non-dakwah adalah potret tarikan terakhir, bukan potret bulan itu —
-    # kalau tidak ditulis di caption, orang akan membacanya sebagai data historis.
-    baris.append("<i>Selain DAKWAH HASIL, angkanya potret data terkini "
-                 "(warehouse hanya menyimpan tarikan terakhir). Baris JUMLAH "
-                 "BULAN LALU diambil dari arsip laporan bulan sebelumnya.</i>")
-    for c in catatan:
-        baris.append(f"⚠️ {html.escape(c)}")
-    return "\n".join(baris)
-
-
 def buat_dan_kirim_laporan(bulan: int, tahun: int, oleh: str, tujuan: list) -> None:
     """
     Bangun laporan lalu kirim ke setiap chat di `tujuan`.
@@ -740,9 +726,16 @@ def buat_dan_kirim_laporan(bulan: int, tahun: int, oleh: str, tujuan: list) -> N
     finally:
         _kunci_laporan.release()
 
-    caption = _caption_laporan(bulan, tahun, oleh, catatan)
+    # Satu kalimat saja — sisanya sudah terbaca dari file itu sendiri.
+    caption = f"Berikut summary excel yang di-request oleh {html.escape(oleh)}"
     for chat in tujuan:
         kirim_dokumen(nama_file, isi, caption, chat)
+
+    # Catatan (kantor tanpa baris di template, arsip gagal ditulis) sengaja
+    # tidak lagi ikut ke Telegram — pesannya harus bersih. Tetap ditulis ke log
+    # supaya masih ada tempat mencarinya kalau ada angka yang terlihat hilang.
+    for c in catatan:
+        log.warning("Laporan %s-%s: %s", tahun, bulan, c)
 
 
 def _tujuan_laporan(chat_id) -> list:
@@ -765,8 +758,9 @@ def kirim_laporan(args: list, message: dict, chat_id, reply_to) -> None:
         send_telegram(f"❌ {html.escape(str(exc))}", chat_id, reply_to)
         return
 
-    send_telegram(f"⏳ Menyusun rekap {report_summary.BULAN_SINGKAT[bulan]} {tahun}…",
-                  chat_id, reply_to)
+    # Tanpa pesan "sedang disusun": satu-satunya pesan yang boleh muncul adalah
+    # yang menyertai filenya. Penyusunannya hitungan detik, dan file yang datang
+    # sudah menjadi tanda selesai.
     threading.Thread(
         target=buat_dan_kirim_laporan,
         args=(bulan, tahun, sebut(message.get("from") or {}), _tujuan_laporan(chat_id)),
@@ -880,7 +874,7 @@ def api_report(body: dict, user: dict) -> dict:
 
     threading.Thread(
         target=buat_dan_kirim_laporan,
-        args=(bulan, tahun, sebut(user) + " lewat Mini App", tujuan),
+        args=(bulan, tahun, sebut(user), tujuan),
         daemon=True,
     ).start()
     label = f"{report_summary.BULAN_SINGKAT[bulan]} {tahun}"

@@ -45,8 +45,12 @@ di dua tempat setiap kali bentuk laporannya berubah.
 menyimpan tarikan terakhir (`_airbyte_generation_id = MAX`), jadi warehouse
 tidak punya riwayat bulanan. Semua kolom selain DAKWAH HASIL adalah potret data
 terkini; bulan yang dipilih menyaring `Bln_Integrasi`/`Th_Integrasi` dan menjadi
-judul laporan. Kalimat ini ikut di caption tiap file, karena laporan yang
-bulannya bisa dipilih *akan* dibaca sebagai data historis kalau tidak dibantah.
+judul laporan.
+
+Caption filenya sengaja satu kalimat — hanya menyebut siapa yang meminta.
+Peringatan (kantor tanpa baris di template, arsip gagal ditulis) tidak lagi ikut
+ke Telegram dan hanya ditulis ke log notif-relay: operator memintanya begitu,
+dan konsekuensinya angka yang hilang tidak lagi terlihat dari Telegram saja.
 
 **Baris JUMLAH BULAN LALU diisi dari arsip, bukan dari warehouse.** Karena
 warehouse tidak punya riwayat, tiap laporan yang selesai dibangun menyimpan

@@ -409,11 +409,10 @@ function renderReport() {
 
   $("#rep-run").disabled = !rep.enabled;
 
-  // Angka selain DAKWAH HASIL adalah potret tarikan terakhir. Tanpa kalimat ini
-  // pemilihan bulan terbaca seolah menarik data historis, yang tidak disimpan.
+  // Hanya alasan kenapa fitur mati yang ditampilkan di sini. Panelnya sengaja
+  // tidak menjelaskan cakupan data — penjelasan itu ikut di caption tiap file.
   $("#hint-report").innerHTML = rep.enabled
-    ? "Bulan yang dipilih menyaring <b>DAKWAH HASIL</b> dan menjadi judul laporan. "
-      + "Kolom lain memakai data tarikan terakhir."
+    ? ""
     : `<span style="color:var(--warn)">${esc(rep.reason || "belum aktif")}</span>`;
 }
 
