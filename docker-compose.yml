@@ -81,6 +81,11 @@ services:
       - .env
     ports:
       - ${NOTIF_RELAY_PORT:-8000}:${NOTIF_RELAY_PORT:-8000}
+    volumes:
+      # Arsip potret bulanan Rekap Bulanan. Satu-satunya sumber angka "JUMLAH
+      # BULAN LALU" — warehouse tidak menyimpan riwayat, jadi kalau folder ini
+      # hilang, pembanding bulan-bulan sebelumnya ikut hilang.
+      - ./report-history:/data/laporan
     networks:
       - gisnet
 

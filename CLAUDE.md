@@ -46,6 +46,9 @@ docker compose up -d notif-relay
 # Mini App page (needs MINI_APP_URL set; /api/* returns 401 without Telegram initData)
 curl -s localhost:8000/app | head -5
 
+# Rebuild the relay after changing report_summary.py or docs/template/summary.xlsx
+docker compose build notif-relay && docker compose up -d notif-relay
+
 # Trigger a job the way the Telegram bot does (control server, gisnet-internal)
 docker run --rm --network gis-data-pipeline_gisnet curlimages/curl -s -X POST split-excel:8080/run
 docker run --rm --network gis-data-pipeline_gisnet curlimages/curl -s split-excel:8080/status
@@ -140,6 +143,53 @@ The **Relay Notifikasi** (see `CONTEXT.md`): a tiny stdlib-only HTTP server that
 - **Mini App auth**: every `/api/*` call re-verifies the `initData` HMAC against the bot token (`hash` and `signature` excluded from the data-check string) *and* that the user is either listed in `TELEGRAM_DM_USER_IDS` (no round-trip needed — the id was written by hand in `.env`) or a member of `TELEGRAM_CHAT_ID` via `getChatMember` (cached 5 min, fail-closed). There is no session or cookie — `initData` is the credential, and `MINI_APP_AUTH_MAX_AGE` (default 24h) caps its life. The page never validates `sources`/`select` itself; it forwards them and shows the control server's 400 (same rule as the text bot).
 - **Mini App needs a public HTTPS URL.** Telegram refuses `http://`, so `MINI_APP_URL` must point at a reverse proxy/tunnel that forwards to `/app`; empty = feature off. `web_app` buttons are private-chat-only, so in the group `/app` uses a direct link (`MINI_APP_DIRECT_LINK`, from BotFather `/newapp`). That's also why `/start`, `/app`, `/help` are answered in DMs — for group members only, and only to open the panel.
 - Actions taken from the panel are announced to the group ("dimulai oleh @siapa lewat Mini App"); completion is still reported only by `watch_jobs()`.
+- **Laporan Rekap Bulanan** (`docs/adr/0004-laporan-rekap-bulanan.md`, builder in `scripts/report_summary.py`): `/laporan [MM-YYYY]` and the Mini App's *laporan* tab query the warehouse directly, fill `docs/template/summary.xlsx`, and push the result to Telegram with `sendDocument`. See the section below.
+
+### Laporan Rekap Bulanan (`scripts/report_summary.py`)
+
+Turns the Metabase rekap query into the printable Excel that used to be filled
+in by hand. Triggered by `/laporan [MM-YYYY]` in Telegram or the *laporan* tab in
+the Mini App (`POST /api/report`), both of which hand off to a background thread
+and reply immediately; the finished `.xlsx` arrives as a Telegram document.
+
+- **Delivery is `sendDocument`, never an HTTP download.** The Mini App runs in
+  Telegram's webview, which blocks page-initiated downloads — a download button
+  would appear to work and produce nothing. The file lands in the group chat, so
+  past months stay searchable.
+- **The template is filled, not redrawn.** `openpyxl` opens
+  `docs/template/summary.xlsx` and writes into existing cells, so merges,
+  borders, and number formats survive. Column → query-field mapping lives in
+  `KOLOM`; `T` (P+A) is derived, and `D` (BARIS) and `S` (NT) are deliberately
+  left alone because the query has no equivalent.
+- **The chosen month only filters DAKWAH HASIL** (`rekrut`, on
+  `Bln_Integrasi`/`Th_Integrasi`) and sets the title. Staging keeps only the
+  latest pull, so every other column is a snapshot of current data — this
+  caveat is repeated in each file's Telegram caption.
+- **Every finished report archives its own snapshot** to `REPORT_HISTORY_DIR`
+  (`./report-history`, bind-mounted at `/data/laporan`) as
+  `<year>-<month>.json`, and the next month's report reads the previous month's
+  archive to fill `JUMLAH BULAN LALU`, with `SELISIH` computed from the two.
+  The warehouse has no history, so **that folder is the only source of
+  month-over-month comparison — back it up**. A month with no archive behind it
+  gets zeros plus a note saying so. Rerunning a month overwrites its archive,
+  which is what you want after a late Airbyte sync.
+- **Archive keys are semantic names** (`NAMA_KOLOM`), not column letters, so
+  inserting a column in the template does not silently reroute old archives
+  into the wrong cells.
+- **Summary rows are found by their column-A labels** (`JUMLAH BULAN INI`,
+  `JUMLAH BULAN LALU`, `SELISIH`), not by fixed row numbers; data rows run from
+  row 5 up to the `JUMLAH BULAN INI` row. Adding offices to the template needs
+  no code change — just a new row with its code in column C. Offices present in
+  the warehouse but absent from the template are named in the caption rather
+  than dropped silently.
+- **Summary rows are written as numbers, replacing the template's
+  `=SUM(...)`/`=X19-X20`** — Telegram's file preview does not recalculate
+  formulas and would show the stale cached result. Cells the template leaves
+  empty stay empty, so a short row keeps its shape.
+- Config is `REPORT_DB_*`, `REPORT_SCHEMA`, `REPORT_VIEW_*`, `REPORT_TEMPLATE`,
+  `REPORT_HISTORY_DIR`; the defaults match this compose stack. `psycopg2` and
+  `openpyxl` are imported defensively, so an image built before this feature
+  keeps running with the report disabled and says so instead of crashing.
 
 ### Observability (`observability/`)
 

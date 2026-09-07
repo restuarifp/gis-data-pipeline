@@ -159,6 +159,7 @@
     <button role="tab" data-job="split" aria-selected="true">split</button>
     <button role="tab" data-job="dbt"   aria-selected="false">dbt</button>
     <button role="tab" data-job="sync"  aria-selected="false">sync</button>
+    <button role="tab" data-job="report" aria-selected="false">laporan</button>
   </div>
 
   <div class="card" id="pane-split">
@@ -183,6 +184,18 @@
     <label class="field" for="dbt-select">--select <span style="opacity:.7">(opsional)</span></label>
     <input type="text" id="dbt-select" placeholder="mis. mart_capil atau stg_*_finance_rekap"
            autocapitalize="off" autocorrect="off" spellcheck="false">
+  </div>
+
+  <div class="card" id="pane-report" hidden>
+    <div class="top"><h2>Rekap Bulanan</h2><span class="pill" id="pill-report">—</span></div>
+    <div class="sub">Susun laporan rekap per kantor dari template, lalu kirim
+      sebagai file .xlsx ke Telegram.</div>
+    <label class="field" for="rep-bulan">Bulan</label>
+    <select id="rep-bulan"></select>
+    <label class="field" for="rep-tahun">Tahun</label>
+    <select id="rep-tahun"></select>
+    <div class="sub" id="hint-report" style="margin-top:9px"></div>
+    <button class="action" id="rep-run">📊 Buat &amp; kirim laporan</button>
   </div>
 
   <div class="card" id="pane-sync" hidden>
@@ -229,6 +242,9 @@ function toast(msg) {
    initData dikirim apa adanya di header; server yang memverifikasi HMAC-nya.
    Jangan pernah percaya initDataUnsafe untuk otorisasi — itu hanya untuk
    menampilkan nama di pojok kanan atas. */
+const NAMA_BULAN = ["Januari", "Februari", "Maret", "April", "Mei", "Juni",
+                    "Juli", "Agustus", "September", "Oktober", "November", "Desember"];
+
 const INIT_DATA = (tg && tg.initData) || "";
 let fatal = false;
 
@@ -291,6 +307,7 @@ function statusPill(st) {
 }
 
 function renderCards() {
+  const rep = state.report || {};
   const wrap = $("#cards");
   const urut = ["split", "dbt"];
   wrap.innerHTML = urut.map((nama) => {
@@ -323,10 +340,21 @@ function renderCards() {
       <div class="sub">${state.airbyte.enabled
         ? "Picu sync koneksi dari tab Jalankan."
         : "Set AIRBYTE_URL, AIRBYTE_CLIENT_ID, dan AIRBYTE_CLIENT_SECRET di .env."}</div>
+    </div>
+    <div class="card">
+      <div class="top"><h2>Rekap Bulanan</h2><span class="pill ${rep.enabled ? "ok" : "warn"}">
+        ${rep.enabled ? "siap" : "belum aktif"}</span></div>
+      <div class="sub">${rep.enabled
+        ? "Laporan .xlsx per kantor, dikirim ke Telegram."
+        : esc(rep.reason || "belum aktif")}</div>
+      <button class="action" data-goto="report" ${rep.enabled ? "" : "disabled"}>
+        📊 Buat laporan</button>
     </div>`;
 
   $$("#cards [data-run]").forEach((b) =>
     b.addEventListener("click", () => { buzz(); jalankan(b.dataset.run, true); }));
+  $$("#cards [data-goto]").forEach((b) =>
+    b.addEventListener("click", () => { buzz(); bukaTab("run", b.dataset.goto); }));
 }
 
 function renderChips() {
@@ -358,6 +386,35 @@ function renderChips() {
   $("#hint-split").textContent = pilihanSumber.size
     ? pilihanSumber.size + " folder dipilih"
     : "Tanpa pilihan = semua folder di NEXTCLOUD_SOURCE_PATHS.";
+}
+
+function renderReport() {
+  const rep = state.report || {};
+  const pill = $("#pill-report");
+  pill.textContent = rep.enabled ? "siap" : "mati";
+  pill.className = "pill " + (rep.enabled ? "ok" : "warn");
+
+  const bln = $("#rep-bulan"), thn = $("#rep-tahun");
+  if (!bln.options.length) {
+    bln.innerHTML = NAMA_BULAN.map((n, i) =>
+      `<option value="${i + 1}">${esc(n)}</option>`).join("");
+    const ini = rep.tahun || new Date().getFullYear();
+    let opsi = "";
+    for (let t = ini + 1; t >= ini - 4; t--) opsi += `<option value="${t}">${t}</option>`;
+    thn.innerHTML = opsi;
+    // Default: bulan lalu — bulan berjalan hampir selalu belum lengkap datanya.
+    bln.value = String(rep.bulan || new Date().getMonth() || 12);
+    thn.value = String(ini);
+  }
+
+  $("#rep-run").disabled = !rep.enabled;
+
+  // Angka selain DAKWAH HASIL adalah potret tarikan terakhir. Tanpa kalimat ini
+  // pemilihan bulan terbaca seolah menarik data historis, yang tidak disimpan.
+  $("#hint-report").innerHTML = rep.enabled
+    ? "Bulan yang dipilih menyaring <b>DAKWAH HASIL</b> dan menjadi judul laporan. "
+      + "Kolom lain memakai data tarikan terakhir."
+    : `<span style="color:var(--warn)">${esc(rep.reason || "belum aktif")}</span>`;
 }
 
 async function renderSync() {
@@ -402,6 +459,8 @@ function ringkasAksi() {
     const sel = $("#dbt-select").value.trim();
     return `dbt ${$("#dbt-cmd").value}` + (sel ? ` --select ${sel}` : "");
   }
+  if (job === "report")
+    return `rekap · ${NAMA_BULAN[$("#rep-bulan").value - 1]} ${$("#rep-tahun").value}`;
   const c = $("#sync-conn");
   return c ? `sync · ${c.selectedOptions[0].textContent}` : "sync";
 }
@@ -422,7 +481,11 @@ async function jalankan(nama, langsung) {
   syncMainButton();
   try {
     let hasil;
-    if (nama === "sync") {
+    if (nama === "report") {
+      hasil = await api("report", { method: "POST", body: JSON.stringify({
+        bulan: Number($("#rep-bulan").value), tahun: Number($("#rep-tahun").value),
+      }) });
+    } else if (nama === "sync") {
       const c = $("#sync-conn");
       if (!c) throw new Error("koneksi belum dipilih");
       hasil = await api("sync", { method: "POST", body: JSON.stringify({ connection_id: c.value }) });
@@ -453,7 +516,7 @@ function syncMainButton() {
   if (!tg || !tg.MainButton) return;
   const mb = tg.MainButton;
   if (tab !== "run") { mb.hide(); return; }
-  const st = state.jobs[job];
+  const st = state.jobs[job];   // job "report" tidak punya control server; st undefined
   const sibuk = sedangKirim || (st && st.running);
   mb.setText(sibuk ? "SEDANG BERJALAN…" : "▶ " + ringkasAksi().toUpperCase());
   sibuk ? mb.disable() : mb.enable();
@@ -469,6 +532,7 @@ async function muat() {
     if (state.user) $("#who").textContent = "@" + (state.user.username || state.user.first_name || "");
     renderCards();
     renderChips();
+    renderReport();
     syncMainButton();
   } catch (e) {
     if (!fatal) toast("Gagal memuat status: " + e.message);
@@ -498,6 +562,15 @@ function detak() {
 document.addEventListener("visibilitychange", () => { if (!document.hidden) detak(); });
 
 /* ── Navigasi ────────────────────────────────────────────────────────── */
+function bukaTab(namaTab, namaJob) {
+  const t = document.querySelector(`.tabs [data-tab="${namaTab}"]`);
+  if (t) t.click();
+  if (namaJob) {
+    const j = document.querySelector(`[data-job="${namaJob}"]`);
+    if (j) j.click();
+  }
+}
+
 $$('.tabs [data-tab]').forEach((b) => b.addEventListener("click", () => {
   buzz();
   tab = b.dataset.tab;
@@ -511,7 +584,7 @@ $$('[data-job]').forEach((b) => b.addEventListener("click", () => {
   buzz();
   job = b.dataset.job;
   $$('[data-job]').forEach((x) => x.setAttribute("aria-selected", String(x === b)));
-  ["split", "dbt", "sync"].forEach((j) => { $("#pane-" + j).hidden = j !== job; });
+  ["split", "dbt", "sync", "report"].forEach((j) => { $("#pane-" + j).hidden = j !== job; });
   if (job === "sync" && !$("#sync-conn")) renderSync();
   syncMainButton();
 }));
@@ -530,8 +603,10 @@ $("#log-auto").addEventListener("click", (e) => {
   if (logAuto) muatLog();
 });
 
-["dbt-cmd", "dbt-select"].forEach((id) =>
+["dbt-cmd", "dbt-select", "rep-bulan", "rep-tahun"].forEach((id) =>
   $("#" + id).addEventListener("input", syncMainButton));
+
+$("#rep-run").addEventListener("click", () => { buzz(); jalankan("report", false); });
 
 if (tg && tg.MainButton) tg.MainButton.onClick(() => jalankan(job, false));
 

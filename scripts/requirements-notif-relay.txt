@@ -1,2 +1,5 @@
 requests>=2.31.0
 python-dotenv>=1.0.0
+# Laporan Rekap Bulanan: query warehouse + isi template .xlsx (report_summary.py)
+psycopg2-binary>=2.9.9
+openpyxl>=3.1.2

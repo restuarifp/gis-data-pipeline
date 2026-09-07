@@ -33,6 +33,7 @@ Endpoint:
   GET  /api/connections -- daftar koneksi Airbyte (butuh initData)
   POST /api/run     -- picu split/dbt (butuh initData)
   POST /api/sync    -- picu sync Airbyte (butuh initData)
+  POST /api/report  -- susun Rekap Bulanan .xlsx lalu kirim ke Telegram (butuh initData)
   POST <apa saja>   -- terima webhook Airbyte, balas 200 seketika
   GET  /            -- health check, balas 200 "ok"
 
@@ -51,11 +52,13 @@ Konfigurasi via environment (lihat .env.example):
   MINI_APP_DIRECT_LINK         (opsional) -- https://t.me/<bot>/<app>, dipakai di grup
   MINI_APP_AUTH_MAX_AGE        (opsional, default 86400) -- umur maksimum initData (detik)
   TELEGRAM_DM_USER_IDS         (opsional) -- id user yang boleh memakai bot lewat DM
+  REPORT_DB_*, REPORT_VIEW_*   (opsional) -- lihat scripts/report_summary.py
 """
 
 import hashlib
 import hmac
 import html
+import io
 import json
 import logging
 import os
@@ -67,6 +70,8 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+
+import report_summary
 
 load_dotenv()
 
@@ -107,6 +112,7 @@ MAX_RETRIES     = int(os.getenv("TELEGRAM_MAX_RETRIES", "3"))
 RETRY_BACKOFF   = float(os.getenv("TELEGRAM_RETRY_BACKOFF_SECONDS", "3"))
 TELEGRAM_BASE   = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 TELEGRAM_API    = f"{TELEGRAM_BASE}/sendMessage"
+TELEGRAM_DOC_API = f"{TELEGRAM_BASE}/sendDocument"
 REQUEST_TIMEOUT = 15  # detik, per-attempt ke api.telegram.org
 
 # ── Bot (perintah dari Telegram) ────────────────────────────────────────────
@@ -284,6 +290,40 @@ def send_telegram(text: str, chat_id=None, reply_to=None, reply_markup=None) -> 
             time.sleep(RETRY_BACKOFF * attempt)
 
     log.error("Pesan Telegram dijatuhkan setelah %d percobaan (best-effort).", MAX_RETRIES)
+
+
+def kirim_dokumen(nama_file: str, isi: bytes, caption: str, chat_id=None) -> bool:
+    """
+    Kirim satu file ke Telegram (sendDocument), retry sama seperti send_telegram.
+
+    Dipisah dari send_telegram karena bodinya multipart, bukan JSON — file-nya
+    diunggah dari memori, tidak pernah ditulis ke disk container.
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.post(
+                TELEGRAM_DOC_API,
+                data={"chat_id": chat_id or TELEGRAM_CHAT_ID,
+                      "caption": caption[:1024], "parse_mode": "HTML"},
+                files={"document": (nama_file, io.BytesIO(isi),
+                                    "application/vnd.openxmlformats-officedocument."
+                                    "spreadsheetml.sheet")},
+                timeout=REQUEST_TIMEOUT * 4,   # unggah file, bukan sekadar teks
+            )
+            if resp.ok:
+                log.info("Dokumen %s terkirim ke %s (attempt %d/%d).",
+                         nama_file, chat_id or TELEGRAM_CHAT_ID, attempt, MAX_RETRIES)
+                return True
+            log.warning("Telegram membalas %s saat sendDocument (attempt %d/%d): %s",
+                        resp.status_code, attempt, MAX_RETRIES, resp.text[:300])
+        except requests.RequestException as exc:
+            log.warning("Gagal mengunggah dokumen (attempt %d/%d): %s",
+                        attempt, MAX_RETRIES, exc)
+        if attempt < MAX_RETRIES:
+            time.sleep(RETRY_BACKOFF * attempt)
+
+    log.error("Dokumen %s dijatuhkan setelah %d percobaan.", nama_file, MAX_RETRIES)
+    return False
 
 
 def dispatch(payload: dict) -> None:
@@ -631,6 +671,109 @@ def pasang_menu_button() -> None:
         log.warning("setChatMenuButton gagal: %s", exc)
 
 
+# ── Laporan Rekap Bulanan ───────────────────────────────────────────────────
+
+# Satu laporan pada satu waktu. Query rekapnya menyentuh seluruh view analytics,
+# dan tombol di Mini App gampang ditekan dua kali — tanpa ini setiap ketukan
+# membuka satu koneksi Postgres lagi. Job lain memakai kunci milik control
+# server; laporan tidak punya control server, jadi kuncinya di sini.
+_kunci_laporan = threading.Lock()
+
+
+def _parse_bulan(args: list) -> tuple:
+    """
+    Baca argumen bulan dari perintah teks: "9-2026", "09/2026", "9 2026", atau
+    kosong (= bulan lalu). Formatnya sengaja longgar; yang dilarang cuma yang
+    ambigu.
+    """
+    potong = [p for p in " ".join(args).replace("-", " ").replace("/", " ").split() if p]
+    if not potong:
+        return report_summary.bulan_default()
+    if len(potong) != 2 or not all(p.isdigit() for p in potong):
+        raise ValueError("format bulan tidak dikenal — pakai MM-YYYY, mis. 8-2026")
+    bulan, tahun = int(potong[0]), int(potong[1])
+    if not 1 <= bulan <= 12:
+        raise ValueError(f"bulan harus 1-12, bukan {bulan}")
+    if not 2000 <= tahun <= 2999:
+        raise ValueError(f"tahun tidak masuk akal: {tahun}")
+    return bulan, tahun
+
+
+def _caption_laporan(bulan: int, tahun: int, oleh: str, catatan: list) -> str:
+    judul = f"{report_summary.BULAN_SINGKAT[bulan]} {tahun}"
+    baris = [f"📊 <b>Rekap Bulanan {html.escape(judul)}</b>",
+             f"Dibuat oleh {html.escape(oleh)}."]
+    # Angka non-dakwah adalah potret tarikan terakhir, bukan potret bulan itu —
+    # kalau tidak ditulis di caption, orang akan membacanya sebagai data historis.
+    baris.append("<i>Selain DAKWAH HASIL, angkanya potret data terkini "
+                 "(warehouse hanya menyimpan tarikan terakhir). Baris JUMLAH "
+                 "BULAN LALU diambil dari arsip laporan bulan sebelumnya.</i>")
+    for c in catatan:
+        baris.append(f"⚠️ {html.escape(c)}")
+    return "\n".join(baris)
+
+
+def buat_dan_kirim_laporan(bulan: int, tahun: int, oleh: str, tujuan: list) -> None:
+    """
+    Bangun laporan lalu kirim ke setiap chat di `tujuan`.
+
+    Selalu dipanggil dari thread background: query rekap menyentuh semua view
+    analytics dan bisa makan beberapa detik — terlalu lama untuk ditahan di
+    dalam handler HTTP Mini App atau loop getUpdates.
+    """
+    if not _kunci_laporan.acquire(blocking=False):
+        for chat in tujuan:
+            send_telegram("⏳ Laporan lain masih disusun; coba lagi sebentar.", chat)
+        return
+    try:
+        isi, nama_file, catatan = report_summary.bangun_laporan(bulan, tahun)
+    except report_summary.ReportError as exc:
+        log.warning("Laporan %s-%s gagal: %s", bulan, tahun, exc)
+        for chat in tujuan:
+            send_telegram(f"❌ Laporan gagal dibuat: {html.escape(str(exc)[:500])}", chat)
+        return
+    except Exception as exc:  # noqa: BLE001 -- satu laporan gagal != relay mati
+        log.exception("Error tak terduga saat membangun laporan.")
+        for chat in tujuan:
+            send_telegram(f"❌ Laporan gagal dibuat: {html.escape(str(exc)[:300])}", chat)
+        return
+    finally:
+        _kunci_laporan.release()
+
+    caption = _caption_laporan(bulan, tahun, oleh, catatan)
+    for chat in tujuan:
+        kirim_dokumen(nama_file, isi, caption, chat)
+
+
+def _tujuan_laporan(chat_id) -> list:
+    """Grup selalu dapat salinannya; chat privat pemesan ditambahkan bila beda."""
+    tujuan = [TELEGRAM_CHAT_ID]
+    if chat_id and str(chat_id) != str(TELEGRAM_CHAT_ID):
+        tujuan.append(chat_id)
+    return tujuan
+
+
+def kirim_laporan(args: list, message: dict, chat_id, reply_to) -> None:
+    bisa, alasan = report_summary.laporan_aktif()
+    if not bisa:
+        send_telegram(f"⚠️ Laporan belum bisa dipakai: {html.escape(alasan)}",
+                      chat_id, reply_to)
+        return
+    try:
+        bulan, tahun = _parse_bulan(args)
+    except ValueError as exc:
+        send_telegram(f"❌ {html.escape(str(exc))}", chat_id, reply_to)
+        return
+
+    send_telegram(f"⏳ Menyusun rekap {report_summary.BULAN_SINGKAT[bulan]} {tahun}…",
+                  chat_id, reply_to)
+    threading.Thread(
+        target=buat_dan_kirim_laporan,
+        args=(bulan, tahun, sebut(message.get("from") or {}), _tujuan_laporan(chat_id)),
+        daemon=True,
+    ).start()
+
+
 # ── Mini App: API JSON ──────────────────────────────────────────────────────
 
 def status_semua_job() -> dict:
@@ -644,9 +787,13 @@ def status_semua_job() -> dict:
 
 
 def api_state(user: dict) -> dict:
+    bisa_laporan, alasan_laporan = report_summary.laporan_aktif()
+    baku_bulan, baku_tahun = report_summary.bulan_default()
     return {
         "jobs": status_semua_job(),
         "airbyte": {"enabled": airbyte_aktif()},
+        "report": {"enabled": bisa_laporan, "reason": alasan_laporan,
+                   "bulan": baku_bulan, "tahun": baku_tahun},
         "user": {k: user.get(k) for k in ("id", "username", "first_name")},
     }
 
@@ -704,6 +851,42 @@ def api_run(body: dict, user: dict) -> dict:
     raise WebAppError(str((data or {}).get("error") or f"ditolak ({kode})")[:300], 400)
 
 
+def api_report(body: dict, user: dict) -> dict:
+    """
+    Picu pembuatan laporan dari Mini App. Filenya tidak dikembalikan lewat HTTP:
+    Mini App berjalan di dalam webview Telegram yang memblokir unduhan, jadi
+    satu-satunya jalur yang benar-benar sampai ke operator adalah sendDocument.
+    """
+    bisa, alasan = report_summary.laporan_aktif()
+    if not bisa:
+        raise WebAppError(alasan, 400)
+
+    baku_bulan, baku_tahun = report_summary.bulan_default()
+    try:
+        bulan = int(body.get("bulan") or baku_bulan)
+        tahun = int(body.get("tahun") or baku_tahun)
+    except (TypeError, ValueError) as exc:
+        raise WebAppError("bulan/tahun harus angka", 400) from exc
+    if not 1 <= bulan <= 12:
+        raise WebAppError(f"bulan harus 1-12, bukan {bulan}", 400)
+    if not 2000 <= tahun <= 2999:
+        raise WebAppError(f"tahun tidak masuk akal: {tahun}", 400)
+
+    # Sama seperti aksi lain di panel: dikirim ke grup, plus ke DM pemesan bila
+    # id-nya memang terdaftar sebagai operator.
+    tujuan = [TELEGRAM_CHAT_ID]
+    if str(user.get("id")) in DM_USER_IDS:
+        tujuan.append(user["id"])
+
+    threading.Thread(
+        target=buat_dan_kirim_laporan,
+        args=(bulan, tahun, sebut(user) + " lewat Mini App", tujuan),
+        daemon=True,
+    ).start()
+    label = f"{report_summary.BULAN_SINGKAT[bulan]} {tahun}"
+    return {"ok": True, "message": f"Rekap {label} sedang disusun; filenya dikirim ke Telegram."}
+
+
 def api_connections() -> dict:
     if not airbyte_aktif():
         raise WebAppError("Airbyte belum dikonfigurasi.", 400)
@@ -752,6 +935,8 @@ BANTUAN = (
     "/dbt — jalankan <code>dbt run</code>\n"
     "/sync — daftar koneksi Airbyte\n"
     "/sync <i>nama-koneksi</i> — picu sync koneksi itu\n"
+    "/laporan — kirim Rekap Bulanan (.xlsx) untuk bulan lalu\n"
+    "/laporan <i>8-2026</i> — rekap bulan tertentu (MM-YYYY)\n"
     "/status — job sedang jalan atau tidak, plus hasil run terakhir\n"
     "/logs [split|dbt] — ekor log run terakhir\n"
     "/app — buka Panel Pipeline (Mini App): status, tombol jalankan, log\n"
@@ -1072,6 +1257,8 @@ def handle_command(message: dict) -> None:
         kirim_logs(args, chat_id, reply_to)
     elif perintah == "sync":
         mulai_sync(args, chat_id, reply_to)
+    elif perintah in ("laporan", "rekap"):
+        kirim_laporan(args, message, chat_id, reply_to)
     elif perintah in JOBS:
         mulai_job(perintah, args, chat_id, reply_to)
     else:
@@ -1191,6 +1378,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                 return 200, api_run(body, user)
             if path == "/api/sync":
                 return 200, api_sync(body, user)
+            if path == "/api/report":
+                return 200, api_report(body, user)
             return 404, {"error": f"endpoint tidak dikenal: {path}"}
         except WebAppError as exc:
             if exc.kode in (401, 403):

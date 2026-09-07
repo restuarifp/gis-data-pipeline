@@ -1,0 +1,4 @@
+# Arsip potret bulanan Rekap Bulanan (lihat docs/adr/0004).
+# Berkasnya <tahun>-<bulan>.json, ditulis notif-relay.
+*.json
+*.json.tmp
