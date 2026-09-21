@@ -116,6 +116,12 @@ WITH
     WHERE "LMG" NOT LIKE 'PRA' AND "LMG" NOT LIKE 'PJ%%' AND "LMG" NOT LIKE 'KPJ%%'
     GROUP BY kantor_id
   ),
+  baris AS (
+    SELECT kantor_id,
+      COUNT(*) FILTER (WHERE "LMG" LIKE 'KPJ%%') AS baris
+    FROM {_q(VIEW_CAPIL)}
+    GROUP BY kantor_id
+  ),
   anggota AS (
     SELECT kantor_id,
       COUNT(*) FILTER (WHERE upper("JK") = 'L') AS anggota_r,
@@ -208,6 +214,7 @@ WITH
   )
 SELECT
   g.kantor_id,
+  b.baris,
   g.pengurus_r, g.pengurus_n, g.pengurus_jumlah,
   g.pengurus_aktivitas_a, g.pengurus_aktivitas_m,
   g.pengurus_aktivitas_am, g.pengurus_aktivitas_na,
@@ -222,6 +229,7 @@ SELECT
   c.cad,
   tl.lainnya_tunai_jiwa, il.lainnya_penerimaan_100_persen, tfl.lainnya_terima_dpp
 FROM pengurus g
+  LEFT JOIN baris            b    ON b.kantor_id    = g.kantor_id
   LEFT JOIN anggota          a    ON a.kantor_id    = g.kantor_id
   LEFT JOIN jenjang          j    ON j.kantor_id    = g.kantor_id
   LEFT JOIN rekrut           r    ON r.kantor_id    = g.kantor_id
@@ -240,9 +248,9 @@ FROM pengurus g
 # yang menentukan, bukan urutan SELECT.
 #
 # Sengaja TIDAK diisi:
-#   D  "BARIS"                — tidak ada di query, biarkan seperti template
-#   S  "NT" (aktivitas anggota) — idem
+#   S  "NT" (aktivitas anggota) — tidak ada di query, biarkan seperti template
 KOLOM = {
+    "D":  "baris",                       # BARIS (LMG KPJ%)
     "E":  "pengurus_r",                  # PENGURUS · R
     "F":  "pengurus_n",                  # PENGURUS · N
     "G":  "pengurus_jumlah",             # PENGURUS · JLH
@@ -276,17 +284,17 @@ KOLOM = {
 # dari dua kolom terpisah).
 KOLOM_TURUNAN = {"T": ("pengurus_jumlah", "anggota_jumlah")}
 
-# Kolom yang totalnya ditulis di baris JUMLAH BULAN INI. D dan S ikut meski tidak
+# Kolom yang totalnya ditulis di baris JUMLAH BULAN INI. S ikut meski tidak
 # pernah diisi: templatenya menaruh =SUM(...) di seluruh baris itu, dan formula
 # yang tersisa akan tampil sebagai hasil lama (0) di previewer yang tidak
 # menghitung ulang — termasuk pratinjau file bawaan Telegram.
-KOLOM_TOTAL = ["D", "S"] + list(KOLOM) + list(KOLOM_TURUNAN)
+KOLOM_TOTAL = ["S"] + list(KOLOM) + list(KOLOM_TURUNAN)
 
 # Nama semantik tiap kolom, dipakai sebagai kunci arsip bulanan. Sengaja BUKAN
 # huruf kolom: kalau suatu saat template menyisipkan kolom baru, huruf-hurufnya
 # bergeser dan arsip lama akan dibaca ke kolom yang salah tanpa error.
 NAMA_KOLOM = dict(KOLOM)
-NAMA_KOLOM.update({"T": "p_plus_a", "D": "baris", "S": "nt"})
+NAMA_KOLOM.update({"T": "p_plus_a", "S": "nt"})
 
 KOL_JUDUL     = "A1"    # "BULAN: Apr 26"
 KOL_KANTOR    = "C"     # kode kantor per baris
@@ -461,16 +469,16 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
             terpakai.add(kantor)
 
         nilai_baris = {}
-        for kol in ("D", "S"):   # tidak diisi query; totalnya tetap harus benar
-            ada = ws[f"{kol}{baris}"].value
-            nilai_baris[kol] = ada if isinstance(ada, (int, float)) else 0
+        # S tidak diisi query; nilainya dibaca dari template supaya totalnya benar.
+        ada = ws[f"S{baris}"].value
+        nilai_baris["S"] = ada if isinstance(ada, (int, float)) else 0
         for kol, nama in KOLOM.items():
             nilai_baris[kol] = _angka(rec.get(nama))
         for kol, bagian in KOLOM_TURUNAN.items():
             nilai_baris[kol] = sum(_angka(rec.get(n)) for n in bagian)
 
         for kol, nilai in nilai_baris.items():
-            if kol not in ("D", "S"):   # dua kolom itu dibiarkan apa adanya
+            if kol != "S":   # S dibiarkan apa adanya
                 ws[f"{kol}{baris}"] = nilai
             total[kol] += nilai
         per_kantor[kantor] = {NAMA_KOLOM[k]: v for k, v in nilai_baris.items()}

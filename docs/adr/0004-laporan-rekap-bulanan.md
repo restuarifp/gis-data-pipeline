@@ -72,7 +72,8 @@ jadi menyisipkan baris dari `openpyxl` justru merusak bentuk yang mau
 dipertahankan. Kantor yang ada di warehouse tapi tidak ada barisnya dilaporkan
 sebagai peringatan di caption, jadi angkanya tidak hilang diam-diam.
 
-**Kolom BARIS dan NT tidak diisi** — keduanya tidak ada di query rekap.
+**Kolom NT tidak diisi** — tidak ada di query rekap. BARIS diisi dari CTE
+`baris` (jumlah `LMG LIKE 'KPJ%'` per kantor).
 
 ## Alternatif yang ditolak
 

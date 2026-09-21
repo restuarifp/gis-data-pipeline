@@ -161,8 +161,8 @@ and reply immediately; the finished `.xlsx` arrives as a Telegram document.
 - **The template is filled, not redrawn.** `openpyxl` opens
   `docs/template/summary.xlsx` and writes into existing cells, so merges,
   borders, and number formats survive. Column → query-field mapping lives in
-  `KOLOM`; `T` (P+A) is derived, and `D` (BARIS) and `S` (NT) are deliberately
-  left alone because the query has no equivalent.
+  `KOLOM`; `D` (BARIS) counts `LMG LIKE 'KPJ%'`, `T` (P+A) is derived, and
+  `S` (NT) is deliberately left alone because the query has no equivalent.
 - **The chosen month only filters DAKWAH HASIL** (`rekrut`, on
   `Bln_Integrasi`/`Th_Integrasi`) and sets the title. Staging keeps only the
   latest pull, so every other column is a snapshot of current data.
