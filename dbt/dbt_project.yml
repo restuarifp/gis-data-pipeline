@@ -14,3 +14,5 @@ models:
       +materialized: view
     marts:
       +materialized: view
+    history:
+      +materialized: view

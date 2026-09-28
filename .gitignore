@@ -4,6 +4,9 @@ postgres-data/
 # Metabase data
 metabase-data/
 
+# Rekap Bulanan archives (runtime data, back up — don't commit)
+report-history/
+
 # DBT
 dbt/target/
 dbt/dbt_packages/

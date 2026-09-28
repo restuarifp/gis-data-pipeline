@@ -41,19 +41,39 @@ di dua tempat setiap kali bentuk laporannya berubah.
 
 ## Konsekuensi
 
-**Bulan yang dipilih hanya menyaring DAKWAH HASIL.** Model staging cuma
-menyimpan tarikan terakhir (`_airbyte_generation_id = MAX`), jadi warehouse
-tidak punya riwayat bulanan. Semua kolom selain DAKWAH HASIL adalah potret data
-terkini; bulan yang dipilih menyaring `Bln_Integrasi`/`Th_Integrasi` dan menjadi
-judul laporan.
+**Laporan bulan X adalah potret data pada akhir bulan X.** Versi pertama
+membaca staging, yang cuma menyimpan tarikan terakhir
+(`_airbyte_generation_id = MAX`), sehingga bulan yang dipilih hanya menyaring
+DAKWAH HASIL dan semua kolom lain selalu berisi data terkini — memilih bulan
+apa pun menghasilkan angka yang sama. Koneksi Airbyte ternyata memakai mode
+Append, jadi tabel raw menyimpan setiap tarikan. Laporan kini membaca view
+`hist_capil`, `hist_finance_rekap`, `hist_finance_rincian`
+(`dbt/models/history/`, macro `hist_pulls`), yang menyimpan semua tarikan
+beserta `tarikan_id` dan `ditarik_pada`, lalu per kantor per sumber memilih
+tarikan terakhir sebelum tanggal 1 bulan berikutnya (`REPORT_TIMEZONE`, default
+Asia/Jakarta). DAKWAH HASIL tetap juga disaring `Bln_Integrasi`/`Th_Integrasi`.
+
+Ini keputusan yang sadar dibuat di sisi dbt, bukan query ke raw dari relay:
+aturan staging (mis. `K IS NOT NULL`) cukup ditulis di satu tempat per lapisan.
+View riwayat membaca kantor dari `sources.yml`, jadi kantor baru tidak butuh
+file model baru. `wajib_ifq` sengaja tidak ada di `hist_finance_rincian` —
+turunannya dari capil tarikan terakhir tidak bermakna untuk tarikan lama.
+
+Konsekuensinya: sync yang terlambat masuk ke bulan tarikannya, bukan bulan
+datanya; kantor tanpa tarikan sebelum akhir bulan itu kosong; dan kantor yang
+tarikan terakhirnya dari bulan lebih awal memakai tarikan lama itu. Ketiganya
+dicatat di log relay. Kalau koneksi Airbyte suatu saat diubah ke Overwrite,
+riwayat itu hilang dan laporan bulan lampau kembali berisi data terkini.
 
 Caption filenya sengaja satu kalimat — hanya menyebut siapa yang meminta.
 Peringatan (kantor tanpa baris di template, arsip gagal ditulis) tidak lagi ikut
 ke Telegram dan hanya ditulis ke log notif-relay: operator memintanya begitu,
 dan konsekuensinya angka yang hilang tidak lagi terlihat dari Telegram saja.
 
-**Baris JUMLAH BULAN LALU diisi dari arsip, bukan dari warehouse.** Karena
-warehouse tidak punya riwayat, tiap laporan yang selesai dibangun menyimpan
+**Baris JUMLAH BULAN LALU diisi dari arsip, bukan dari warehouse.** Angka bulan
+lalu bisa saja dihitung ulang dari view riwayat, tapi itu menjalankan query rekap
+dua kali per laporan, dan hasilnya bisa berbeda dari file yang dulu benar-benar
+dikirim bila ada sync susulan. Karena itu tiap laporan yang selesai dibangun menyimpan
 potretnya sendiri ke `REPORT_HISTORY_DIR` sebagai `<tahun>-<bulan>.json`, dan
 laporan bulan berikutnya membacanya. Artinya pembanding baru ada setelah bulan
 itu pernah dilaporkan sekali — bulan pertama berisi nol, dengan catatan yang

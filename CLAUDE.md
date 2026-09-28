@@ -94,6 +94,7 @@ Nextcloud (WebDAV)
 - `models/staging/finance/stg_<kantor_id>_finance_rekap.sql` / `_rincian.sql` — one-liner: `{{ stg_finance_rekap('<kantor_id>') }}` delegating to the macro
 - `models/marts/mart_capil.sql` — `UNION ALL` across every staging capil model
 - `models/marts/finance/mart_finance_rekap.sql` / `mart_finance_rincian.sql` — `UNION ALL` across every staging finance model
+- `models/history/hist_*.sql` — every pull (not just the latest), all offices, for the Rekap Bulanan month snapshot; see that section
 
 ### Key macro (`dbt/macros/finance_helpers.sql`)
 
@@ -163,15 +164,27 @@ and reply immediately; the finished `.xlsx` arrives as a Telegram document.
   borders, and number formats survive. Column → query-field mapping lives in
   `KOLOM`; `D` (BARIS) counts `LMG LIKE 'KPJ%'`, `T` (P+A) is derived, and
   `S` (NT) is deliberately left alone because the query has no equivalent.
-- **The chosen month only filters DAKWAH HASIL** (`rekrut`, on
-  `Bln_Integrasi`/`Th_Integrasi`) and sets the title. Staging keeps only the
-  latest pull, so every other column is a snapshot of current data.
+- **The report for month X is a snapshot as of the end of month X.** It does
+  *not* read staging (latest pull only). It reads `hist_capil`,
+  `hist_finance_rekap`, `hist_finance_rincian` (`dbt/models/history/`, macro
+  `hist_pulls` in `macros/history_helpers.sql`), which keep every Airbyte pull
+  with `tarikan_id` (= generation id) and `ditarik_pada` (MIN extracted_at per
+  generation, epoch rows dropped). Per office and per source the query takes
+  the latest pull before the 1st of the next month in `REPORT_TIMEZONE`
+  (default Asia/Jakarta). This only works because the Airbyte connections are
+  **Full refresh | Append** — switch one to Overwrite and its history is gone.
+  DAKWAH HASIL is additionally filtered on `Bln_Integrasi`/`Th_Integrasi`.
+  Offices falling back to an older pull, or with no finance pull yet, are
+  noted in the relay log. History views discover offices from `sources.yml`,
+  so a new office needs no new history model; `hist_finance_rincian` has no
+  `wajib_ifq` on purpose.
 - **Every finished report archives its own snapshot** to `REPORT_HISTORY_DIR`
   (`./report-history`, bind-mounted at `/data/laporan`) as
   `<year>-<month>.json`, and the next month's report reads the previous month's
   archive to fill `JUMLAH BULAN LALU`, with `SELISIH` computed from the two.
-  The warehouse has no history, so **that folder is the only source of
-  month-over-month comparison — back it up**. A month with no archive behind it
+  The raw tables hold past pulls only while the Airbyte connections stay on
+  Append, and the archive is the only record of what was actually *reported*,
+  so **back that folder up**. A month with no archive behind it
   gets zeros, noted in the relay log. Rerunning a month overwrites its archive,
   which is what you want after a late Airbyte sync.
 - **Archive keys are semantic names** (`NAMA_KOLOM`), not column letters, so
@@ -186,8 +199,10 @@ and reply immediately; the finished `.xlsx` arrives as a Telegram document.
   `=SUM(...)`/`=X19-X20`** — Telegram's file preview does not recalculate
   formulas and would show the stale cached result. Cells the template leaves
   empty stay empty, so a short row keeps its shape.
-- Config is `REPORT_DB_*`, `REPORT_SCHEMA`, `REPORT_VIEW_*`, `REPORT_TEMPLATE`,
-  `REPORT_HISTORY_DIR`; the defaults match this compose stack. `psycopg2` and
+- Config is `REPORT_DB_*`, `REPORT_SCHEMA`, `REPORT_VIEW_HIST_*`,
+  `REPORT_TIMEZONE`, `REPORT_TEMPLATE`, `REPORT_HISTORY_DIR`; the defaults match
+  this compose stack. The old `REPORT_VIEW_*` (pointing at `stg_all_*`) are
+  ignored — renamed on purpose so a stale `.env` can't feed staging views in. `psycopg2` and
   `openpyxl` are imported defensively, so an image built before this feature
   keeps running with the report disabled and says so instead of crashing.
 

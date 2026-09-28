@@ -13,12 +13,19 @@ memanggil bangun_laporan(), lalu hasilnya dikirim ke Telegram sebagai dokumen.
 
 Yang perlu diingat soal cakupan datanya
 ---------------------------------------
-Model staging hanya menyimpan *tarikan terakhir* (`_airbyte_generation_id`
-= MAX), jadi warehouse tidak menyimpan riwayat bulanan. Konsekuensinya:
+Model staging hanya menyimpan *tarikan terakhir*, jadi laporan TIDAK membaca
+staging. Ia membaca view `hist_*` (dbt/models/history/) yang menyimpan semua
+tarikan Airbyte (koneksinya memakai mode Append), lalu untuk tiap kantor dan
+tiap sumber memilih tarikan terakhir yang terjadi sebelum bulan berikutnya
+dimulai (zona waktu REPORT_TIMEZONE). Konsekuensinya:
 
-  * Semua kolom selain DAKWAH HASIL adalah potret data terkini, bukan potret
-    bulan yang dipilih. Bulan/tahun yang dipilih hanya menyaring DAKWAH HASIL
-    (Bln_Integrasi/Th_Integrasi) dan menjadi judul laporan.
+  * Laporan bulan X adalah potret data seperti pada akhir bulan X. Sync yang
+    terlambat (mis. data Agustus baru ditarik 2 September) masuk ke bulan
+    tarikannya, bukan bulan datanya.
+  * Kantor yang belum punya tarikan sebelum akhir bulan itu tidak punya data.
+    Kantor yang tarikan terakhirnya jatuh di bulan sebelumnya memakai tarikan
+    lama itu — keduanya disebut di catatan (log relay).
+  * DAKWAH HASIL tetap juga disaring Bln_Integrasi/Th_Integrasi = bulan itu.
   * Baris "JUMLAH BULAN LALU" dan "SELISIH" diambil dari *arsip* laporan bulan
     sebelumnya (REPORT_HISTORY_DIR), bukan dari warehouse. Tiap laporan yang
     selesai dibangun menyimpan potretnya sendiri, jadi pembanding baru ada
@@ -37,9 +44,10 @@ Konfigurasi via environment:
   REPORT_DB_USER      (default admin)
   REPORT_DB_PASSWORD  (default password123)
   REPORT_SCHEMA       (default analytics)
-  REPORT_VIEW_CAPIL           (default stg_all_capil)
-  REPORT_VIEW_FINANCE_REKAP   (default stg_all_finance_rekap)
-  REPORT_VIEW_FINANCE_RINCIAN (default stg_all_finance_rincian)
+  REPORT_VIEW_HIST_CAPIL           (default hist_capil)
+  REPORT_VIEW_HIST_FINANCE_REKAP   (default hist_finance_rekap)
+  REPORT_VIEW_HIST_FINANCE_RINCIAN (default hist_finance_rincian)
+  REPORT_TIMEZONE     (default Asia/Jakarta) -- batas "akhir bulan" tarikan
   REPORT_TEMPLATE     (default docs/template/summary.xlsx di sebelah modul ini)
   REPORT_HISTORY_DIR  (default /data/laporan) -- arsip potret bulanan
 """
@@ -77,9 +85,13 @@ DB = {
 }
 
 SCHEMA          = os.getenv("REPORT_SCHEMA", "analytics")
-VIEW_CAPIL      = os.getenv("REPORT_VIEW_CAPIL", "stg_all_capil")
-VIEW_REKAP      = os.getenv("REPORT_VIEW_FINANCE_REKAP", "stg_all_finance_rekap")
-VIEW_RINCIAN    = os.getenv("REPORT_VIEW_FINANCE_RINCIAN", "stg_all_finance_rincian")
+# View riwayat (semua tarikan), bukan staging. Nama env-nya sengaja beda dari
+# REPORT_VIEW_* lama: .env yang masih menunjuk stg_all_* akan diam-diam
+# memberi view tanpa kolom tarikan_id/ditarik_pada.
+VIEW_CAPIL      = os.getenv("REPORT_VIEW_HIST_CAPIL", "hist_capil")
+VIEW_REKAP      = os.getenv("REPORT_VIEW_HIST_FINANCE_REKAP", "hist_finance_rekap")
+VIEW_RINCIAN    = os.getenv("REPORT_VIEW_HIST_FINANCE_RINCIAN", "hist_finance_rincian")
+ZONA_WAKTU      = os.getenv("REPORT_TIMEZONE", "Asia/Jakarta")
 
 TEMPLATE = Path(os.getenv(
     "REPORT_TEMPLATE",
@@ -98,11 +110,46 @@ def _q(nama: str) -> str:
     return f'"{SCHEMA}"."{nama}"'
 
 
-# Query rekap. Sama persis dengan pertanyaan yang dipakai di Metabase, kecuali
-# CTE `rekrut` yang bulan/tahunnya dijadikan parameter (%(bulan)s / %(tahun)s)
-# alih-alih CURRENT_DATE - 1 bulan, supaya laporan bulan mana pun bisa diminta.
+def _potret(view: str) -> str:
+    """
+    Isi satu view riwayat pada akhir bulan laporan: per kantor, tarikan terakhir
+    yang ditarik sebelum %(batas)s (awal bulan berikutnya, jam lokal).
+
+    Dipilih lewat tarikan_id (= _airbyte_generation_id), bukan per baris:
+    satu tarikan bisa punya _airbyte_extracted_at yang berbeda antar baris.
+    """
+    return f"""
+    SELECT h.*
+    FROM {_q(view)} h
+    JOIN (
+      SELECT kantor_id, MAX(tarikan_id) AS tarikan_id
+      FROM {_q(view)}
+      WHERE ditarik_pada < (%(batas)s::timestamp AT TIME ZONE %(zona)s)
+      GROUP BY kantor_id
+    ) p ON p.kantor_id = h.kantor_id AND p.tarikan_id = h.tarikan_id"""
+
+
+# Query rekap. Sama dengan pertanyaan yang dipakai di Metabase, kecuali:
+#  * sumbernya potret akhir bulan dari view riwayat (CTE capil/rekap/rincian),
+#    bukan staging yang hanya berisi tarikan terakhir;
+#  * CTE `rekrut` memakai parameter %(bulan)s / %(tahun)s alih-alih
+#    CURRENT_DATE - 1 bulan, supaya laporan bulan mana pun bisa diminta.
 SQL = f"""
 WITH
+  capil   AS ({_potret(VIEW_CAPIL)}
+  ),
+  rekap   AS ({_potret(VIEW_REKAP)}
+  ),
+  rincian AS ({_potret(VIEW_RINCIAN)}
+  ),
+  -- Waktu tarikan yang terpakai, dalam jam lokal, untuk catatan di log.
+  tarikan AS (
+    SELECT c.kantor_id, c.ditarik_capil, f.ditarik_finance
+    FROM (SELECT kantor_id, MAX(ditarik_pada) AT TIME ZONE %(zona)s AS ditarik_capil
+          FROM capil GROUP BY kantor_id) c
+    LEFT JOIN (SELECT kantor_id, MAX(ditarik_pada) AT TIME ZONE %(zona)s AS ditarik_finance
+               FROM rincian GROUP BY kantor_id) f ON f.kantor_id = c.kantor_id
+  ),
   pengurus AS (
     SELECT kantor_id,
       COUNT(*) FILTER (WHERE upper("JK") = 'L') AS pengurus_r,
@@ -112,14 +159,14 @@ WITH
       COUNT(*) FILTER (WHERE "Status_Aktivitas" = 'M')  AS pengurus_aktivitas_m,
       COUNT(*) FILTER (WHERE "Status_Aktivitas" = 'AM') AS pengurus_aktivitas_am,
       COUNT(*) FILTER (WHERE "Status_Aktivitas" = 'NA') AS pengurus_aktivitas_na
-    FROM {_q(VIEW_CAPIL)}
+    FROM capil
     WHERE "LMG" NOT LIKE 'PRA' AND "LMG" NOT LIKE 'PJ%%' AND "LMG" NOT LIKE 'KPJ%%'
     GROUP BY kantor_id
   ),
   baris AS (
     SELECT kantor_id,
       COUNT(*) FILTER (WHERE "LMG" LIKE 'KPJ%%') AS baris
-    FROM {_q(VIEW_CAPIL)}
+    FROM capil
     GROUP BY kantor_id
   ),
   anggota AS (
@@ -131,7 +178,7 @@ WITH
       COUNT(*) FILTER (WHERE "Status_Aktivitas" = 'M')  AS anggota_aktivitas_m,
       COUNT(*) FILTER (WHERE "Status_Aktivitas" = 'AM') AS anggota_aktivitas_am,
       COUNT(*) FILTER (WHERE "Status_Aktivitas" = 'NA') AS anggota_aktivitas_na
-    FROM {_q(VIEW_CAPIL)}
+    FROM capil
     WHERE "LMG" LIKE 'PRA' OR "LMG" LIKE 'PJ%%' OR "LMG" LIKE 'KPJ%%'
     GROUP BY kantor_id
   ),
@@ -140,12 +187,12 @@ WITH
       COUNT(*) FILTER (WHERE "K" = '1') AS jenjang_a1,
       COUNT(*) FILTER (WHERE "K" = '2') AS jenjang_a2,
       COUNT(*) FILTER (WHERE "K" = '3') AS jenjang_a3
-    FROM {_q(VIEW_CAPIL)}
+    FROM capil
     GROUP BY kantor_id
   ),
   rekrut AS (
     SELECT kantor_id, COUNT(*) AS rekrut
-    FROM {_q(VIEW_CAPIL)}
+    FROM capil
     WHERE "Bln_Integrasi"::int = %(bulan)s
       AND "Th_Integrasi"::int  = %(tahun)s
     GROUP BY kantor_id
@@ -156,60 +203,60 @@ WITH
       + SUM(COALESCE("tunai_ifq",0)) + SUM(COALESCE("tunai_lqt",0))
       + SUM(COALESCE("tunai_sdq",0)) + SUM(COALESCE("tunai_snk",0))
       + SUM(COALESCE("tunai_fdy",0)) AS mfq
-    FROM {_q(VIEW_RINCIAN)}
+    FROM rincian
     GROUP BY kantor_id
   ),
   income_ip AS (
     SELECT kantor_id,
       SUM(CASE WHEN jenis IN {JENIS_IP} THEN total_100_persen ELSE 0 END)
         AS ip_penerimaan_100_persen
-    FROM {_q(VIEW_REKAP)}
+    FROM rekap
     GROUP BY kantor_id
   ),
   transfer_ip AS (
     SELECT kantor_id,
       SUM(CASE WHEN jenis IN {JENIS_IP} THEN pembulatan_setor ELSE 0 END)
         AS ip_terima_dpp
-    FROM {_q(VIEW_REKAP)}
+    FROM rekap
     GROUP BY kantor_id
   ),
   income_sd AS (
     SELECT kantor_id, SUM(COALESCE(nominal_zkt,0)) AS sd_penerimaan_100_persen
-    FROM {_q(VIEW_RINCIAN)}
+    FROM rincian
     GROUP BY kantor_id
   ),
   transfer_sd AS (
     SELECT kantor_id,
       SUM(CASE WHEN jenis IN ('NOMINAL ZKT') THEN pembulatan_setor ELSE 0 END)
         AS sd_terima_dpp
-    FROM {_q(VIEW_REKAP)}
+    FROM rekap
     GROUP BY kantor_id
   ),
   cadangan AS (
     SELECT kantor_id,
       SUM(CASE WHEN jenis IN ('CAD ') THEN pembulatan_setor ELSE 0 END) AS cad
-    FROM {_q(VIEW_REKAP)}
+    FROM rekap
     GROUP BY kantor_id
   ),
   tunai_lainnya AS (
     SELECT kantor_id,
       SUM(COALESCE("tunai_zf",0)) + SUM(COALESCE("tunai_tdy",0))
         AS lainnya_tunai_jiwa
-    FROM {_q(VIEW_RINCIAN)}
+    FROM rincian
     GROUP BY kantor_id
   ),
   income_lainnya AS (
     SELECT kantor_id,
       SUM(COALESCE(nominal_zf,0) + COALESCE(nominal_tdy,0))
         AS lainnya_penerimaan_100_persen
-    FROM {_q(VIEW_RINCIAN)}
+    FROM rincian
     GROUP BY kantor_id
   ),
   transfer_lainnya AS (
     SELECT kantor_id,
       SUM(CASE WHEN jenis IN ('NOMINAL ZF','NOMINAL TDY') THEN pembulatan_setor
                ELSE 0 END) AS lainnya_terima_dpp
-    FROM {_q(VIEW_REKAP)}
+    FROM rekap
     GROUP BY kantor_id
   )
 SELECT
@@ -227,8 +274,10 @@ SELECT
   i.ip_penerimaan_100_persen, tfip.ip_terima_dpp,
   isd.sd_penerimaan_100_persen, tfsd.sd_terima_dpp,
   c.cad,
-  tl.lainnya_tunai_jiwa, il.lainnya_penerimaan_100_persen, tfl.lainnya_terima_dpp
+  tl.lainnya_tunai_jiwa, il.lainnya_penerimaan_100_persen, tfl.lainnya_terima_dpp,
+  tr.ditarik_capil, tr.ditarik_finance
 FROM pengurus g
+  LEFT JOIN tarikan          tr   ON tr.kantor_id   = g.kantor_id
   LEFT JOIN baris            b    ON b.kantor_id    = g.kantor_id
   LEFT JOIN anggota          a    ON a.kantor_id    = g.kantor_id
   LEFT JOIN jenjang          j    ON j.kantor_id    = g.kantor_id
@@ -345,9 +394,14 @@ def _angka(nilai):
 
 def ambil_data(bulan: int, tahun: int) -> dict:
     """Jalankan query rekap; kembalikan {kantor_id: {kolom: nilai}}."""
+    # Awal bulan berikutnya: tarikan sebelum titik ini = potret akhir bulan laporan.
+    b_depan, t_depan = _bulan_sesudah(bulan, tahun)
     try:
         with psycopg2.connect(connect_timeout=10, **DB) as conn, conn.cursor() as cur:
-            cur.execute(SQL, {"bulan": bulan, "tahun": tahun})
+            cur.execute(SQL, {
+                "bulan": bulan, "tahun": tahun, "zona": ZONA_WAKTU,
+                "batas": date(t_depan, b_depan, 1).isoformat(),
+            })
             nama_kolom = [d[0] for d in cur.description]
             baris = cur.fetchall()
     except psycopg2.Error as exc:
@@ -360,12 +414,45 @@ def ambil_data(bulan: int, tahun: int) -> dict:
         rec = dict(zip(nama_kolom, r))
         kantor = str(rec.get("kantor_id") or "").strip().upper()
         if kantor:
-            hasil[kantor] = {k: _angka(v) for k, v in rec.items() if k != "kantor_id"}
+            # ditarik_* adalah waktu, bukan angka: _angka() akan mengubah NULL-nya jadi 0.
+            hasil[kantor] = {k: v if k.startswith("ditarik_") else _angka(v)
+                             for k, v in rec.items() if k != "kantor_id"}
     return hasil
 
 
 def _bulan_sebelum(bulan: int, tahun: int) -> tuple:
     return (12, tahun - 1) if bulan == 1 else (bulan - 1, tahun)
+
+
+def _bulan_sesudah(bulan: int, tahun: int) -> tuple:
+    return (1, tahun + 1) if bulan == 12 else (bulan + 1, tahun)
+
+
+def _catatan_tarikan(data: dict, bulan: int, tahun: int) -> list:
+    """
+    Sebut kantor yang potretnya tidak berasal dari bulan laporan: tarikan
+    terakhirnya sebelum akhir bulan itu jatuh di bulan yang lebih awal, atau
+    finance-nya belum pernah ditarik sama sekali sampai saat itu.
+    """
+    lama, tanpa_finance = [], []
+    for kantor, rec in sorted(data.items()):
+        for label, kunci in (("capil", "ditarik_capil"), ("finance", "ditarik_finance")):
+            waktu = rec.get(kunci)
+            if waktu is None:
+                if kunci == "ditarik_finance":
+                    tanpa_finance.append(kantor)
+            elif (waktu.year, waktu.month) != (tahun, bulan):
+                lama.append(f"{kantor} {label} {waktu:%Y-%m-%d}")
+        log.info("Laporan %s-%02d: %s memakai tarikan capil %s, finance %s.",
+                 tahun, bulan, kantor, rec.get("ditarik_capil"), rec.get("ditarik_finance"))
+    catatan = []
+    if lama:
+        catatan.append(f"Tidak ada tarikan di {BULAN_SINGKAT[bulan]} {tahun}, "
+                       f"memakai tarikan lebih lama: " + ", ".join(lama))
+    if tanpa_finance:
+        catatan.append("Belum ada tarikan finance sampai akhir bulan itu: "
+                       + ", ".join(tanpa_finance))
+    return catatan
 
 
 def _berkas_arsip(bulan: int, tahun: int) -> Path:
@@ -490,7 +577,7 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
     b_lalu, t_lalu = _bulan_sebelum(bulan, tahun)
     arsip = baca_arsip(b_lalu, t_lalu)
     total_lalu = arsip.get("total") or {}
-    catatan = []
+    catatan = _catatan_tarikan(data, bulan, tahun)
     if not total_lalu:
         catatan.append(
             f"Belum ada arsip {BULAN_SINGKAT[b_lalu]} {t_lalu} — baris JUMLAH "
