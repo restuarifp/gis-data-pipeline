@@ -72,6 +72,11 @@ try:
     from openpyxl import load_workbook
 except ImportError:  # pragma: no cover
     load_workbook = None
+try:
+    import msoffcrypto
+    from msoffcrypto.format.ooxml import OOXMLFile
+except ImportError:  # pragma: no cover
+    msoffcrypto = None
 
 
 # ── Konfigurasi ─────────────────────────────────────────────────────────────
@@ -97,6 +102,11 @@ TEMPLATE = Path(os.getenv(
     "REPORT_TEMPLATE",
     Path(__file__).resolve().parent.parent / "docs" / "template" / "summary.xlsx",
 ))
+
+# Password pembuka file .xlsx yang dikirim ke Telegram. Kosong = tanpa password.
+# Kalau diisi tapi msoffcrypto-tool tidak ada, laporan dimatikan — lebih baik
+# gagal daripada diam-diam mengirim file tanpa password ke grup.
+PASSWORD_XLSX = os.getenv("REPORT_XLSX_PASSWORD", "")
 
 BULAN_SINGKAT = ["", "Jan", "Feb", "Mar", "Apr", "Mei", "Jun",
                  "Jul", "Agu", "Sep", "Okt", "Nov", "Des"]
@@ -374,7 +384,20 @@ def laporan_aktif() -> tuple:
                        "build ulang: docker compose build notif-relay")
     if not TEMPLATE.is_file():
         return False, f"template tidak ditemukan: {TEMPLATE}"
+    if PASSWORD_XLSX and msoffcrypto is None:
+        return False, ("REPORT_XLSX_PASSWORD diisi tapi image notif-relay ini "
+                       "belum punya msoffcrypto-tool — build ulang: "
+                       "docker compose build notif-relay")
     return True, ""
+
+
+def _kunci_xlsx(isi: bytes) -> bytes:
+    """Enkripsi .xlsx dengan password pembuka (ECMA-376 Agile, standar Excel)."""
+    if not PASSWORD_XLSX:
+        return isi
+    keluar = io.BytesIO()
+    OOXMLFile(io.BytesIO(isi)).encrypt(PASSWORD_XLSX, keluar)
+    return keluar.getvalue()
 
 
 def bulan_default() -> tuple:
@@ -621,4 +644,4 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
     nama_file = f"rekap-{tahun:04d}-{bulan:02d}.xlsx"
     log.info("Laporan %s dibangun (%d kantor terisi, %d catatan).",
              nama_file, len(terpakai), len(catatan))
-    return buf.getvalue(), nama_file, catatan
+    return _kunci_xlsx(buf.getvalue()), nama_file, catatan

@@ -199,8 +199,13 @@ and reply immediately; the finished `.xlsx` arrives as a Telegram document.
   `=SUM(...)`/`=X19-X20`** — Telegram's file preview does not recalculate
   formulas and would show the stale cached result. Cells the template leaves
   empty stay empty, so a short row keeps its shape.
+- **`REPORT_XLSX_PASSWORD`** sets an open-password on the sent `.xlsx`
+  (`msoffcrypto-tool`, ECMA-376 Agile encryption — openpyxl can't do this);
+  empty = no password. If it is set but the library is missing, the report is
+  **disabled** rather than sent unprotected. Encrypted files get no Telegram
+  preview. The JSON archive in `REPORT_HISTORY_DIR` is not encrypted.
 - Config is `REPORT_DB_*`, `REPORT_SCHEMA`, `REPORT_VIEW_HIST_*`,
-  `REPORT_TIMEZONE`, `REPORT_TEMPLATE`, `REPORT_HISTORY_DIR`; the defaults match
+  `REPORT_TIMEZONE`, `REPORT_TEMPLATE`, `REPORT_HISTORY_DIR`, `REPORT_XLSX_PASSWORD`; the defaults match
   this compose stack. The old `REPORT_VIEW_*` (pointing at `stg_all_*`) are
   ignored — renamed on purpose so a stale `.env` can't feed staging views in. `psycopg2` and
   `openpyxl` are imported defensively, so an image built before this feature
