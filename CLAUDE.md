@@ -162,7 +162,7 @@ and reply immediately; the finished `.xlsx` arrives as a Telegram document.
 - **The template is filled, not redrawn.** `openpyxl` opens
   `docs/template/summary.xlsx` and writes into existing cells, so merges,
   borders, and number formats survive. Column → query-field mapping lives in
-  `KOLOM`; `D` (BARIS) counts `LMG LIKE 'KPJ%'`, `T` (P+A) is derived, and
+  `KOLOM`; `D` (BARIS) counts distinct `LMG LIKE 'PJ%'`, `T` (P+A) is derived, and
   `S` (NT) is deliberately left alone because the query has no equivalent.
 - **The report for month X is a snapshot as of the end of month X.** It does
   *not* read staging (latest pull only). It reads `hist_capil`,

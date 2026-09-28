@@ -93,7 +93,7 @@ dipertahankan. Kantor yang ada di warehouse tapi tidak ada barisnya dilaporkan
 sebagai peringatan di caption, jadi angkanya tidak hilang diam-diam.
 
 **Kolom NT tidak diisi** — tidak ada di query rekap. BARIS diisi dari CTE
-`baris` (jumlah `LMG LIKE 'KPJ%'` per kantor).
+`baris` (jumlah `LMG` unik yang `LIKE 'PJ%'` per kantor).
 
 ## Alternatif yang ditolak
 

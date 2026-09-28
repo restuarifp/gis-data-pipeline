@@ -165,7 +165,7 @@ WITH
   ),
   baris AS (
     SELECT kantor_id,
-      COUNT(*) FILTER (WHERE "LMG" LIKE 'KPJ%%') AS baris
+      COUNT(DISTINCT "LMG") FILTER (WHERE "LMG" LIKE 'PJ%%') AS baris
     FROM capil
     GROUP BY kantor_id
   ),
@@ -299,7 +299,7 @@ FROM pengurus g
 # Sengaja TIDAK diisi:
 #   S  "NT" (aktivitas anggota) — tidak ada di query, biarkan seperti template
 KOLOM = {
-    "D":  "baris",                       # BARIS (LMG KPJ%)
+    "D":  "baris",                       # BARIS (jumlah LMG PJ% unik)
     "E":  "pengurus_r",                  # PENGURUS · R
     "F":  "pengurus_n",                  # PENGURUS · N
     "G":  "pengurus_jumlah",             # PENGURUS · JLH
