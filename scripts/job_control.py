@@ -2,7 +2,7 @@
 """
 job_control.py — server kontrol job mungil (stdlib saja)
 
-Dipakai bersama oleh split-excel dan dbt-runner supaya sebuah job bisa dipicu
+Dipakai bersama oleh excel-loader dan dbt-runner supaya sebuah job bisa dipicu
 dari service lain di jaringan `gisnet` — konkretnya oleh bot Telegram di
 notif-relay (lihat docs/adr/0002-trigger-job-via-telegram.md).
 
@@ -13,7 +13,8 @@ sini hanyalah "jalankan fungsi Python yang memang milik service ini".
 Endpoint (hanya di dalam gisnet, tidak dipublish ke host):
   POST /run     -- mulai job. Body JSON opsional diteruskan ke runner.
                    202 dimulai | 409 masih jalan | 400 parameter ditolak
-  GET  /status  -- JSON: running, last_started, last_finished, last_ok, duration_s
+  GET  /status  -- JSON: running, last_started, last_finished, last_ok, duration_s,
+                   last_trigger ('manual' | 'jadwal'), last_result (ringkasan dari runner)
   GET  /logs    -- ekor log run terakhir (teks biasa)
   GET  /        -- health check
 
@@ -56,9 +57,13 @@ class JobRunner:
     """
     Pembungkus single-flight untuk satu job.
 
-    Lock-nya bukan sekadar rapi-rapi: dua run split-excel yang tumpang tindih
-    akan menulis file yang sama di folder tujuan Nextcloud, jadi permintaan
-    kedua ditolak (409), bukan diantrikan.
+    Lock-nya bukan sekadar rapi-rapi: dua run excel-loader yang tumpang tindih
+    akan berebut generation id tabel raw yang sama, jadi permintaan kedua
+    ditolak (409), bukan diantrikan. Run terjadwal (--watch) lewat run_now()
+    dan tunduk pada lock yang sama.
+
+    `fn(params)` boleh mengembalikan bool, atau dict berkunci "ok" — dict itu
+    disimpan utuh sebagai last_result supaya relay bisa menyusun laporan rinci.
     """
 
     def __init__(self, nama: str, fn, info=None):
@@ -75,6 +80,8 @@ class JobRunner:
         self.last_finished: float | None = None
         self.last_ok: bool | None = None
         self.last_params: dict = {}
+        self.last_trigger: str | None = None
+        self.last_result: dict | None = None
 
     # ── status ──────────────────────────────────────────────────────────────
 
@@ -93,6 +100,8 @@ class JobRunner:
             "last_finished": self.last_finished,
             "last_ok": self.last_ok,
             "last_params": self.last_params,
+            "last_trigger": self.last_trigger,
+            "last_result": self.last_result,
             "duration_s": round(durasi, 1) if durasi is not None else None,
         }
 
@@ -101,8 +110,7 @@ class JobRunner:
 
     # ── eksekusi ────────────────────────────────────────────────────────────
 
-    def start(self, params: dict) -> bool:
-        """True kalau job dimulai, False kalau masih ada run yang jalan."""
+    def _ambil(self, params: dict, trigger: str) -> bool:
         if not self._lock.acquire(blocking=False):
             return False
         self._running = True
@@ -110,8 +118,27 @@ class JobRunner:
         self.last_finished = None
         self.last_ok = None
         self.last_params = params
+        self.last_trigger = trigger
+        self.last_result = None
         self._logs.clear()
+        return True
+
+    def start(self, params: dict, trigger: str = "manual") -> bool:
+        """Mulai di thread baru. True kalau dimulai, False kalau masih ada run yang jalan."""
+        if not self._ambil(params, trigger):
+            return False
         threading.Thread(target=self._run, args=(params,), daemon=True).start()
+        return True
+
+    def run_now(self, params: dict, trigger: str = "jadwal") -> bool:
+        """
+        Jalankan di thread pemanggil (loop --watch). False kalau run lain masih
+        jalan. Lewat sini, run terjadwal ikut tercatat di /status — dan karena
+        itu ikut dilaporkan watch_jobs() di relay.
+        """
+        if not self._ambil(params, trigger):
+            return False
+        self._run(params)
         return True
 
     def _run(self, params: dict) -> None:
@@ -121,13 +148,20 @@ class JobRunner:
             logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S")
         )
         root.addHandler(handler)
+        hasil = None
         try:
-            ok = bool(self.fn(params))
+            keluaran = self.fn(params)
+            if isinstance(keluaran, dict):
+                hasil = keluaran
+                ok = bool(keluaran.get("ok"))
+            else:
+                ok = bool(keluaran)
         except Exception:  # noqa: BLE001 -- kegagalan job != matinya server kontrol
             log.exception("Job %s gagal dengan exception.", self.nama)
             ok = False
         finally:
             root.removeHandler(handler)
+            self.last_result = hasil
             self.last_ok = ok
             self.last_finished = time.time()
             self._running = False
@@ -206,7 +240,7 @@ def serve(nama: str, fn, validate=None, background: bool = False, info=None) -> 
     """
     Nyalakan server kontrol untuk job `nama`.
 
-    background=True menjalankannya di thread daemon (dipakai split-excel yang
+    background=True menjalankannya di thread daemon (dipakai excel-loader yang
     thread utamanya sudah dipegang loop --watch).
     `info` dict/callable berisi config aktif yang ikut tampil di /status.
     """

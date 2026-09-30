@@ -150,13 +150,13 @@
     },
     {
       "type": "logs",
-      "title": "Pipeline service logs (split-excel, notif-relay, dbt)",
+      "title": "Pipeline service logs (excel-loader, notif-relay, dbt)",
       "datasource": { "type": "loki", "uid": "loki" },
       "gridPos": { "h": 12, "w": 24, "x": 0, "y": 25 },
       "targets": [
         {
           "refId": "A",
-          "expr": "{compose_service=~\"split-excel|notif-relay|dbt|postgres-db|metabase\"}"
+          "expr": "{compose_service=~\"excel-loader|split-excel|notif-relay|dbt|postgres-db|metabase\"}"
         }
       ],
       "options": {

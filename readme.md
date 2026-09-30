@@ -11,7 +11,7 @@ A geospatial-based remote worker data warehouse stack using PostgreSQL/PostGIS, 
 | `postgres-db` | `postgis/postgis:latest` | `5432` | PostgreSQL + PostGIS database |
 | `metabase` | `metabase/metabase:latest` | `3000` | Data visualization dashboard |
 | `dbt` | Custom (Dockerfile.dbt) | — | Data transformation (CLI only) |
-| `split-excel` | Custom (Dockerfile.split-excel) | — | Splits Nextcloud Excel sheets into per-sheet files |
+| `excel-loader` | Custom (Dockerfile.excel-loader) | — | Loads each office's `finance.xlsx` from Nextcloud straight into `raw_finance_*` |
 | `onlyoffice-docs` | `onlyoffice/documentserver:9.3.1.1` | `8080` | Document server |
 
 ---
@@ -125,23 +125,27 @@ dbt/
 
 ### Adding a new branch office — finance
 
-Finance raw tables (`raw_<kantor_id>_finance_rekap` / `_rincian`) are synced by Airbyte per office and may not exist yet for offices that haven't run a sync. The staging models handle this gracefully via `source_relation_exists()` in `macros/finance_helpers.sql`: if the raw table is physically missing, the model falls back to an empty result set with the same columns/types instead of failing with "relation does not exist". This keeps `mart_finance_rekap`/`mart_finance_rincian` (a `UNION ALL` across every known office, same pattern as `mart_capil.sql`) always runnable, contributing 0 rows for offices without data yet.
+Finance raw tables (`raw_finance_rekap_<kantor_id>` / `raw_finance_rincian_<kantor_id>`) are written by `excel-loader` (created on an office's first load) and may not exist yet for offices that haven't been loaded. The staging models handle this gracefully via `source_relation_exists()` in `macros/finance_helpers.sql`: if the raw table is physically missing, the model falls back to an empty result set with the same columns/types instead of failing with "relation does not exist". This keeps `mart_finance_rekap`/`mart_finance_rincian` (a `UNION ALL` across every known office, same pattern as `mart_capil.sql`) always runnable, contributing 0 rows for offices without data yet.
 
-To onboard a new office once its Airbyte sync exists:
+To onboard a new office: add its `<Kantor>/Finance` folder to `NEXTCLOUD_SOURCE_PATHS` (no Airbyte connection needed), then:
 
-1. Add `raw_<kantor_id>_finance_rekap` and `raw_<kantor_id>_finance_rincian` to `models/staging/sources.yml` under the `raw` source
+1. Add `raw_finance_rekap_<kantor_id>` and `raw_finance_rincian_<kantor_id>` to `models/staging/sources.yml` under the `raw` source
 2. Create `models/staging/finance/stg_<kantor_id>_finance_rekap.sql` containing just `{{ stg_finance_rekap('<kantor_id>') }}`
 3. Create `models/staging/finance/stg_<kantor_id>_finance_rincian.sql` containing just `{{ stg_finance_rincian('<kantor_id>') }}`
 4. Add both to the `UNION ALL` lists in `models/marts/finance/mart_finance_rekap.sql` and `mart_finance_rincian.sql`
-5. Run `dbt run` — no need to wait for the Airbyte sync to land first; the model compiles either way
+5. Run `dbt run` — no need to wait for the first load; the model compiles either way
 
 If a future office's Excel template has different finance columns, update the column lists in both branches of `stg_finance_rekap`/`stg_finance_rincian` in `macros/finance_helpers.sql` (the "exists" and "missing" branches must always match column-for-column, or the `UNION ALL` in the mart breaks).
 
 ---
 
-## Split-Excel Service
+## Excel Loader Service
 
-The `split-excel` service (`scripts/split_excel.py`) fetches `.xlsx` files from Nextcloud source folders via WebDAV, splits each sheet into a separate file, and uploads the results to a destination folder (to be picked up by Airbyte).
+The `excel-loader` service (`scripts/excel_loader.py`) fetches each office's `finance.xlsx` from Nextcloud via WebDAV and writes the `REKAP` and `RINCIAN` sheets straight into `raw_finance_rekap_<kantor_id>` / `raw_finance_rincian_<kantor_id>` — one transaction per office, one new pull (`_airbyte_generation_id = MAX + 1`) per load. It replaced the old `split-excel` → Airbyte path; see `docs/adr/0005-loader-excel-langsung-ke-postgres.md`. Capil still comes in through Airbyte.
+
+- Header row 1, normalised like Airbyte did (`TUNAI IFQ` → `TUNAI_IFQ`). A missing column, text in a numeric cell, or a formula saved without its result rejects that office (the previous pull stays in effect) and names the cells.
+- Unchanged content is skipped if that office already has a pull this month, so the hourly schedule does not duplicate data.
+- **Cutover:** disable the Airbyte finance connections (do **not** reset/clear them — that empties the raw tables and their history).
 
 ### Configuration
 
@@ -152,45 +156,40 @@ Set the following in `.env` (loaded via `env_file` in `docker-compose.yml`):
 NEXTCLOUD_URL=<nextcloud base url>
 NEXTCLOUD_USER=<user>
 NEXTCLOUD_PASSWORD=<password>
-NEXTCLOUD_SOURCE_PATHS=<comma or newline separated source folders>
-NEXTCLOUD_DEST_PATH=<destination folder>
+NEXTCLOUD_SOURCE_PATHS=<comma or newline separated source folders, e.g. A1/Finance,A2/Finance>
 
 # Optional
+NEXTCLOUD_SOURCE_HOME=<parent folder the paths above are relative to>
 SCHEDULE_INTERVAL_MINUTES=60        # polling interval in --watch mode
-WEBDAV_MAX_RETRIES=5                # retries on HTTP 423 (Locked)
+LOAD_DB_HOST/PORT/NAME/USER/PASSWORD/SCHEMA   # defaults match this compose stack
+WEBDAV_MAX_RETRIES=5                # download retries on HTTP 423/5xx
 WEBDAV_RETRY_BACKOFF_SECONDS=3      # linear backoff between retries
 ```
 
-> **Important:** After changing `.env`, recreate the container — a plain `restart` does **not** reload environment variables, so the service keeps running with stale paths/credentials:
+> **Important:** After changing `.env`, recreate the container — a plain `restart` does **not** reload environment variables:
 >
 > ```bash
-> docker compose up -d --force-recreate split-excel
+> docker compose up -d --force-recreate excel-loader
 > ```
 
 ### Run once (manual)
 
-Runs a single pass and exits (exit code 1 if any upload failed):
+Runs a single pass and exits (exit code 1 if any office failed):
 
 ```bash
-docker compose run --rm split-excel python split_excel.py
+docker compose run --rm excel-loader python excel_loader.py            # all folders
+docker compose run --rm excel-loader python excel_loader.py A1/Finance # one folder
 ```
 
 ### Run as a watcher (background service)
 
-The container's default command is `python split_excel.py --watch`, which polls every `SCHEDULE_INTERVAL_MINUTES`:
+The container's default command is `python excel_loader.py --watch --serve`, which loads every `SCHEDULE_INTERVAL_MINUTES` and serves the control API used by the Telegram `/load` command:
 
 ```bash
-# Start (builds the image on first run)
-docker compose up -d split-excel
-
-# Follow logs
-docker compose logs -f split-excel
-
-# Stop
-docker compose stop split-excel
+docker compose up -d --build excel-loader
+docker compose logs -f excel-loader
+docker compose stop excel-loader
 ```
-
-> Keep the OnlyOffice-watched folder separate from `NEXTCLOUD_DEST_PATH` — files opened in OnlyOffice get WebDAV-locked (HTTP 423) and uploads/deletes will need to retry.
 
 ---
 

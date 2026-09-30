@@ -1,8 +1,8 @@
 # GIS Data Pipeline
 
 Gudang data geospasial untuk data catatan sipil (capil) dan keuangan dari sejumlah
-kantor perwakilan. Data mengalir dari Nextcloud → Airbyte → PostgreSQL/PostGIS →
-dbt → Metabase.
+kantor perwakilan. Data mengalir dari Nextcloud → Airbyte (capil) / Loader Excel (finance) →
+PostgreSQL/PostGIS → dbt → Metabase.
 
 ## Language
 
@@ -12,6 +12,19 @@ dbt → Metabase.
 Satu kali eksekusi sinkronisasi Airbyte untuk satu koneksi. Ini adalah unit yang
 dinotifikasi — satu Job menghasilkan satu notifikasi, apa pun jumlah tabel di dalamnya.
 _Avoid_: stream, pipeline run, sync run
+
+**Muatan** (load):
+Satu kali Loader Excel menulis data finance satu kantor ke Postgres. Setiap muatan
+menjadi satu *tarikan* baru (`_airbyte_generation_id` berikutnya), sama seperti satu
+sync Airbyte mode Append dulu. Satu run loader = satu notifikasi, berisi satu baris
+per kantor.
+_Avoid_: split, sync (untuk finance)
+
+**Loader Excel** (`excel-loader`):
+Layanan yang membaca `finance.xlsx` tiap kantor dari Nextcloud dan menulis sheet
+REKAP/RINCIAN langsung ke tabel raw finance. Menggantikan split-excel + koneksi
+Airbyte finance (ADR 0005).
+_Avoid_: split-excel
 
 **Stream**:
 Satu tabel/sheet di dalam sebuah Job. Sebuah Job umumnya berisi banyak Stream.

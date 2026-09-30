@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-A geospatial-based remote worker data warehouse stack for tracking civil registration (capil) and finance data across multiple branch offices (kantor perwakilan). Raw data flows from Nextcloud (via Excel) → Airbyte → PostgreSQL/PostGIS → dbt → Metabase.
+A geospatial-based remote worker data warehouse stack for tracking civil registration (capil) and finance data across multiple branch offices (kantor perwakilan). Raw data flows from Nextcloud (via Excel) → Airbyte (capil) / `excel-loader` (finance) → PostgreSQL/PostGIS → dbt → Metabase.
 
 ## Stack
 
@@ -13,7 +13,7 @@ A geospatial-based remote worker data warehouse stack for tracking civil registr
 | `postgres-db` | postgis/postgis:latest | 5432 |
 | `metabase` | metabase/metabase:latest | 3000 |
 | `dbt` | Custom Dockerfile.dbt (Python 3.9 + dbt-postgres) | CLI only |
-| `split-excel` | Custom Dockerfile.split-excel (Python 3.12) | — |
+| `excel-loader` | Custom Dockerfile.excel-loader (Python 3.12) | — |
 | `notif-relay` | Custom Dockerfile.notif-relay (Python 3.12) | 8000 |
 | `dbt-runner` | Custom Dockerfile.dbt (server kontrol job) | — |
 | `onlyoffice-docs` | onlyoffice/documentserver:9.3.1.1 | 8080 |
@@ -24,6 +24,8 @@ A geospatial-based remote worker data warehouse stack for tracking civil registr
 | `node-exporter` / `cadvisor` / `postgres-exporter` | Prometheus exporters | — |
 
 Services share a `gisnet` bridge network; inter-service references use Docker service names (e.g., `postgres-db`), not `localhost`.
+
+**Roadmap:** `docs/plans/0001-ingest-and-input-quality.md` — data contracts + smart Excel template, replacing Airbyte with a direct Postgres loader, config-driven datasets for new divisions. Read it before touching ingestion. Done so far: finance moved off Airbyte to `excel-loader` (ADR 0005); capil still on Airbyte.
 
 ## Common Commands
 
@@ -37,10 +39,10 @@ docker compose run --rm dbt dbt run --select <model_name>
 docker compose run --rm dbt dbt debug          # test connection
 docker compose run --rm dbt dbt deps           # install packages
 
-# Run split-excel once (without --watch loop)
-docker compose run --rm split-excel python split_excel.py
+# Load finance Excel into Postgres once (without --watch loop); optional folder args
+docker compose run --rm excel-loader python excel_loader.py [A1/Finance ...]
 
-# Start the notif-relay (Airbyte webhook → Telegram + bot perintah + Mini App); listens on :8000
+# Start the notif-relay (Airbyte capil webhook → Telegram + bot perintah + Mini App); listens on :8000
 docker compose up -d notif-relay
 
 # Mini App page (needs MINI_APP_URL set; /api/* returns 401 without Telegram initData)
@@ -50,8 +52,8 @@ curl -s localhost:8000/app | head -5
 docker compose build notif-relay && docker compose up -d notif-relay
 
 # Trigger a job the way the Telegram bot does (control server, gisnet-internal)
-docker run --rm --network gis-data-pipeline_gisnet curlimages/curl -s -X POST split-excel:8080/run
-docker run --rm --network gis-data-pipeline_gisnet curlimages/curl -s split-excel:8080/status
+docker run --rm --network gis-data-pipeline_gisnet curlimages/curl -s -X POST excel-loader:8080/run
+docker run --rm --network gis-data-pipeline_gisnet curlimages/curl -s excel-loader:8080/status
 
 # Start the observability stack (Grafana on :3030, admin/admin by default)
 docker compose --profile observability up -d
@@ -69,12 +71,11 @@ docker compose down -v
 
 ```
 Nextcloud (WebDAV)
-    └── split_excel.py (scripts/)
-            Fetches .xlsx from source folders, splits each sheet into a
-            separate file, uploads to destination folder
-    └── Airbyte
-            Syncs per-sheet .xlsx files into PostgreSQL as raw_<kantor_id> tables
-            (capil) and raw_finance_rekap_<kantor_id> / raw_finance_rincian_<kantor_id> tables (finance)
+    ├── excel_loader.py (scripts/, service excel-loader)       [finance]
+    │       Reads <Kantor>/Finance/finance.xlsx, sheets REKAP + RINCIAN, and appends
+    │       one pull to raw_finance_rekap_<kantor_id> / raw_finance_rincian_<kantor_id>
+    └── Airbyte                                                  [capil]
+            Syncs capil Excel into PostgreSQL as raw_<kantor_id> tables
     └── dbt (dbt/)
             staging/ views → mart/ views in the analytics schema
     └── Metabase (port 3000)
@@ -98,7 +99,7 @@ Nextcloud (WebDAV)
 
 ### Key macro (`dbt/macros/finance_helpers.sql`)
 
-`source_relation_exists(relation)` — checks `information_schema.tables` at compile time; returns `false` during `dbt parse`/`dbt ls` (no DB connection). Used in `stg_finance_rekap` and `stg_finance_rincian` to gracefully handle offices whose Airbyte sync hasn't landed yet, returning an empty result set with matching columns instead of crashing.
+`source_relation_exists(relation)` — checks `information_schema.tables` at compile time; returns `false` during `dbt parse`/`dbt ls` (no DB connection). Used in `stg_finance_rekap` and `stg_finance_rincian` to gracefully handle offices that haven't been loaded yet, returning an empty result set with matching columns instead of crashing.
 
 **Critical invariant:** The "exists" and "missing" branches of both macros must have identical column names and types, or the `UNION ALL` in the mart breaks.
 
@@ -108,19 +109,19 @@ Nextcloud (WebDAV)
 
 **Derived `wajib_ifq`:** In `stg_finance_rincian`, `wajib_ifq` is *not* read from the finance file — it is computed from the office's capil table (`raw_<kantor_id>`): `COUNT(*)` of latest-pull rows per instansi where `LMG = INSTANSI` and `Status_Tabungan = 'Paham'` (COALESCE to 0 when an instansi has no capil match). This makes `stg_finance_rincian` depend on **both** `raw_finance_rincian_<kantor_id>` **and** `raw_<kantor_id>`; the capil source must be declared in `sources.yml` for every office passed to the macro. If the capil table doesn't physically exist yet, `wajib_ifq` falls back to `NULL` (guarded by `source_relation_exists`).
 
-### split-excel service (`scripts/split_excel.py`)
+### excel-loader service (`scripts/excel_loader.py`)
 
-Configured via `.env` (required: `NEXTCLOUD_URL`, `NEXTCLOUD_USER`, `NEXTCLOUD_PASSWORD`, `NEXTCLOUD_SOURCE_PATHS`, `NEXTCLOUD_DEST_PATH`; optional: `SCHEDULE_INTERVAL_MINUTES` default 60, `WEBDAV_MAX_RETRIES` default 5, `WEBDAV_RETRY_BACKOFF_SECONDS` default 3).
+Replaced `split-excel` + the Airbyte finance connections (`docs/adr/0005-loader-excel-langsung-ke-postgres.md`). Configured via `.env` (required: `NEXTCLOUD_URL`, `NEXTCLOUD_USER`, `NEXTCLOUD_PASSWORD`, `NEXTCLOUD_SOURCE_PATHS`; optional: `NEXTCLOUD_SOURCE_HOME`, `SCHEDULE_INTERVAL_MINUTES` default 60, `LOAD_DB_*` defaults match compose, `LOAD_TIMEZONE`, `WEBDAV_MAX_RETRIES`, `WEBDAV_RETRY_BACKOFF_SECONDS`). `NEXTCLOUD_DEST_PATH` is ignored.
 
-- Accepts multiple source paths via `NEXTCLOUD_SOURCE_PATHS` (comma or newline separated)
-- **`NEXTCLOUD_SOURCE_HOME`** — optional parent folder; entries in `NEXTCLOUD_SOURCE_PATHS` are written relative to it (`A1/Finance`). `resolve_source()` joins them **idempotently**, so entries that already spell out the full path still work and an unset `SOURCE_HOME` reproduces the old behaviour exactly. It is also the security boundary for the `/split <path>` Telegram argument: anything containing `..` or resolving outside `SOURCE_HOME` is rejected. **An empty `SOURCE_HOME` means no folder boundary at all** (only `..` is still blocked) — the service logs a warning at startup when that's the case.
-- **Control server (`--serve`)**: `job_control.serve()` exposes `POST /run` (202 / 409 busy / 400 rejected params), `GET /status`, `GET /logs` on `JOB_CONTROL_PORT` (8080) — **gisnet only, never published to the host**. `POST /run {"sources": [...]}` runs a subset. The container CMD is `--watch --serve`, so the schedule and the on-demand path coexist.
-- Output naming: `{kantor_name}__{file_stem}__{safe_sheet_name}.xlsx`
-- Atomic per-office: if any sheet fails to process, the whole office is skipped and old files are not deleted
-- `--watch` flag enables polling loop; without it, runs once and exits (exit code 1 if any upload failed)
-- `split_workbook()` reads with `data_only=True` and copies only resolved values (never formula strings) into the split output; if a cell has no cached value (formula saved without a stored result), its coordinates are logged as a warning instead of leaking `=...` text downstream.
-- **Upload-first, then prune:** each office's sheets are uploaded via PUT (overwrite) *before* anything is deleted, so a lock failure can't leave the destination half-empty. Only stale files (prefix matches but no longer produced) are deleted afterward. If any upload still fails after retries, old files are kept and `process_source` returns failure.
-- **423 Locked retry:** WebDAV `PUT`/`DELETE` retry on HTTP 423 (`_request_with_retry`, linear backoff, `WEBDAV_MAX_RETRIES` × `WEBDAV_RETRY_BACKOFF_SECONDS`). Destination files get locked when OnlyOffice/another client holds them open; keep the OnlyOffice-watched folder separate from `NEXTCLOUD_DEST_PATH` to avoid this.
+- **Writes the exact Airbyte table shape.** `_airbyte_raw_id/_extracted_at/_meta/_generation_id` are still written, each load is one pull with `generation_id = MAX + 1` (Append semantics), so staging's latest-pull filter, `hist_pulls`, and the Rekap Bulanan work unchanged. Loader rows carry `_airbyte_meta->>'loader' = 'excel-loader'`, plus `source_file` and `sha256`. Missing tables are created on first load (new office needs no Airbyte connection).
+- **Contract in code (`DATASETS`)**: sheet `REKAP` → `raw_finance_rekap_<kantor>`, `RINCIAN` → `raw_finance_rincian_<kantor>`; header row 1 normalised like Airbyte (`TUNAI IFQ` → `TUNAI_IFQ`). kantor_id = folder above `Finance`, lowercased. A missing column, text in a numeric cell, a formula without a cached result, or the same sheet in two files → the office is rejected with cell addresses. Unknown sheets/extra columns are warnings.
+- **Atomic per office**: both tables in one transaction; any failure → nothing for that office changes, previous pull stays current.
+- **Skip unchanged — within the month**: if the data hash equals the latest pull's and that pull is from the current month (`LOAD_TIMEZONE` → `REPORT_TIMEZONE` → Asia/Jakarta), no rows are written. Every month still gets its own pull for the Rekap Bulanan snapshot.
+- **Airbyte still writing = warning**: non-loader rows newer than the last loader pull are flagged (`airbyte_aktif`) in the Telegram message. Airbyte's generation counter can be lower than the loader's, making its pulls invisible — disable (never reset/clear) the finance connections.
+- The template formats rows down to 1,048,576; reading stops after `BATAS_BARIS_KOSONG` (1000) fully-empty rows.
+- `NEXTCLOUD_SOURCE_HOME` / `resolve_source()` rules are unchanged from split-excel: idempotent join, security boundary for `/load <path>`, `..` always rejected, empty `SOURCE_HOME` = no boundary (warned at startup).
+- **Control server (`--serve`)**: `job_control.serve()` exposes `POST /run` (202 / 409 busy / 400 rejected params), `GET /status`, `GET /logs` on `JOB_CONTROL_PORT` (8080) — **gisnet only, never published to the host**. `POST /run {"sources": [...]}` runs a subset. CMD is `--watch --serve`; the scheduled run goes through `JobRunner.run_now()` so it shares the single-flight lock and shows up in `/status` (`last_trigger: "jadwal"`). `run_once()` returns `{"ok", "kantor": [...]}`, exposed as `last_result`.
+- Without `--watch`, runs once and exits (exit code 1 if any office failed).
 
 ### notif-relay service (`scripts/notif_relay.py`)
 
@@ -131,14 +132,14 @@ The **Relay Notifikasi** (see `CONTEXT.md`): a tiny stdlib-only HTTP server that
 - **Fails fast on missing config:** an empty/absent `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` logs one clear line and exits **78** (`EX_CONFIG`). The compose restart policy is `on-failure:3`, so a misconfigured relay stops after 3 attempts instead of crash-looping. Note an *empty* value in `.env` is still a set env var — hence the explicit emptiness check, not `os.environ[...]`.
 - Accepts any POST path (health check on `GET /`). `format_message()` is defensive: it reads the structured `data` object of Airbyte's custom webhook, falls back to a Slack-style `{text}` field, and dumps raw JSON for unknown shapes. All interpolated values are HTML-escaped (`parse_mode=HTML`).
 - Airbyte is **not** in this compose stack — point its webhook notification at `http://<host>:8000/` (the relay publishes host port 8000 on `gisnet`).
-- **`/sync` triggers Airbyte** via its Public API (`AIRBYTE_URL`, `AIRBYTE_CLIENT_ID`, `AIRBYTE_CLIENT_SECRET`; optional `AIRBYTE_WORKSPACE_ID`). Connections are resolved by **name** from `GET /connections`, so no UUIDs in `.env`; an ambiguous name fails with the candidate list rather than guessing. Unlike split/dbt there is no control server and no single-flight lock — Airbyte owns its own job queue — and **completion is reported by Airbyte's existing webhook to this relay**, not by `watch_jobs()`.
+- **`/sync` triggers Airbyte** via its Public API (`AIRBYTE_URL`, `AIRBYTE_CLIENT_ID`, `AIRBYTE_CLIENT_SECRET`; optional `AIRBYTE_WORKSPACE_ID`). Connections are resolved by **name** from `GET /connections`, so no UUIDs in `.env`; an ambiguous name fails with the candidate list rather than guessing. Unlike load/dbt there is no control server and no single-flight lock — Airbyte owns its own job queue — and **completion is reported by Airbyte's existing webhook to this relay**, not by `watch_jobs()`.
 - Airbyte's token endpoint takes `grant-type` (hyphen, not `grant_type`) and answers **401 — not 400** — when that field is wrong or missing, so a malformed body masquerades as bad credentials. Token is cached until ~30s before expiry and refreshed once on a 401.
-- **Two-way bot** (`docs/adr/0002-trigger-job-via-telegram.md`): a `getUpdates` long-polling thread accepts `/split [path...]`, `/dbt [select]`, `/sync [connection]`, `/status`, `/logs [split|dbt]`, `/app`, `/id`, `/help`. It triggers jobs by calling the control servers over `gisnet` (`SPLIT_CONTROL_URL`, `DBT_CONTROL_URL`) — **never via the Docker socket**, because the relay eats outside input.
+- **Two-way bot** (`docs/adr/0002-trigger-job-via-telegram.md`): a `getUpdates` long-polling thread accepts `/load [path...]`, `/dbt [select]`, `/sync [connection]`, `/status`, `/logs [load|dbt]`, `/app`, `/id`, `/help`. `/split` is a deprecated alias for `/load` (`ALIAS_JOB`, also honoured by the Mini App API). It triggers jobs by calling the control servers over `gisnet` (`LOAD_CONTROL_URL`, `DBT_CONTROL_URL`; a leftover `SPLIT_CONTROL_URL` is ignored with a warning because it points at the removed `split-excel` host) — **never via the Docker socket**, because the relay eats outside input.
 - **Who may command the bot**: the group `TELEGRAM_CHAT_ID`, plus any user id listed in `TELEGRAM_DM_USER_IDS` (comma/space separated) talking to the bot in a DM. Everything else is ignored silently — the rejected user's id is logged, since that's the number to paste into the allowlist. `/id` replies with the sender's user and chat id so nobody needs a third-party bot to find it. A group member who is *not* on the DM allowlist can still DM `/start`, `/app`, `/help`, `/id` — enough to open the Mini App panel, nothing more.
 - **DM-triggered runs report back to that DM.** `langgan_hasil()` records the private chat that triggered a job; `_lapor_selesai()` sends the finished-run message to the group *and* to that chat, then clears the list (one run = one report each). Group-triggered runs subscribe nobody, so the group never gets a duplicate.
-- `/status` also prints the config the container is actually running with (`info` block from `/status`: `source_home`, resolved `sources`, dest, interval). This is the remote-debugging path: `docker compose restart` re-reads neither `.env` nor a rebuilt image, so a stale container is otherwise invisible from Telegram. A missing `fitur` key means the image predates `/split <path>` support.
-- **Every finished run is announced to the group**, not just Telegram-triggered ones. `watch_jobs()` polls each control server's `/status` every `JOB_WATCH_INTERVAL_SECONDS` and reports when `last_finished` changes — so the hourly `--watch` run reports too. Completion is reported *only* there (the command handler just acks `▶️ dimulai`), which is what keeps manual runs from getting two messages. `last_finished` is seeded at relay startup so a restart doesn't re-announce an old run. Disable with `JOB_WATCH_ENABLED=false`.
-- The bot does **not** validate `/split` paths; it forwards them and surfaces the control server's `400`. Path rules live only in `resolve_source()` — two copies of a rule drift, and the looser one becomes the hole.
+- `/status` also prints the config the container is actually running with (`info` block from `/status`: `source_home`, resolved `sources`, `db`, interval). This is the remote-debugging path: `docker compose restart` re-reads neither `.env` nor a rebuilt image, so a stale container is otherwise invisible from Telegram. `fitur` other than `load-db` means the container isn't running the excel-loader image.
+- **Every finished run is announced to the group**, not just Telegram-triggered ones. `watch_jobs()` polls each control server's `/status` every `JOB_WATCH_INTERVAL_SECONDS` and reports when `last_finished` changes — so the hourly `--watch` run reports too. For `load`, the message has one line per office (tables loaded, row count, pull number, or the error) — this replaces the Airbyte finance webhook notifications. A **scheduled** load that succeeded and changed nothing is not announced; manual runs always are. Completion is reported *only* there (the command handler just acks `▶️ dimulai`), which is what keeps manual runs from getting two messages. `last_finished` is seeded at relay startup so a restart doesn't re-announce an old run. Disable with `JOB_WATCH_ENABLED=false`.
+- The bot does **not** validate `/load` paths; it forwards them and surfaces the control server's `400`. Path rules live only in `resolve_source()` — two copies of a rule drift, and the looser one becomes the hole.
 - Long-polling means the token must have **no webhook** set and only **one** polling process may run per token (Telegram answers 409 otherwise). An invalid token (401/404) shuts the command loop down with one clear log line; the Airbyte webhook path keeps running.
 - **Mini App** (`docs/adr/0003-mini-app-telegram.md`, page in `scripts/miniapp.html`): the relay also serves a Telegram Mini App at `GET /app` with a JSON API at `/api/*` (`state`, `logs`, `connections`, `run`, `sync`) — same capabilities as the text commands, plus source-folder chips, a dbt command picker, an Airbyte connection list, live status, and an auto-refreshing log tail. `/app` in Telegram replies with the button that opens it.
 - **Mini App auth**: every `/api/*` call re-verifies the `initData` HMAC against the bot token (`hash` and `signature` excluded from the data-check string) *and* that the user is either listed in `TELEGRAM_DM_USER_IDS` (no round-trip needed — the id was written by hand in `.env`) or a member of `TELEGRAM_CHAT_ID` via `getChatMember` (cached 5 min, fail-closed). There is no session or cookie — `initData` is the credential, and `MINI_APP_AUTH_MAX_AGE` (default 24h) caps its life. The page never validates `sources`/`select` itself; it forwards them and shows the control server's 400 (same rule as the text bot).
@@ -167,12 +168,13 @@ and reply immediately; the finished `.xlsx` arrives as a Telegram document.
 - **The report for month X is a snapshot as of the end of month X.** It does
   *not* read staging (latest pull only). It reads `hist_capil`,
   `hist_finance_rekap`, `hist_finance_rincian` (`dbt/models/history/`, macro
-  `hist_pulls` in `macros/history_helpers.sql`), which keep every Airbyte pull
+  `hist_pulls` in `macros/history_helpers.sql`), which keep every pull
   with `tarikan_id` (= generation id) and `ditarik_pada` (MIN extracted_at per
   generation, epoch rows dropped). Per office and per source the query takes
   the latest pull before the 1st of the next month in `REPORT_TIMEZONE`
-  (default Asia/Jakarta). This only works because the Airbyte connections are
-  **Full refresh | Append** — switch one to Overwrite and its history is gone.
+  (default Asia/Jakarta). This only works because every pull is appended —
+  capil via Airbyte **Full refresh | Append** (switch one to Overwrite and its
+  history is gone), finance via `excel-loader`, which always appends.
   DAKWAH HASIL is additionally filtered on `Bln_Integrasi`/`Th_Integrasi`.
   Offices falling back to an older pull, or with no finance pull yet, are
   noted in the relay log. History views discover offices from `sources.yml`,
@@ -182,11 +184,11 @@ and reply immediately; the finished `.xlsx` arrives as a Telegram document.
   (`./report-history`, bind-mounted at `/data/laporan`) as
   `<year>-<month>.json`, and the next month's report reads the previous month's
   archive to fill `JUMLAH BULAN LALU`, with `SELISIH` computed from the two.
-  The raw tables hold past pulls only while the Airbyte connections stay on
-  Append, and the archive is the only record of what was actually *reported*,
+  The raw tables hold past pulls only while capil's Airbyte connections stay
+  on Append (and nobody resets a connection), and the archive is the only record of what was actually *reported*,
   so **back that folder up**. A month with no archive behind it
   gets zeros, noted in the relay log. Rerunning a month overwrites its archive,
-  which is what you want after a late Airbyte sync.
+  which is what you want after a late sync or load.
 - **Archive keys are semantic names** (`NAMA_KOLOM`), not column letters, so
   inserting a column in the template does not silently reroute old archives
   into the wrong cells.
@@ -235,13 +237,14 @@ file-provisioned; UI edits are not written back to the repo.
 
 ### Finance
 
+0. Add the office's `<Kantor>/Finance` folder to `NEXTCLOUD_SOURCE_PATHS` and recreate `excel-loader` — no Airbyte connection; the loader creates both raw tables on first load
 1. Add `raw_finance_rekap_<kantor_id>` and `raw_finance_rincian_<kantor_id>` to `sources.yml`
 2. Create `models/staging/finance/stg_<kantor_id>_finance_rekap.sql` → `{{ stg_finance_rekap('<kantor_id>') }}`
 3. Create `models/staging/finance/stg_<kantor_id>_finance_rincian.sql` → `{{ stg_finance_rincian('<kantor_id>') }}`
 4. Add both `ref()` calls to their respective marts
-5. `docker compose run --rm dbt dbt run` — safe to run before the Airbyte sync lands
+5. `docker compose run --rm dbt dbt run` — safe to run before the first load
 
-If a new office uses different finance columns, update **both** branches (exists + missing) of `stg_finance_rekap` / `stg_finance_rincian` in `macros/finance_helpers.sql` to keep columns in sync.
+If the finance columns change, update `DATASETS` in `scripts/excel_loader.py` **and both** branches (exists + missing) of `stg_finance_rekap` / `stg_finance_rincian` in `macros/finance_helpers.sql`, plus `hist_finance_*`.
 
 ## Data Persistence Notes
 

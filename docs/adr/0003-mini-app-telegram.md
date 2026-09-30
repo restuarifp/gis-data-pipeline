@@ -1,5 +1,7 @@
 # Mini App Telegram: panel web dilayani relay, otorisasi lewat initData
 
+> Catatan 2026-09-30: tab/job `split` kini `load` (ADR 0005).
+
 Perintah teks (`/split`, `/dbt`, `/sync`, `/status`, `/logs`) tetap ada, tapi
 operator harus hafal namanya dan mengetik path folder dengan benar dari ponsel.
 Mini App menambahkan panel klik-klik dengan **kemampuan yang sama persis**:

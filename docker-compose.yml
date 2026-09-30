@@ -81,14 +81,21 @@ services:
     networks:
       - gisnet
 
-  split-excel:
+  # Membaca finance.xlsx tiap kantor dari Nextcloud dan menulisnya langsung ke
+  # raw_finance_rekap_<kantor> / raw_finance_rincian_<kantor> — menggantikan
+  # split-excel + koneksi Airbyte finance (docs/adr/0005). Capil masih lewat Airbyte.
+  excel-loader:
     build:
       context: .
-      dockerfile: Dockerfile.split-excel
-    container_name: split_excel
+      dockerfile: Dockerfile.excel-loader
+    container_name: excel_loader
     restart: unless-stopped
     env_file:
       - .env
+    # Belasan file Excel kecil per run; openpyxl read_only jauh di bawah ini.
+    mem_limit: 512m
+    depends_on:
+      - postgres-db
     networks:
       - gisnet
 

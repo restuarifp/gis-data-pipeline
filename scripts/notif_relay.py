@@ -2,7 +2,8 @@
 """
 notif_relay.py — Relay Notifikasi
 
-Menerima webhook dari Airbyte lalu menerjemahkannya menjadi pesan Telegram.
+Menerima webhook dari Airbyte (kini hanya koneksi capil) lalu menerjemahkannya
+menjadi pesan Telegram.
 Airbyte tidak bisa memanggil Telegram Bot API secara langsung (bentuk payload
 berbeda), jadi layanan kecil ini yang menjembatani.
 
@@ -14,7 +15,7 @@ pesannya hilang, Airbyte tidak pernah dibuat menganggap job bermasalah.
 Satu webhook (satu Job) = satu pesan Telegram.
 
 Sekaligus bot dua arah: loop long-polling getUpdates menerima perintah dari grup
-TELEGRAM_CHAT_ID (/split, /dbt, /status, /logs, /help) lalu memicu job lewat
+TELEGRAM_CHAT_ID (/load, /dbt, /status, /logs, /help) lalu memicu job lewat
 server kontrol HTTP internal di gisnet — bukan lewat Docker socket. Lihat
 docs/adr/0002-trigger-job-via-telegram.md dan scripts/job_control.py.
 
@@ -31,7 +32,7 @@ Endpoint:
   GET  /api/state   -- status semua job + config aktif (butuh initData)
   GET  /api/logs    -- ekor log satu job (butuh initData)
   GET  /api/connections -- daftar koneksi Airbyte (butuh initData)
-  POST /api/run     -- picu split/dbt (butuh initData)
+  POST /api/run     -- picu load/dbt (butuh initData)
   POST /api/sync    -- picu sync Airbyte (butuh initData)
   POST /api/report  -- susun Rekap Bulanan .xlsx lalu kirim ke Telegram (butuh initData)
   POST <apa saja>   -- terima webhook Airbyte, balas 200 seketika
@@ -45,7 +46,7 @@ Konfigurasi via environment (lihat .env.example):
   TELEGRAM_MAX_RETRIES         (opsional, default 3)
   TELEGRAM_RETRY_BACKOFF_SECONDS (opsional, default 3)
   TELEGRAM_BOT_ENABLED         (opsional, default true) -- matikan loop perintah
-  SPLIT_CONTROL_URL            (opsional, default http://split-excel:8080)
+  LOAD_CONTROL_URL             (opsional, default http://excel-loader:8080)
   DBT_CONTROL_URL              (opsional, default http://dbt-runner:8080)
   TELEGRAM_POLL_TIMEOUT        (opsional, default 50)
   MINI_APP_URL                 (opsional) -- URL HTTPS publik ke /app; kosong = Mini App mati
@@ -119,9 +120,17 @@ REQUEST_TIMEOUT = 15  # detik, per-attempt ke api.telegram.org
 # Job yang bisa dipicu; masing-masing menjalankan server kontrol job_control di
 # gisnet. Relay TIDAK menyentuh Docker socket — lihat docs/adr/0002.
 JOBS = {
-    "split": os.getenv("SPLIT_CONTROL_URL", "http://split-excel:8080").rstrip("/"),
-    "dbt":   os.getenv("DBT_CONTROL_URL", "http://dbt-runner:8080").rstrip("/"),
+    "load": os.getenv("LOAD_CONTROL_URL", "http://excel-loader:8080").rstrip("/"),
+    "dbt":  os.getenv("DBT_CONTROL_URL", "http://dbt-runner:8080").rstrip("/"),
 }
+# Nama lama yang masih diterima dari Telegram/Mini App supaya kebiasaan operator
+# tidak langsung patah. split-excel sudah digantikan excel-loader (ADR 0005).
+ALIAS_JOB = {"split": "load"}
+if os.getenv("SPLIT_CONTROL_URL", "").strip():
+    # Sengaja tidak dipakai sebagai fallback: nilainya di .env lama menunjuk ke
+    # http://split-excel:8080, service yang sudah tidak ada.
+    log.warning("SPLIT_CONTROL_URL diabaikan — service split-excel sudah diganti "
+                "excel-loader. Pakai LOAD_CONTROL_URL (default http://excel-loader:8080).")
 # Airbyte (perintah /sync). Airbyte tidak ada di compose stack ini, jadi URL-nya
 # harus yang terjangkau DARI DALAM container relay — bukan localhost.
 AIRBYTE_URL           = os.getenv("AIRBYTE_URL", "").strip().rstrip("/")
@@ -134,7 +143,7 @@ WATCH_INTERVAL = int(os.getenv("JOB_WATCH_INTERVAL_SECONDS", "10"))
 _MATI = ("0", "false", "no", "off")
 BOT_ENABLED = os.getenv("TELEGRAM_BOT_ENABLED", "true").strip().lower() not in _MATI
 # Pemantau job: laporkan setiap run yang selesai ke grup, termasuk run terjadwal
-# split-excel yang tidak dipicu dari Telegram.
+# excel-loader yang tidak dipicu dari Telegram.
 JOB_WATCH_ENABLED = os.getenv("JOB_WATCH_ENABLED", "true").strip().lower() not in _MATI
 
 # Mini App. Telegram hanya mau membuka URL HTTPS publik, sementara relay ini
@@ -793,6 +802,7 @@ def api_state(user: dict) -> dict:
 
 
 def api_logs(nama: str) -> dict:
+    nama = ALIAS_JOB.get(nama, nama)
     if nama not in JOBS:
         raise WebAppError(f"job tidak dikenal: {nama}", 400)
     try:
@@ -808,11 +818,12 @@ def api_run(body: dict, user: dict) -> dict:
     yang memvalidasi tetap hanya validate_params() milik service itu (ADR 0002).
     """
     nama = str(body.get("job") or "").lower()
+    nama = ALIAS_JOB.get(nama, nama)
     if nama not in JOBS:
         raise WebAppError(f"job tidak dikenal: {nama}", 400)
 
     params = {}
-    if nama == "split":
+    if nama == "load":
         sumber = body.get("sources") or []
         if not isinstance(sumber, list):
             raise WebAppError("sources harus berupa list", 400)
@@ -923,16 +934,16 @@ def api_sync(body: dict, user: dict) -> dict:
 
 BANTUAN = (
     "<b>Perintah yang tersedia</b>\n"
-    "/split — jalankan split-excel untuk semua folder di NEXTCLOUD_SOURCE_PATHS\n"
-    "/split <i>A1/Finance</i> — hanya folder tertentu (relatif ke NEXTCLOUD_SOURCE_HOME, "
+    "/load — muat finance.xlsx semua folder di NEXTCLOUD_SOURCE_PATHS ke database\n"
+    "/load <i>A1/Finance</i> — hanya folder tertentu (relatif ke NEXTCLOUD_SOURCE_HOME, "
     "boleh beberapa dipisah spasi)\n"
     "/dbt — jalankan <code>dbt run</code>\n"
-    "/sync — daftar koneksi Airbyte\n"
+    "/sync — daftar koneksi Airbyte (capil)\n"
     "/sync <i>nama-koneksi</i> — picu sync koneksi itu\n"
     "/laporan — kirim Rekap Bulanan (.xlsx) untuk bulan lalu\n"
     "/laporan <i>8-2026</i> — rekap bulan tertentu (MM-YYYY)\n"
     "/status — job sedang jalan atau tidak, plus hasil run terakhir\n"
-    "/logs [split|dbt] — ekor log run terakhir\n"
+    "/logs [load|dbt] — ekor log run terakhir\n"
     "/app — buka Panel Pipeline (Mini App): status, tombol jalankan, log\n"
     "/id — tampilkan user id Anda (untuk didaftarkan ke TELEGRAM_DM_USER_IDS)\n"
     "/help — pesan ini"
@@ -981,13 +992,61 @@ def _ambil_pelanggan(nama: str) -> set:
         return _pelanggan.pop(nama, set())
 
 
+def _ringkas_muatan(hasil: dict) -> tuple:
+    """
+    Susun baris per kantor dari last_result excel-loader. Mengisi peran
+    notifikasi "Airbyte sync berhasil/GAGAL" untuk finance: satu baris per
+    kantor, tabel yang dimuat, jumlah baris, dan nomor tarikannya.
+
+    Kembalikan (baris_teks, layak_diumumkan): True kalau ada yang dimuat atau
+    ada peringatan Airbyte yang masih menulis — dua hal yang perlu dilihat orang.
+    """
+    e = lambda v: html.escape(str(v))
+    baris, dimuat = [], False
+    if hasil.get("error"):
+        baris.append(f"Error: {e(hasil['error'])}")
+    for k in hasil.get("kantor") or []:
+        if not k.get("ok"):
+            baris.append(f"❌ <b>{e(k.get('kantor'))}</b>: {e(str(k.get('error', '?'))[:300])}")
+            continue
+        potong = []
+        for t in k.get("tabel") or []:
+            jenis = "rekap" if "_rekap_" in t["tabel"] else "rincian"
+            if t.get("status") == "dimuat":
+                dimuat = True
+                potong.append(f"{jenis} {t['baris']} baris (#{t['tarikan']})")
+            else:
+                potong.append(f"{jenis} tidak berubah")
+            if t.get("airbyte_aktif"):
+                dimuat = True
+                potong.append("⚠️ Airbyte masih menulis ke tabel ini")
+        baris.append(f"• <b>{e(k.get('kantor'))}</b>: {e(', '.join(potong))}")
+        for p in (k.get("peringatan") or [])[:3]:
+            baris.append(f"   ⚠️ <i>{e(str(p)[:200])}</i>")
+    return baris, dimuat
+
+
 def _lapor_selesai(nama: str, st: dict) -> None:
     """Kirim satu pesan hasil run ke grup (dan ke chat privat yang memicunya)."""
     base = JOBS[nama]
     durasi = _fmt_duration(st.get("duration_s"))
     sumber = st.get("last_params", {}).get("sources")
     rincian = ""
-    if sumber:
+    hasil = st.get("last_result") or {}
+    pelanggan = _ambil_pelanggan(nama)
+
+    if nama == "load" and hasil:
+        baris, dimuat = _ringkas_muatan(hasil)
+        # Run per jam yang tidak menemukan perubahan tidak diumumkan: tiap run
+        # terjadwal kini tercatat di /status, dan "tidak ada yang berubah" setiap
+        # jam hanya menenggelamkan pesan yang penting. Run manual tetap dijawab.
+        if (st.get("last_ok") and not dimuat and not pelanggan
+                and st.get("last_trigger") == "jadwal"):
+            log.info("Run terjadwal %s selesai tanpa perubahan; tidak diumumkan.", nama)
+            return
+        if baris:
+            rincian = "\n" + "\n".join(baris)
+    elif sumber:
         rincian = "\n" + "\n".join(f"• {html.escape(str(s))}" for s in sumber)
 
     if st.get("last_ok"):
@@ -1001,10 +1060,12 @@ def _lapor_selesai(nama: str, st: dict) -> None:
             log.warning("Gagal ambil log %s: %s", nama, exc)
         pesan = f"❌ <b>{nama}</b> GAGAL ({durasi}).{rincian}"
         if ekor:
-            pesan += f"\n<pre>{html.escape(ekor[:3000])}</pre>"
+            # Batas pesan Telegram 4096 karakter; rincian per kantor didahulukan.
+            sisa = max(500, 3800 - len(pesan))
+            pesan += f"\n<pre>{html.escape(ekor[-sisa:])}</pre>"
 
     send_telegram(pesan)
-    for chat_id in _ambil_pelanggan(nama):
+    for chat_id in pelanggan:
         send_telegram(pesan, chat_id)
 
 
@@ -1013,7 +1074,7 @@ def watch_jobs() -> None:
     Pantau semua job terus-menerus dan laporkan setiap run yang selesai ke grup.
 
     Satu pemantau untuk semua asal-usul run — dipicu dari Telegram, dari jadwal
-    --watch split-excel, atau dari curl. Pendekatan poll dipilih supaya split-excel
+    --watch excel-loader, atau dari curl. Pendekatan poll dipilih supaya loader
     tidak perlu tahu apa pun soal Telegram (token tetap hanya di relay ini).
 
     `last_finished` dipakai sebagai penanda run: nilainya berubah tepat sekali per
@@ -1081,9 +1142,9 @@ def picu_job(nama: str, params: dict):
 def mulai_job(nama: str, args: list, chat_id, reply_to) -> None:
     """Panggil POST /run pada control server job, lalu balas ke Telegram."""
     body = {}
-    if nama == "split" and args:
+    if nama == "load" and args:
         # Diteruskan apa adanya — validasi path hanya hidup di resolve_source()
-        # milik split-excel, supaya tidak ada dua aturan yang bisa berbeda.
+        # milik excel-loader, supaya tidak ada dua aturan yang bisa berbeda.
         body["sources"] = args
     elif nama == "dbt" and args:
         body["select"] = " ".join(args)
@@ -1132,15 +1193,19 @@ def kirim_status(chat_id, reply_to) -> None:
                 baris.append("   sumber: " + ", ".join(
                     f"<code>{html.escape(str(s))}</code>" for s in info["sources"]
                 ))
-            if "fitur" not in info and nama == "split":
-                baris.append("   ⚠️ <i>image lama: argumen path pada /split belum didukung</i>")
+            if nama == "load" and info.get("db"):
+                baris.append(f"   db: <code>{html.escape(str(info['db']))}</code>")
+            if nama == "load" and info.get("fitur") != "load-db":
+                baris.append("   ⚠️ <i>bukan image excel-loader — rebuild: "
+                             "<code>docker compose up -d --build excel-loader</code></i>")
         except Exception as exc:  # noqa: BLE001
             baris.append(f"⚠️ <b>{nama}</b>: tidak bisa dihubungi ({html.escape(str(exc)[:120])})")
     send_telegram("\n".join(baris), chat_id, reply_to)
 
 
 def kirim_logs(args: list, chat_id, reply_to) -> None:
-    nama = (args[0] if args else "split").lower()
+    nama = (args[0] if args else "load").lower()
+    nama = ALIAS_JOB.get(nama, nama)
     if nama not in JOBS:
         send_telegram(f"Job tidak dikenal: {html.escape(nama)}. "
                       f"Pilihan: {', '.join(JOBS)}", chat_id, reply_to)
@@ -1253,6 +1318,12 @@ def handle_command(message: dict) -> None:
         mulai_sync(args, chat_id, reply_to)
     elif perintah in ("laporan", "rekap"):
         kirim_laporan(args, message, chat_id, reply_to)
+    elif perintah in ALIAS_JOB:
+        baru = ALIAS_JOB[perintah]
+        send_telegram(f"ℹ️ <code>/{perintah}</code> sudah diganti <code>/{baru}</code> — "
+                      f"file tidak lagi dipecah, langsung dimuat ke database.",
+                      chat_id, reply_to)
+        mulai_job(baru, args, chat_id, reply_to)
     elif perintah in JOBS:
         mulai_job(perintah, args, chat_id, reply_to)
     else:
@@ -1365,7 +1436,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             if path == "/api/state":
                 return 200, api_state(user)
             if path == "/api/logs":
-                return 200, api_logs((query.get("job") or ["split"])[0])
+                return 200, api_logs((query.get("job") or ["load"])[0])
             if path == "/api/connections":
                 return 200, api_connections()
             if path == "/api/run":

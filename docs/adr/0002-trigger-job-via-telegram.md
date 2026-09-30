@@ -1,5 +1,7 @@
 # Trigger job lewat Telegram: HTTP internal, bukan Docker socket
 
+> Catatan 2026-09-30: `split-excel` digantikan `excel-loader` dan `/split` menjadi `/load` (ADR 0005). Keputusan di sini tetap berlaku untuk job barunya.
+
 Operator memicu `split-excel` (dan `dbt run`) dari grup Telegram yang sudah dipakai
 notifikasi pipeline. Perintahnya diterima `notif-relay`, yang lalu memanggil server
 kontrol HTTP kecil (`scripts/job_control.py`) milik masing-masing service di jaringan

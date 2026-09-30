@@ -156,18 +156,18 @@
 
 <section id="tab-run" hidden>
   <div class="tabs" style="position:static;margin-bottom:12px">
-    <button role="tab" data-job="split" aria-selected="true">split</button>
+    <button role="tab" data-job="load" aria-selected="true">load</button>
     <button role="tab" data-job="dbt"   aria-selected="false">dbt</button>
     <button role="tab" data-job="sync"  aria-selected="false">sync</button>
     <button role="tab" data-job="report" aria-selected="false">laporan</button>
   </div>
 
-  <div class="card" id="pane-split">
-    <div class="top"><h2>split-excel</h2><span class="pill" id="pill-split">—</span></div>
-    <div class="sub">Ambil .xlsx dari Nextcloud, pecah per sheet, unggah ke folder tujuan.</div>
+  <div class="card" id="pane-load">
+    <div class="top"><h2>excel-loader</h2><span class="pill" id="pill-load">—</span></div>
+    <div class="sub">Ambil finance.xlsx dari Nextcloud, muat sheet REKAP &amp; RINCIAN langsung ke database.</div>
     <label class="field">Folder sumber</label>
-    <div class="chips" id="chips-split"></div>
-    <div class="sub" id="hint-split" style="margin-top:9px"></div>
+    <div class="chips" id="chips-load"></div>
+    <div class="sub" id="hint-load" style="margin-top:9px"></div>
   </div>
 
   <div class="card" id="pane-dbt" hidden>
@@ -200,7 +200,7 @@
 
   <div class="card" id="pane-sync" hidden>
     <div class="top"><h2>Airbyte</h2><span class="pill" id="pill-sync">—</span></div>
-    <div class="sub">Picu sync satu koneksi. Hasilnya dilaporkan lewat webhook Airbyte ke grup.</div>
+    <div class="sub">Picu sync satu koneksi (capil). Hasilnya dilaporkan lewat webhook Airbyte ke grup.</div>
     <div id="sync-body"></div>
   </div>
 </section>
@@ -208,7 +208,7 @@
 <section id="tab-logs" hidden>
   <div class="row">
     <div class="tabs grow" style="position:static;margin:0">
-      <button role="tab" data-log="split" aria-selected="true">split</button>
+      <button role="tab" data-log="load" aria-selected="true">load</button>
       <button role="tab" data-log="dbt"   aria-selected="false">dbt</button>
     </div>
     <button class="ghost" id="log-auto" aria-pressed="true">Auto ⟳</button>
@@ -293,7 +293,7 @@ function kapan(ts) {
 
 /* ── State ───────────────────────────────────────────────────────────── */
 let state = { jobs: {}, airbyte: { enabled: false }, user: null };
-let tab = "status", job = "split", logJob = "split", logAuto = true;
+let tab = "status", job = "load", logJob = "load", logAuto = true;
 let pilihanSumber = new Set();   // kosong = semua folder
 let sedangKirim = false;
 
@@ -309,7 +309,7 @@ function statusPill(st) {
 function renderCards() {
   const rep = state.report || {};
   const wrap = $("#cards");
-  const urut = ["split", "dbt"];
+  const urut = ["load", "dbt"];
   wrap.innerHTML = urut.map((nama) => {
     const st = state.jobs[nama] || {};
     const p = statusPill(st);
@@ -321,12 +321,19 @@ function renderCards() {
         : "<i>tidak dibatasi</i>"}</div>`);
     if (info.sources && info.sources.length)
       baris.push(`<div><b>Sumber</b> · ${info.sources.map((s) => "<code>" + esc(s) + "</code>").join(" ")}</div>`);
-    if (info.dest) baris.push(`<div><b>Tujuan</b> · <code>${esc(info.dest)}</code></div>`);
+    if (info.db) baris.push(`<div><b>Tujuan</b> · <code>${esc(info.db)}</code></div>`);
     if (info.interval_menit) baris.push(`<div><b>Jadwal</b> · tiap ${esc(info.interval_menit)} menit</div>`);
     if (st.last_params && st.last_params.select)
       baris.push(`<div><b>Select</b> · <code>${esc(st.last_params.select)}</code></div>`);
-    if (nama === "split" && st.info && !("fitur" in info))
-      baris.push(`<div style="color:var(--warn)">⚠️ image lama: argumen folder belum didukung</div>`);
+    const kantor = (st.last_result && st.last_result.kantor) || [];
+    if (kantor.length)
+      baris.push(`<div><b>Muatan</b> · ${kantor.map((k) => {
+        const dimuat = (k.tabel || []).some((t) => t.status === "dimuat");
+        const tanda = !k.ok ? "❌" : dimuat ? "✅" : "＝";
+        return `<span title="${esc(k.error || "")}">${tanda}${esc(k.kantor)}</span>`;
+      }).join(" ")}</div>`);
+    if (nama === "load" && st.info && info.fitur !== "load-db")
+      baris.push(`<div style="color:var(--warn)">⚠️ bukan image excel-loader — perlu rebuild</div>`);
     if (st.error) baris.push(`<div style="color:var(--warn)">${esc(st.error)}</div>`);
     return `<div class="card">
         <div class="top"><h2>${esc(nama)}</h2><span class="pill ${p.cls}">${esc(p.text)}</span></div>
@@ -358,11 +365,11 @@ function renderCards() {
 }
 
 function renderChips() {
-  const info = (state.jobs.split || {}).info || {};
+  const info = (state.jobs.load || {}).info || {};
   const sumber = info.sources || [];
-  const box = $("#chips-split");
+  const box = $("#chips-load");
   if (!sumber.length) {
-    box.innerHTML = '<span class="sub">Daftar folder belum bisa dibaca dari split-excel.</span>';
+    box.innerHTML = '<span class="sub">Daftar folder belum bisa dibaca dari excel-loader.</span>';
     return;
   }
   const semua = pilihanSumber.size === 0;
@@ -374,7 +381,7 @@ function renderChips() {
                 title="${esc(s)}">${esc(nama)}</button>`;
     }).join("");
 
-  $$("#chips-split .chip").forEach((c) => c.addEventListener("click", () => {
+  $$("#chips-load .chip").forEach((c) => c.addEventListener("click", () => {
     buzz();
     const v = c.dataset.src;
     if (!v) pilihanSumber.clear();
@@ -383,7 +390,7 @@ function renderChips() {
     renderChips();
     syncMainButton();
   }));
-  $("#hint-split").textContent = pilihanSumber.size
+  $("#hint-load").textContent = pilihanSumber.size
     ? pilihanSumber.size + " folder dipilih"
     : "Tanpa pilihan = semua folder di NEXTCLOUD_SOURCE_PATHS.";
 }
@@ -452,8 +459,8 @@ function renderLog(teks) {
 
 /* ── Aksi ────────────────────────────────────────────────────────────── */
 function ringkasAksi() {
-  if (job === "split")
-    return pilihanSumber.size ? `split-excel · ${pilihanSumber.size} folder` : "split-excel · semua folder";
+  if (job === "load")
+    return pilihanSumber.size ? `excel-loader · ${pilihanSumber.size} folder` : "excel-loader · semua folder";
   if (job === "dbt") {
     const sel = $("#dbt-select").value.trim();
     return `dbt ${$("#dbt-cmd").value}` + (sel ? ` --select ${sel}` : "");
@@ -490,7 +497,7 @@ async function jalankan(nama, langsung) {
       hasil = await api("sync", { method: "POST", body: JSON.stringify({ connection_id: c.value }) });
     } else {
       const body = { job: nama };
-      if (nama === "split" && !langsung && pilihanSumber.size) body.sources = Array.from(pilihanSumber);
+      if (nama === "load" && !langsung && pilihanSumber.size) body.sources = Array.from(pilihanSumber);
       if (nama === "dbt" && !langsung) {
         body.command = $("#dbt-cmd").value;
         const sel = $("#dbt-select").value.trim();
@@ -583,7 +590,7 @@ $$('[data-job]').forEach((b) => b.addEventListener("click", () => {
   buzz();
   job = b.dataset.job;
   $$('[data-job]').forEach((x) => x.setAttribute("aria-selected", String(x === b)));
-  ["split", "dbt", "sync", "report"].forEach((j) => { $("#pane-" + j).hidden = j !== job; });
+  ["load", "dbt", "sync", "report"].forEach((j) => { $("#pane-" + j).hidden = j !== job; });
   if (job === "sync" && !$("#sync-conn")) renderSync();
   syncMainButton();
 }));
