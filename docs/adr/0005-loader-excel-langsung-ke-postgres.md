@@ -48,6 +48,16 @@ ada di memori, dengan biaya Kubernetes yang sering OOM (lihat
   tab Mini App `split` → `load`, `SPLIT_CONTROL_URL` → `LOAD_CONTROL_URL`
   (nilai lama sengaja diabaikan karena menunjuk ke host yang sudah tidak ada).
 
+**Rekap pengecekan (tambahan 2026-09-30).** Loader memeriksa semua file dan
+sheet sampai habis dan mengumpulkan setiap temuan sebagai data terstruktur
+(`masalah`), bukan berhenti di kesalahan pertama. Relay menyusun satu rekap
+berbahasa sehari-hari untuk semua kantor (`scripts/rekap_masalah.py`) — dibaca
+petugas pengisi file, jadi setiap temuan menyebut sel, isinya, dan cara
+memperbaikinya. Rekap yang sama persis tidak dikirim ulang oleh run terjadwal;
+diingatkan lagi setelah `REKAP_ULANG_JAM`. Kalimatnya sengaja hidup di relay,
+bukan loader: loader tetap bisa dipakai tanpa Telegram, dan bahasa rekap bisa
+diubah tanpa menyentuh jalur tulis database.
+
 ## Konsekuensi
 
 - **Koneksi Airbyte finance harus dimatikan saat cutover** — *disable*, jangan

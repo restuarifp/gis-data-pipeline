@@ -72,6 +72,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+import rekap_masalah
 import report_summary
 
 load_dotenv()
@@ -145,6 +146,9 @@ BOT_ENABLED = os.getenv("TELEGRAM_BOT_ENABLED", "true").strip().lower() not in _
 # Pemantau job: laporkan setiap run yang selesai ke grup, termasuk run terjadwal
 # excel-loader yang tidak dipicu dari Telegram.
 JOB_WATCH_ENABLED = os.getenv("JOB_WATCH_ENABLED", "true").strip().lower() not in _MATI
+# Rekap pengecekan data keuangan yang isinya sama persis dengan rekap terakhir
+# tidak dikirim ulang oleh run terjadwal; baru diingatkan lagi setelah sekian jam.
+REKAP_ULANG_JAM = float(os.getenv("REKAP_ULANG_JAM", "24"))
 
 # Mini App. Telegram hanya mau membuka URL HTTPS publik, sementara relay ini
 # mendengarkan HTTP di jaringan internal — jadi MINI_APP_URL harus menunjuk ke
@@ -992,38 +996,40 @@ def _ambil_pelanggan(nama: str) -> set:
         return _pelanggan.pop(nama, set())
 
 
-def _ringkas_muatan(hasil: dict) -> tuple:
-    """
-    Susun baris per kantor dari last_result excel-loader. Mengisi peran
-    notifikasi "Airbyte sync berhasil/GAGAL" untuk finance: satu baris per
-    kantor, tabel yang dimuat, jumlah baris, dan nomor tarikannya.
+# Rekap terakhir yang benar-benar dikirim untuk job load: sidik masalahnya dan
+# kapan. In-memory — relay restart paling banyak mengulang satu rekap.
+_rekap_terakhir = {"sidik": "", "waktu": 0.0}
 
-    Kembalikan (baris_teks, layak_diumumkan): True kalau ada yang dimuat atau
-    ada peringatan Airbyte yang masih menulis — dua hal yang perlu dilihat orang.
+
+def _lapor_muatan(st: dict, pelanggan: set) -> None:
     """
-    e = lambda v: html.escape(str(v))
-    baris, dimuat = [], False
-    if hasil.get("error"):
-        baris.append(f"Error: {e(hasil['error'])}")
-    for k in hasil.get("kantor") or []:
-        if not k.get("ok"):
-            baris.append(f"❌ <b>{e(k.get('kantor'))}</b>: {e(str(k.get('error', '?'))[:300])}")
-            continue
-        potong = []
-        for t in k.get("tabel") or []:
-            jenis = "rekap" if "_rekap_" in t["tabel"] else "rincian"
-            if t.get("status") == "dimuat":
-                dimuat = True
-                potong.append(f"{jenis} {t['baris']} baris (#{t['tarikan']})")
-            else:
-                potong.append(f"{jenis} tidak berubah")
-            if t.get("airbyte_aktif"):
-                dimuat = True
-                potong.append("⚠️ Airbyte masih menulis ke tabel ini")
-        baris.append(f"• <b>{e(k.get('kantor'))}</b>: {e(', '.join(potong))}")
-        for p in (k.get("peringatan") or [])[:3]:
-            baris.append(f"   ⚠️ <i>{e(str(p)[:200])}</i>")
-    return baris, dimuat
+    Satu rekap untuk seluruh run excel-loader (semua kantor sekaligus), dalam
+    bahasa sehari-hari — lihat rekap_masalah.py. Menggantikan notifikasi Airbyte
+    finance per koneksi dan pesan gagal per kantor.
+
+    Run terjadwal tidak mengirim apa pun bila tidak ada data baru DAN keadaan
+    masalahnya sama dengan rekap terakhir (termasuk "tidak ada masalah"). Masalah
+    yang belum diperbaiki diingatkan lagi setelah REKAP_ULANG_JAM. Run manual
+    selalu dijawab.
+    """
+    hasil = st.get("last_result") or {}
+    sidik = rekap_masalah.sidik(hasil)
+    sekarang = time.time()
+    sama = sidik == _rekap_terakhir["sidik"]
+    basi = sekarang - _rekap_terakhir["waktu"] >= REKAP_ULANG_JAM * 3600
+    manual = bool(pelanggan) or st.get("last_trigger") != "jadwal"
+
+    if not manual and not rekap_masalah.dimuat(hasil) and sama and (not sidik or not basi):
+        log.info("Run terjadwal load: tidak ada data baru, masalah sama dengan rekap "
+                 "terakhir; tidak diumumkan.")
+        return
+
+    pesan = rekap_masalah.susun(hasil, _fmt_duration(st.get("duration_s")),
+                                diulang=bool(sidik) and sama and not manual)
+    _rekap_terakhir.update(sidik=sidik, waktu=sekarang)
+    send_telegram(pesan)
+    for chat_id in pelanggan:
+        send_telegram(pesan, chat_id)
 
 
 def _lapor_selesai(nama: str, st: dict) -> None:
@@ -1032,22 +1038,13 @@ def _lapor_selesai(nama: str, st: dict) -> None:
     durasi = _fmt_duration(st.get("duration_s"))
     sumber = st.get("last_params", {}).get("sources")
     rincian = ""
-    hasil = st.get("last_result") or {}
     pelanggan = _ambil_pelanggan(nama)
 
-    if nama == "load" and hasil:
-        baris, dimuat = _ringkas_muatan(hasil)
-        # Run per jam yang tidak menemukan perubahan tidak diumumkan: tiap run
-        # terjadwal kini tercatat di /status, dan "tidak ada yang berubah" setiap
-        # jam hanya menenggelamkan pesan yang penting. Run manual tetap dijawab.
-        if (st.get("last_ok") and not dimuat and not pelanggan
-                and st.get("last_trigger") == "jadwal"):
-            log.info("Run terjadwal %s selesai tanpa perubahan; tidak diumumkan.", nama)
-            return
-        if baris:
-            rincian = "\n" + "\n".join(baris)
-    elif sumber:
-        rincian = "\n" + "\n".join(f"• {html.escape(str(s))}" for s in sumber)
+    if nama == "load" and st.get("last_result"):
+        _lapor_muatan(st, pelanggan)
+        return
+    if sumber:
+        rincian = "\n" + "\n".join(f"• <code>{html.escape(str(s))}</code>" for s in sumber)
 
     if st.get("last_ok"):
         pesan = f"✅ <b>{nama}</b> selesai ({durasi}).{rincian}"
@@ -1060,9 +1057,11 @@ def _lapor_selesai(nama: str, st: dict) -> None:
             log.warning("Gagal ambil log %s: %s", nama, exc)
         pesan = f"❌ <b>{nama}</b> GAGAL ({durasi}).{rincian}"
         if ekor:
-            # Batas pesan Telegram 4096 karakter; rincian per kantor didahulukan.
+            # Log teknis sebagai kutipan yang bisa dibuka-tutup, bukan blok kode:
+            # yang perlu disalin operator adalah nama job/folder di atas, bukan log.
+            # Batas pesan Telegram 4096 karakter.
             sisa = max(500, 3800 - len(pesan))
-            pesan += f"\n<pre>{html.escape(ekor[-sisa:])}</pre>"
+            pesan += f"\n<blockquote expandable>{html.escape(ekor[-sisa:])}</blockquote>"
 
     send_telegram(pesan)
     for chat_id in pelanggan:

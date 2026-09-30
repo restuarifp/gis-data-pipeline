@@ -20,6 +20,12 @@ sync Airbyte mode Append dulu. Satu run loader = satu notifikasi, berisi satu ba
 per kantor.
 _Avoid_: split, sync (untuk finance)
 
+**Rekap Pengecekan**:
+Satu pesan Telegram per run Loader Excel yang merangkum semua kantor: data masuk,
+tidak berubah, atau ditolak — beserta sel yang salah dan cara memperbaikinya, dalam
+bahasa sehari-hari. Pengganti notifikasi gagal per kantor.
+_Avoid_: notifikasi error, alert
+
 **Loader Excel** (`excel-loader`):
 Layanan yang membaca `finance.xlsx` tiap kantor dari Nextcloud dan menulis sheet
 REKAP/RINCIAN langsung ke tabel raw finance. Menggantikan split-excel + koneksi

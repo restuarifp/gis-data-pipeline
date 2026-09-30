@@ -336,7 +336,28 @@ def _ke_teks(nilai):
     return teks if teks.strip() else None
 
 
-def baca_sheet(ws_nilai, ws_rumus, kontrak: dict) -> tuple[list[dict], list[str]]:
+# ── Masalah data ────────────────────────────────────────────────────────────
+# Setiap temuan dicatat terstruktur (bukan kalimat jadi) supaya relay bisa
+# menyusun SATU rekap berbahasa sederhana untuk semua kantor — lihat
+# scripts/rekap_masalah.py, yang juga memegang kalimat untuk tiap jenis.
+#
+# galat=True  -> kantor itu tidak dimuat (tarikan sebelumnya tetap dipakai)
+# galat=False -> catatan saja, data tetap dimuat
+# sistem=True -> bukan kesalahan pengisi file (Nextcloud/database bermasalah)
+
+BATAS_MASALAH_PER_KANTOR = 200  # /status ikut membawa daftar ini tiap poll relay
+
+
+def _masalah(jenis: str, galat: bool = True, **rinci) -> dict:
+    return {"jenis": jenis, "galat": galat, **{k: v for k, v in rinci.items() if v is not None}}
+
+
+def _nilai_pendek(nilai) -> str:
+    teks = str(nilai)
+    return teks if len(teks) <= 40 else teks[:37] + "..."
+
+
+def baca_sheet(ws_nilai, ws_rumus, kontrak: dict) -> tuple[list[dict], list[dict]]:
     """
     Ubah satu sheet menjadi daftar baris sesuai kontrak.
 
@@ -344,19 +365,21 @@ def baca_sheet(ws_nilai, ws_rumus, kontrak: dict) -> tuple[list[dict], list[str]
     tanpa — dipakai hanya untuk mengenali sel formula yang tidak punya hasil
     tersimpan, yang di ws_nilai tampak kosong.
 
-    Kembalikan (baris, peringatan). Melempar ValueError bila header tidak
-    sesuai kontrak, ada sel berisi nilai yang salah tipe, atau ada formula
-    tanpa hasil tersimpan — satu sel salah membatalkan kantor itu, karena
-    dimuat sebagian lebih buruk dari tidak dimuat.
+    Kembalikan (baris, masalah). Pemeriksaan jalan terus sampai akhir sheet
+    supaya SEMUA masalah terlihat sekaligus — pengisi file cukup memperbaiki
+    sekali, bukan satu per satu tiap kali loader jalan. Satu masalah galat saja
+    sudah membatalkan kantor itu, karena dimuat sebagian lebih buruk dari tidak
+    dimuat. Airbyte dulu memuat formula tanpa hasil sebagai kosong tanpa suara,
+    dan tarikan bertotal kosong itu menjadi "tarikan terakhir" — laporan jadi nol.
     """
-    peringatan: list[str] = []
+    masalah: list[dict] = []
     it_nilai = ws_nilai.iter_rows(values_only=True)
     it_rumus = ws_rumus.iter_rows(values_only=True)
 
     header = next(it_nilai, None)
     next(it_rumus, None)
-    if not header:
-        raise ValueError("sheet kosong (tidak ada baris header)")
+    if not header or all(h is None or not str(h).strip() for h in header):
+        return [], [_masalah("sheet_kosong")]
 
     posisi: dict[str, int] = {}
     for i, h in enumerate(header):
@@ -364,20 +387,21 @@ def baca_sheet(ws_nilai, ws_rumus, kontrak: dict) -> tuple[list[dict], list[str]
             continue
         nama = _nama_kolom(h)
         if nama in posisi:
-            raise ValueError(f"header {nama!r} muncul dua kali")
+            masalah.append(_masalah("kolom_ganda", kolom=nama,
+                                    sel=f"{get_column_letter(i + 1)}1"))
+            continue
         posisi[nama] = i
 
     wajib = kontrak["teks"] + kontrak["angka"]
-    hilang = [k for k in wajib if k not in posisi]
-    if hilang:
-        raise ValueError(f"kolom wajib tidak ada di header: {', '.join(hilang)}")
+    for k in wajib:
+        if k not in posisi:
+            masalah.append(_masalah("kolom_hilang", kolom=k))
     tambahan = [k for k in posisi if k not in wajib]
     if tambahan:
-        peringatan.append(f"kolom di luar kontrak diabaikan: {', '.join(tambahan)}")
+        masalah.append(_masalah("kolom_tambahan", galat=False, kolom=", ".join(tambahan)))
+    ada = [k for k in wajib if k in posisi]  # kolom yang hilang tetap dilaporkan di atas
 
     baris: list[dict] = []
-    salah: list[str] = []
-    tanpa_cache: list[str] = []
     kosong_beruntun = 0
     for nomor, (nilai, rumus) in enumerate(zip(it_nilai, it_rumus), start=2):
         # Template finance memformat seluruh kolom sampai baris 1.048.576, dan
@@ -394,37 +418,32 @@ def baca_sheet(ws_nilai, ws_rumus, kontrak: dict) -> tuple[list[dict], list[str]
             i = posisi[kolom]
             return nilai[i] if i < len(nilai) else None
 
-        mentah = {k: sel(k) for k in wajib}
+        mentah = {k: sel(k) for k in ada}
         if all(v is None or (isinstance(v, str) and not v.strip()) for v in mentah.values()):
             continue  # baris kosong (ekor sheet, baris pemisah)
 
-        rekaman = {}
+        rekaman = {k: None for k in wajib}
         for k in kontrak["teks"]:
-            rekaman[k] = _ke_teks(mentah[k])
+            if k in mentah:
+                rekaman[k] = _ke_teks(mentah[k])
         for k in kontrak["angka"]:
+            if k not in mentah:
+                continue
+            alamat = f"{get_column_letter(posisi[k] + 1)}{nomor}"
             try:
                 rekaman[k] = _ke_angka(mentah[k])
-            except ValueError as exc:
-                salah.append(f"{get_column_letter(posisi[k] + 1)}{nomor} ({k}) {exc}")
-        for k in wajib:
+            except ValueError:
+                masalah.append(_masalah("bukan_angka", sel=alamat, kolom=k,
+                                        nilai=_nilai_pendek(mentah[k])))
+        for k in ada:
             i = posisi[k]
             f = rumus[i] if i < len(rumus) else None
             if mentah[k] is None and isinstance(f, str) and f.startswith("="):
-                tanpa_cache.append(f"{get_column_letter(i + 1)}{nomor}")
+                masalah.append(_masalah("formula_tanpa_hasil",
+                                        sel=f"{get_column_letter(i + 1)}{nomor}", kolom=k))
         baris.append(rekaman)
 
-    if salah:
-        lebih = f" (+{len(salah) - 10} lagi)" if len(salah) > 10 else ""
-        raise ValueError("nilai tidak valid: " + "; ".join(salah[:10]) + lebih)
-    if tanpa_cache:
-        # Airbyte dulu memuatnya sebagai kosong tanpa suara, dan tarikan berisi
-        # total kosong itu menjadi "tarikan terakhir" — laporan jadi nol. Lebih
-        # baik ditolak: tarikan sebelumnya tetap berlaku sampai file diperbaiki.
-        raise ValueError(
-            f"{len(tanpa_cache)} sel formula tanpa hasil tersimpan ({', '.join(tanpa_cache[:10])}) — "
-            "buka lalu simpan ulang file di OnlyOffice/Excel supaya hasil hitungnya ikut tersimpan"
-        )
-    return baris, peringatan
+    return baris, masalah
 
 
 def _sidik(baris: list[dict]) -> str:
@@ -433,31 +452,33 @@ def _sidik(baris: list[dict]) -> str:
     return hashlib.sha256(kanonik.encode("utf-8")).hexdigest()
 
 
-def baca_workbook(isi: bytes) -> tuple[dict, list[str]]:
+def baca_workbook(isi: bytes) -> tuple[dict, list[dict]]:
     """
-    Baca semua sheet yang dikenal kontrak. Kembalikan ({NAMA_SHEET: baris}, peringatan).
-    Sheet lain diabaikan dengan peringatan.
+    Baca semua sheet yang dikenal kontrak.
+    Kembalikan ({NAMA_SHEET: baris}, masalah) — setiap masalah sudah membawa
+    nama sheet-nya. Sheet lain diabaikan dengan catatan. File yang tidak bisa
+    dibuka sama sekali melempar exception.
     """
     wb_nilai = load_workbook(io.BytesIO(isi), data_only=True, read_only=True)
     wb_rumus = load_workbook(io.BytesIO(isi), data_only=False, read_only=True)
     hasil: dict[str, list[dict]] = {}
-    peringatan: list[str] = []
+    masalah: list[dict] = []
     try:
         for nama in wb_nilai.sheetnames:
             kunci = nama.strip().upper()
             if kunci not in DATASETS:
-                peringatan.append(f"sheet {nama!r} tidak dikenal, diabaikan")
+                masalah.append(_masalah("sheet_tak_dikenal", galat=False, sheet=nama))
                 continue
-            try:
-                baris, catatan = baca_sheet(wb_nilai[nama], wb_rumus[nama], DATASETS[kunci])
-            except ValueError as exc:
-                raise ValueError(f"sheet {nama}: {exc}") from None
+            if kunci in hasil:
+                masalah.append(_masalah("sheet_ganda", sheet=nama))
+                continue
+            baris, temuan = baca_sheet(wb_nilai[nama], wb_rumus[nama], DATASETS[kunci])
             hasil[kunci] = baris
-            peringatan += [f"sheet {nama}: {c}" for c in catatan]
+            masalah += [{**m, "sheet": nama} for m in temuan]
     finally:
         wb_nilai.close()
         wb_rumus.close()
-    return hasil, peringatan
+    return hasil, masalah
 
 
 # ── Tulis ke Postgres ───────────────────────────────────────────────────────
@@ -575,61 +596,84 @@ def _kantor_name(source_path: str) -> str:
     return parts[-1]
 
 
+def _log_masalah(m: dict) -> None:
+    lokasi = " ".join(f"{k}={m[k]}" for k in ("file", "sheet", "sel", "kolom", "nilai") if k in m)
+    (log.error if m["galat"] else log.warning)(
+        "    %s %s %s%s", "✗" if m["galat"] else "⚠", m["jenis"], lokasi,
+        f" — {m['detail']}" if m.get("detail") else "")
+
+
+def _tolak(hasil: dict) -> dict:
+    """Tandai kantor ditolak; `error` = ringkasan pendek untuk log & Mini App."""
+    galat = [m for m in hasil["masalah"] if m["galat"]]
+    if len(hasil["masalah"]) > BATAS_MASALAH_PER_KANTOR:
+        sisa = len(hasil["masalah"]) - BATAS_MASALAH_PER_KANTOR
+        hasil["masalah"] = hasil["masalah"][:BATAS_MASALAH_PER_KANTOR] + [
+            _masalah("terpotong", jumlah=sisa)]
+    hasil["error"] = f"{len(galat)} masalah — data kantor ini tidak dimuat"
+    log.error("  ✗ %s: %s", hasil["kantor"], hasil["error"])
+    return hasil
+
+
 def process_source(conn, source_path: str) -> dict:
     """
     Muat semua sheet finance dari satu folder sumber dalam SATU transaksi.
 
-    Semua-atau-tidak-sama-sekali per kantor: kalau satu sheet gagal dibaca atau
-    ditulis, tidak ada tabel kantor itu yang berubah — sama dengan aturan
-    split-excel dulu ("satu sheet gagal, seluruh kantor dilewati").
+    Semua-atau-tidak-sama-sekali per kantor: kalau satu sheet bermasalah atau
+    gagal ditulis, tidak ada tabel kantor itu yang berubah — sama dengan aturan
+    split-excel dulu ("satu sheet gagal, seluruh kantor dilewati"). Semua file
+    dan sheet tetap diperiksa sampai habis supaya rekapnya lengkap.
 
-    Kembalikan ringkasan: {kantor, ok, tabel: [...], peringatan: [...], error?}.
+    Kembalikan ringkasan: {kantor, ok, tabel: [...], masalah: [...], error?}.
     """
     nama_kantor = _kantor_name(source_path)
     kantor_id = nama_kantor.lower()
     hasil = {"kantor": nama_kantor.upper(), "sumber": source_path, "ok": False,
-             "tabel": [], "peringatan": []}
+             "tabel": [], "masalah": []}
+    catat = hasil["masalah"].append
     log.info("── Sumber: %s  (kantor: %s)", source_path, kantor_id)
 
     if not POLA_KANTOR.match(kantor_id):
-        hasil["error"] = f"nama kantor {nama_kantor!r} tidak bisa jadi nama tabel"
-        log.error("  ✗ %s", hasil["error"])
-        return hasil
+        catat(_masalah("nama_kantor_tidak_valid", sistem=True, detail=nama_kantor))
+        return _tolak(hasil)
     if not POLA_KANTOR_DBT.match(kantor_id):
-        hasil["peringatan"].append(
-            f"kantor_id {kantor_id!r} di luar pola dbt [a-z][0-9]+ — tidak masuk model riwayat")
+        catat(_masalah("kantor_di_luar_pola", galat=False, sistem=True, detail=kantor_id))
 
     try:
         files = list_xlsx(source_path)
     except Exception as exc:
-        hasil["error"] = f"gagal membaca folder: {exc}"
-        log.error("  ✗ %s", hasil["error"])
-        return hasil
+        catat(_masalah("folder_gagal", sistem=True, detail=str(exc)[:300]))
+        return _tolak(hasil)
 
     if not files:
-        hasil["error"] = "tidak ada file .xlsx"
-        log.error("  ✗ %s", hasil["error"])
-        return hasil
+        catat(_masalah("folder_kosong"))
+        return _tolak(hasil)
     log.info("  Ditemukan %d file: %s", len(files), files)
 
-    # Baca & validasi semuanya dulu, baru buka transaksi.
+    # Baca & periksa semuanya dulu, baru buka transaksi.
     data: dict[str, tuple[list[dict], dict]] = {}
+    ada_file_rusak = False
     for filename in files:
         log.info("  Membaca: %s", filename)
         try:
             isi = download(source_path, filename)
-            sheets, peringatan = baca_workbook(isi)
         except Exception as exc:
-            hasil["error"] = f"{filename}: {exc}"
-            log.error("    ✗ Gagal membaca %s: %s", filename, exc, exc_info=True)
-            return hasil
-        hasil["peringatan"] += [f"{filename}: {p}" for p in peringatan]
+            catat(_masalah("unduh_gagal", sistem=True, file=filename, detail=str(exc)[:300]))
+            ada_file_rusak = True
+            continue
+        try:
+            sheets, temuan = baca_workbook(isi)
+        except Exception as exc:
+            log.error("    ✗ Gagal membuka %s: %s: %s", filename, type(exc).__name__, exc)
+            catat(_masalah("file_rusak", file=filename, detail=str(exc)[:300]))
+            ada_file_rusak = True
+            continue
+        hasil["masalah"] += [{**m, "file": filename} for m in temuan]
         for kunci, baris in sheets.items():
             if kunci in data:
-                hasil["error"] = (f"sheet {kunci} ada di dua file "
-                                  f"({data[kunci][1]['source_file']} dan {filename})")
-                log.error("  ✗ %s", hasil["error"])
-                return hasil
+                catat(_masalah("sheet_ganda_antar_file", file=filename, sheet=kunci,
+                               detail=data[kunci][1]["source_file"].rsplit("/", 1)[-1]))
+                continue
             data[kunci] = (baris, {
                 "loader": PENANDA_LOADER,
                 "source_file": f"{source_path}/{filename}",
@@ -637,14 +681,16 @@ def process_source(conn, source_path: str) -> dict:
             })
             log.info("    %s: %d baris", kunci, len(baris))
 
-    for p in hasil["peringatan"]:
-        log.warning("    ⚠ %s", p)
+    # Sheet yang hilang baru bermakna kalau semua file bisa dibuka.
+    if not ada_file_rusak:
+        for kunci in DATASETS:
+            if kunci not in data:
+                catat(_masalah("sheet_hilang", sheet=kunci))
 
-    hilang = [k for k in DATASETS if k not in data]
-    if hilang:
-        hasil["error"] = f"sheet tidak ditemukan: {', '.join(hilang)}"
-        log.error("  ✗ %s", hasil["error"])
-        return hasil
+    for m in hasil["masalah"]:
+        _log_masalah(m)
+    if any(m["galat"] for m in hasil["masalah"]):
+        return _tolak(hasil)
 
     try:
         with conn:  # commit bila sukses, rollback bila ada exception
@@ -657,11 +703,10 @@ def process_source(conn, source_path: str) -> dict:
                              "✓" if r["status"] == "dimuat" else "=",
                              tabel, r["status"], r["baris"], r["tarikan"])
     except Exception as exc:
+        log.error("  ✗ Gagal menulis — tidak ada tabel kantor ini yang berubah.", exc_info=True)
         hasil["tabel"] = []
-        hasil["error"] = f"gagal menulis ke database: {exc}"
-        log.error("  ✗ %s — tidak ada tabel kantor ini yang berubah.", hasil["error"],
-                  exc_info=True)
-        return hasil
+        catat(_masalah("gagal_simpan", sistem=True, detail=str(exc)[:300]))
+        return _tolak(hasil)
 
     hasil["ok"] = True
     return hasil
@@ -689,7 +734,8 @@ def run_once(sources: list[str] | None = None) -> dict:
         conn = psycopg2.connect(connect_timeout=15, **DB)
     except Exception as exc:
         log.error("Gagal konek ke database: %s", exc)
-        return {"ok": False, "error": f"gagal konek ke database: {exc}", "kantor": []}
+        return {"ok": False, "error": f"gagal konek ke database: {str(exc)[:300]}",
+                "kantor": []}
 
     try:
         ringkasan = [process_source(conn, s) for s in targets]

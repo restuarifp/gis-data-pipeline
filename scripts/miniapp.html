@@ -376,7 +376,11 @@ function renderChips() {
   box.innerHTML =
     `<button class="chip all" data-src="" aria-pressed="${semua}">Semua (${sumber.length})</button>` +
     sumber.map((s) => {
-      const nama = String(s).split("/").filter(Boolean).pop();
+      // Nama kantor = folder di atas "Finance" (…/A1/Finance -> A1), sama dengan
+      // _kantor_name() di excel_loader.py; path lengkapnya tetap di tooltip.
+      const bagian = String(s).split("/").filter(Boolean);
+      const nama = bagian.length > 1 && bagian[bagian.length - 1].toLowerCase() === "finance"
+        ? bagian[bagian.length - 2] : bagian.pop();
       return `<button class="chip" data-src="${esc(s)}" aria-pressed="${pilihanSumber.has(s)}"
                 title="${esc(s)}">${esc(nama)}</button>`;
     }).join("");
