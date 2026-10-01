@@ -135,7 +135,7 @@ The **Relay Notifikasi** (see `CONTEXT.md`): a tiny stdlib-only HTTP server that
 - Airbyte is **not** in this compose stack — point its webhook notification at `http://<host>:8000/` (the relay publishes host port 8000 on `gisnet`).
 - **`/sync` triggers Airbyte** via its Public API (`AIRBYTE_URL`, `AIRBYTE_CLIENT_ID`, `AIRBYTE_CLIENT_SECRET`; optional `AIRBYTE_WORKSPACE_ID`). Connections are resolved by **name** from `GET /connections`, so no UUIDs in `.env`; an ambiguous name fails with the candidate list rather than guessing. Unlike load/dbt there is no control server and no single-flight lock — Airbyte owns its own job queue — and **completion is reported by Airbyte's existing webhook to this relay**, not by `watch_jobs()`.
 - Airbyte's token endpoint takes `grant-type` (hyphen, not `grant_type`) and answers **401 — not 400** — when that field is wrong or missing, so a malformed body masquerades as bad credentials. Token is cached until ~30s before expiry and refreshed once on a 401.
-- **Two-way bot** (`docs/adr/0002-trigger-job-via-telegram.md`): a `getUpdates` long-polling thread accepts `/load [path...]`, `/dbt [select]`, `/sync [connection]`, `/status`, `/logs [load|dbt]`, `/app`, `/id`, `/help`. `/split` is a deprecated alias for `/load` (`ALIAS_JOB`, also honoured by the Mini App API). It triggers jobs by calling the control servers over `gisnet` (`LOAD_CONTROL_URL`, `DBT_CONTROL_URL`; a leftover `SPLIT_CONTROL_URL` is ignored with a warning because it points at the removed `split-excel` host) — **never via the Docker socket**, because the relay eats outside input.
+- **Two-way bot** (`docs/adr/0002-trigger-job-via-telegram.md`): a `getUpdates` long-polling thread accepts `/load [path...]`, `/dbt [select]`, `/sync [connection]`, `/laporan`, `/keuangan`, `/status`, `/logs [load|dbt]`, `/app`, `/id`, `/help`. `/split` is a deprecated alias for `/load` (`ALIAS_JOB`, also honoured by the Mini App API). It triggers jobs by calling the control servers over `gisnet` (`LOAD_CONTROL_URL`, `DBT_CONTROL_URL`; a leftover `SPLIT_CONTROL_URL` is ignored with a warning because it points at the removed `split-excel` host) — **never via the Docker socket**, because the relay eats outside input.
 - **Who may command the bot**: the group `TELEGRAM_CHAT_ID`, plus any user id listed in `TELEGRAM_DM_USER_IDS` (comma/space separated) talking to the bot in a DM. Everything else is ignored silently — the rejected user's id is logged, since that's the number to paste into the allowlist. `/id` replies with the sender's user and chat id so nobody needs a third-party bot to find it. A group member who is *not* on the DM allowlist can still DM `/start`, `/app`, `/help`, `/id` — enough to open the Mini App panel, nothing more.
 - **DM-triggered runs report back to that DM.** `langgan_hasil()` records the private chat that triggered a job; `_lapor_selesai()` sends the finished-run message to the group *and* to that chat, then clears the list (one run = one report each). Group-triggered runs subscribe nobody, so the group never gets a duplicate.
 - `/status` also prints the config the container is actually running with (`info` block from `/status`: `source_home`, resolved `sources`, `db`, interval). This is the remote-debugging path: `docker compose restart` re-reads neither `.env` nor a rebuilt image, so a stale container is otherwise invisible from Telegram. `fitur` other than `load-db` means the container isn't running the excel-loader image.
@@ -213,6 +213,31 @@ and reply immediately; the finished `.xlsx` arrives as a Telegram document.
   ignored — renamed on purpose so a stale `.env` can't feed staging views in. `psycopg2` and
   `openpyxl` are imported defensively, so an image built before this feature
   keeps running with the report disabled and says so instead of crashing.
+
+### Laporan Keuangan (`scripts/report_finance.py`)
+
+`/keuangan [MM-YYYY]` and the *Laporan keuangan* button in the Mini App's laporan tab
+(`POST /api/report {"jenis": "keuangan"}`) fill `docs/template/monthly-finance-report.xlsx`
+and send it with `sendDocument`. Delivery, password, locking and the one-line caption are
+shared with the Rekap Bulanan (`LAPORAN` in `notif_relay.py` maps `jenis` → builder module;
+a builder needs `laporan_aktif()` and `bangun_laporan(bulan, tahun)`).
+
+- Same snapshot rule and `hist_*` views as the Rekap Bulanan. One query returns
+  per-(month, office) rows from the first finance pull up to the report month; the top
+  table is the report month per office, the bottom table is all-office totals per month
+  of that year (later months stay empty).
+- Columns: NASABAH TUNAI 1/2/3 = rincian `TUNAI_IFQ` split by K via `INSTANSI = LMG` in
+  capil (majority K when an LMG mixes K; unmatched instansi are logged, not placed);
+  NASABAH AKTIF 1/2/3 = capil rows per K; WAJIB/POKOK/SUKARELA = rekap `NOMINAL IFQ/ZKT/SDQ`
+  `total_100_persen`; TOTAL SETOR = `SUM(disetor)` over all rekap rows except `TOTAL`;
+  CAD = rekap `CAD` (trimmed — the file has `'CAD '`) `disetor`; JUMLAH PETUGAS = capil
+  pengurus (LMG not PRA/PJ%/KPJ%).
+- **AKUMULASI CAD** is recomputed from the warehouse, not archived: running sum of CAD over
+  months whose finance pull is *from that month*. An office reusing an older pull shows
+  that pull's CAD BULAN INI but does not add it again. Accuracy depends on finance raw
+  tables never being reset.
+- Template rows are found by column-A labels (office codes, `TOTAL`, `BULAN`, month names),
+  so offices/rows can be added without code changes. Totals are written as numbers.
 
 ### Observability (`observability/`)
 

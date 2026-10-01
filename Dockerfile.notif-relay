@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements-notif-relay.txt
 
 COPY scripts/notif_relay.py .
 COPY scripts/report_summary.py .
+COPY scripts/report_finance.py .
 # Rekap pengecekan data keuangan (pesan hasil excel-loader)
 COPY scripts/rekap_masalah.py .
 # Halaman Mini App dilayani di GET /app oleh notif_relay.py
@@ -14,5 +15,6 @@ COPY scripts/miniapp.html .
 # Template laporan. Path-nya sengaja meniru layout repo (../docs/template) supaya
 # REPORT_TEMPLATE default di report_summary.py berlaku di container maupun lokal.
 COPY docs/template/summary.xlsx /docs/template/summary.xlsx
+COPY docs/template/monthly-finance-report.xlsx /docs/template/monthly-finance-report.xlsx
 
 CMD ["python", "notif_relay.py"]

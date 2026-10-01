@@ -187,15 +187,16 @@
   </div>
 
   <div class="card" id="pane-report" hidden>
-    <div class="top"><h2>Rekap Bulanan</h2><span class="pill" id="pill-report">—</span></div>
-    <div class="sub">Susun laporan rekap per kantor dari template, lalu kirim
+    <div class="top"><h2>Laporan Bulanan</h2><span class="pill" id="pill-report">—</span></div>
+    <div class="sub">Susun laporan per kantor dari template, lalu kirim
       sebagai file .xlsx ke Telegram.</div>
     <label class="field" for="rep-bulan">Bulan</label>
     <select id="rep-bulan"></select>
     <label class="field" for="rep-tahun">Tahun</label>
     <select id="rep-tahun"></select>
     <div class="sub" id="hint-report" style="margin-top:9px"></div>
-    <button class="action" id="rep-run">📊 Buat &amp; kirim laporan</button>
+    <button class="action" id="rep-run">📊 Rekap bulanan</button>
+    <button class="action" id="rep-fin">💰 Laporan keuangan</button>
   </div>
 
   <div class="card" id="pane-sync" hidden>
@@ -296,6 +297,7 @@ let state = { jobs: {}, airbyte: { enabled: false }, user: null };
 let tab = "status", job = "load", logJob = "load", logAuto = true;
 let pilihanSumber = new Set();   // kosong = semua folder
 let sedangKirim = false;
+let jenisLaporan = "rekap";      // tombol laporan terakhir; MainButton tab laporan ikut memakainya
 
 function statusPill(st) {
   if (!st || st.error) return { cls: "warn", text: "tak terjangkau" };
@@ -418,13 +420,16 @@ function renderReport() {
     thn.value = String(ini);
   }
 
+  const fin = rep.keuangan || {};
   $("#rep-run").disabled = !rep.enabled;
+  $("#rep-fin").disabled = !rep.enabled || !fin.enabled;
 
   // Hanya alasan kenapa fitur mati yang ditampilkan di sini. Panelnya sengaja
   // tidak menjelaskan cakupan data — penjelasan itu ikut di caption tiap file.
-  $("#hint-report").innerHTML = rep.enabled
-    ? ""
-    : `<span style="color:var(--warn)">${esc(rep.reason || "belum aktif")}</span>`;
+  const alasan = !rep.enabled ? rep.reason || "belum aktif"
+               : !fin.enabled ? "Laporan keuangan: " + (fin.reason || "belum aktif") : "";
+  $("#hint-report").innerHTML = alasan
+    ? `<span style="color:var(--warn)">${esc(alasan)}</span>` : "";
 }
 
 async function renderSync() {
@@ -470,7 +475,7 @@ function ringkasAksi() {
     return `dbt ${$("#dbt-cmd").value}` + (sel ? ` --select ${sel}` : "");
   }
   if (job === "report")
-    return `rekap · ${NAMA_BULAN[$("#rep-bulan").value - 1]} ${$("#rep-tahun").value}`;
+    return `${jenisLaporan} · ${NAMA_BULAN[$("#rep-bulan").value - 1]} ${$("#rep-tahun").value}`;
   const c = $("#sync-conn");
   return c ? `sync · ${c.selectedOptions[0].textContent}` : "sync";
 }
@@ -493,6 +498,7 @@ async function jalankan(nama, langsung) {
     let hasil;
     if (nama === "report") {
       hasil = await api("report", { method: "POST", body: JSON.stringify({
+        jenis: jenisLaporan,
         bulan: Number($("#rep-bulan").value), tahun: Number($("#rep-tahun").value),
       }) });
     } else if (nama === "sync") {
@@ -616,7 +622,8 @@ $("#log-auto").addEventListener("click", (e) => {
 ["dbt-cmd", "dbt-select", "rep-bulan", "rep-tahun"].forEach((id) =>
   $("#" + id).addEventListener("input", syncMainButton));
 
-$("#rep-run").addEventListener("click", () => { buzz(); jalankan("report", false); });
+$("#rep-run").addEventListener("click", () => { buzz(); jenisLaporan = "rekap"; jalankan("report", false); });
+$("#rep-fin").addEventListener("click", () => { buzz(); jenisLaporan = "keuangan"; jalankan("report", false); });
 
 if (tg && tg.MainButton) tg.MainButton.onClick(() => jalankan(job, false));
 

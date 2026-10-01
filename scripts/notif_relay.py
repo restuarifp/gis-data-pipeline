@@ -34,7 +34,8 @@ Endpoint:
   GET  /api/connections -- daftar koneksi Airbyte (butuh initData)
   POST /api/run     -- picu load/dbt (butuh initData)
   POST /api/sync    -- picu sync Airbyte (butuh initData)
-  POST /api/report  -- susun Rekap Bulanan .xlsx lalu kirim ke Telegram (butuh initData)
+  POST /api/report  -- susun Rekap Bulanan / Laporan Keuangan (jenis) .xlsx lalu
+                       kirim ke Telegram (butuh initData)
   POST <apa saja>   -- terima webhook Airbyte, balas 200 seketika
   GET  /            -- health check, balas 200 "ok"
 
@@ -73,6 +74,7 @@ import requests
 from dotenv import load_dotenv
 
 import rekap_masalah
+import report_finance
 import report_summary
 
 load_dotenv()
@@ -692,6 +694,13 @@ def pasang_menu_button() -> None:
 # server; laporan tidak punya control server, jadi kuncinya di sini.
 _kunci_laporan = threading.Lock()
 
+# Jenis laporan → (modul pembangun, caption). Modulnya memenuhi kontrak yang
+# sama: laporan_aktif() dan bangun_laporan(bulan, tahun) → (isi, nama, catatan).
+LAPORAN = {
+    "rekap":    (report_summary, "Berikut summary excel yang di-request oleh {oleh}"),
+    "keuangan": (report_finance, "Berikut laporan keuangan yang di-request oleh {oleh}"),
+}
+
 
 def _parse_bulan(args: list) -> tuple:
     """
@@ -712,7 +721,8 @@ def _parse_bulan(args: list) -> tuple:
     return bulan, tahun
 
 
-def buat_dan_kirim_laporan(bulan: int, tahun: int, oleh: str, tujuan: list) -> None:
+def buat_dan_kirim_laporan(bulan: int, tahun: int, oleh: str, tujuan: list,
+                           jenis: str = "rekap") -> None:
     """
     Bangun laporan lalu kirim ke setiap chat di `tujuan`.
 
@@ -725,7 +735,8 @@ def buat_dan_kirim_laporan(bulan: int, tahun: int, oleh: str, tujuan: list) -> N
             send_telegram("⏳ Laporan lain masih disusun; coba lagi sebentar.", chat)
         return
     try:
-        isi, nama_file, catatan = report_summary.bangun_laporan(bulan, tahun)
+        modul, caption = LAPORAN[jenis]
+        isi, nama_file, catatan = modul.bangun_laporan(bulan, tahun)
     except report_summary.ReportError as exc:
         log.warning("Laporan %s-%s gagal: %s", bulan, tahun, exc)
         for chat in tujuan:
@@ -740,7 +751,7 @@ def buat_dan_kirim_laporan(bulan: int, tahun: int, oleh: str, tujuan: list) -> N
         _kunci_laporan.release()
 
     # Satu kalimat saja — sisanya sudah terbaca dari file itu sendiri.
-    caption = f"Berikut summary excel yang di-request oleh {html.escape(oleh)}"
+    caption = caption.format(oleh=html.escape(oleh))
     for chat in tujuan:
         kirim_dokumen(nama_file, isi, caption, chat)
 
@@ -759,8 +770,9 @@ def _tujuan_laporan(chat_id) -> list:
     return tujuan
 
 
-def kirim_laporan(args: list, message: dict, chat_id, reply_to) -> None:
-    bisa, alasan = report_summary.laporan_aktif()
+def kirim_laporan(args: list, message: dict, chat_id, reply_to,
+                  jenis: str = "rekap") -> None:
+    bisa, alasan = LAPORAN[jenis][0].laporan_aktif()
     if not bisa:
         send_telegram(f"⚠️ Laporan belum bisa dipakai: {html.escape(alasan)}",
                       chat_id, reply_to)
@@ -776,7 +788,8 @@ def kirim_laporan(args: list, message: dict, chat_id, reply_to) -> None:
     # sudah menjadi tanda selesai.
     threading.Thread(
         target=buat_dan_kirim_laporan,
-        args=(bulan, tahun, sebut(message.get("from") or {}), _tujuan_laporan(chat_id)),
+        args=(bulan, tahun, sebut(message.get("from") or {}), _tujuan_laporan(chat_id),
+              jenis),
         daemon=True,
     ).start()
 
@@ -795,12 +808,14 @@ def status_semua_job() -> dict:
 
 def api_state(user: dict) -> dict:
     bisa_laporan, alasan_laporan = report_summary.laporan_aktif()
+    bisa_keuangan, alasan_keuangan = report_finance.laporan_aktif()
     baku_bulan, baku_tahun = report_summary.bulan_default()
     return {
         "jobs": status_semua_job(),
         "airbyte": {"enabled": airbyte_aktif()},
         "report": {"enabled": bisa_laporan, "reason": alasan_laporan,
-                   "bulan": baku_bulan, "tahun": baku_tahun},
+                   "bulan": baku_bulan, "tahun": baku_tahun,
+                   "keuangan": {"enabled": bisa_keuangan, "reason": alasan_keuangan}},
         "user": {k: user.get(k) for k in ("id", "username", "first_name")},
     }
 
@@ -866,7 +881,10 @@ def api_report(body: dict, user: dict) -> dict:
     Mini App berjalan di dalam webview Telegram yang memblokir unduhan, jadi
     satu-satunya jalur yang benar-benar sampai ke operator adalah sendDocument.
     """
-    bisa, alasan = report_summary.laporan_aktif()
+    jenis = str(body.get("jenis") or "rekap").lower()
+    if jenis not in LAPORAN:
+        raise WebAppError(f"jenis laporan tidak dikenal: {jenis}", 400)
+    bisa, alasan = LAPORAN[jenis][0].laporan_aktif()
     if not bisa:
         raise WebAppError(alasan, 400)
 
@@ -889,11 +907,12 @@ def api_report(body: dict, user: dict) -> dict:
 
     threading.Thread(
         target=buat_dan_kirim_laporan,
-        args=(bulan, tahun, sebut(user), tujuan),
+        args=(bulan, tahun, sebut(user), tujuan, jenis),
         daemon=True,
     ).start()
     label = f"{report_summary.BULAN_SINGKAT[bulan]} {tahun}"
-    return {"ok": True, "message": f"Rekap {label} sedang disusun; filenya dikirim ke Telegram."}
+    nama = "Laporan keuangan" if jenis == "keuangan" else "Rekap"
+    return {"ok": True, "message": f"{nama} {label} sedang disusun; filenya dikirim ke Telegram."}
 
 
 def api_connections() -> dict:
@@ -946,6 +965,7 @@ BANTUAN = (
     "/sync <i>nama-koneksi</i> — picu sync koneksi itu\n"
     "/laporan — kirim Rekap Bulanan (.xlsx) untuk bulan lalu\n"
     "/laporan <i>8-2026</i> — rekap bulan tertentu (MM-YYYY)\n"
+    "/keuangan [<i>8-2026</i>] — kirim Laporan Keuangan (.xlsx) bulan lalu / bulan tertentu\n"
     "/status — job sedang jalan atau tidak, plus hasil run terakhir\n"
     "/logs [load|dbt] — ekor log run terakhir\n"
     "/app — buka Panel Pipeline (Mini App): status, tombol jalankan, log\n"
@@ -1317,6 +1337,8 @@ def handle_command(message: dict) -> None:
         mulai_sync(args, chat_id, reply_to)
     elif perintah in ("laporan", "rekap"):
         kirim_laporan(args, message, chat_id, reply_to)
+    elif perintah == "keuangan":
+        kirim_laporan(args, message, chat_id, reply_to, "keuangan")
     elif perintah in ALIAS_JOB:
         baru = ALIAS_JOB[perintah]
         send_telegram(f"ℹ️ <code>/{perintah}</code> sudah diganti <code>/{baru}</code> — "
