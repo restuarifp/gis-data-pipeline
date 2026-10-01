@@ -11,20 +11,26 @@ di Mini App memanggil bangun_laporan(), lalu hasilnya dikirim ke Telegram
 sebagai dokumen — sama seperti Rekap Bulanan (report_summary.py), dan dengan
 cakupan data yang sama: potret akhir bulan dari view `hist_*`, bukan staging.
 
-Isi kolom (per kantor, per bulan):
-  B-D  NASABAH TUNAI 1/2/3  SUM(rincian TUNAI_IFQ), dibagi per K lewat
-                            instansi = LMG di capil (K terbanyak di LMG itu)
-  E-G  NASABAH AKTIF 1/2/3  jumlah baris capil dengan K = 1/2/3
-  H    TOTAL ANGGOTA        E + F + G
-  I    SIMPANAN WAJIB       rekap NOMINAL IFQ · TOTAL 100%
-  J    SIMPANAN POKOK       rekap NOMINAL ZKT · TOTAL 100%
-  K    SIMPANAN SUKARELA    rekap NOMINAL SDQ · TOTAL 100%
-  L    TOTAL KONTRIBUSI     I + J + K
-  M    TOTAL SETOR          SUM(rekap DISETOR) semua baris kecuali TOTAL
-  N    CAD BULAN INI        rekap CAD · DISETOR
-  O    AKUMULASI CAD        jumlah CAD semua bulan s.d. bulan laporan, hanya
-                            bulan yang punya tarikan finance sendiri
-  P    JUMLAH PETUGAS       capil dengan LMG bukan PRA / PJ% / KPJ% (= pengurus)
+Isi kolom (per kantor, per bulan). Kolom dicari dari judulnya di baris header
+(HEADER), bukan dari hurufnya — template yang kolomnya digeser tetap terisi
+benar, dan judul yang hilang/berubah menggagalkan laporan dengan pesan jelas:
+  NASABAH TUNAI        SUM(rincian TUNAI_IFQ)
+  NASABAH AKTIF 1/2/3  jumlah baris capil dengan K = 1/2/3
+  TOTAL ANGGOTA        aktif 1 + 2 + 3
+  SIMPANAN WAJIB       rekap NOMINAL IFQ · TOTAL 100%
+  SIMPANAN POKOK       rekap NOMINAL ZKT · TOTAL 100%
+  SIMPANAN SUKARELA    rekap NOMINAL SDQ · TOTAL 100%
+  TOTAL KONTRIBUSI     wajib + pokok + sukarela
+  TOTAL SETOR          SUM(rekap DISETOR) semua baris kecuali TOTAL
+  CAD BULAN INI        rekap CAD · DISETOR
+  AKUMULASI CAD        jumlah CAD semua bulan s.d. bulan laporan, hanya
+                       bulan yang punya tarikan finance sendiri
+  JUMLAH PETUGAS       capil dengan LMG bukan PRA / PJ% / KPJ% (= pengurus)
+
+Grafik (sheet GRAFIK) dibuat oleh kode, BUKAN disimpan di template: openpyxl
+membuang chart yang sudah ada saat membuka workbook, jadi chart di template
+akan hilang dari setiap laporan. Semua grafik merujuk sel tabel laporan itu
+sendiri, sehingga tetap benar kalau angkanya diedit tangan di Excel.
 
 AKUMULASI CAD dihitung ulang dari warehouse setiap kali, mulai dari bulan
 tarikan finance pertama. Jadi ia hanya selengkap riwayat tarikan finance
@@ -44,6 +50,15 @@ from pathlib import Path
 
 import report_summary as rs
 from report_summary import ReportError
+
+try:
+    from openpyxl.chart import BarChart, LineChart, Reference, Series
+    from openpyxl.chart.shapes import GraphicalProperties
+    from openpyxl.drawing.line import LineProperties
+    from openpyxl.styles import Font
+    from openpyxl.utils import column_index_from_string, get_column_letter
+except ImportError:  # pragma: no cover -- laporan_aktif() sudah mematikan fiturnya
+    BarChart = None
 
 log = logging.getLogger("notif_relay.report_finance")
 
@@ -85,26 +100,6 @@ WITH
     FROM {rs._q(rs.VIEW_CAPIL)}
     GROUP BY kantor_id, tarikan_id
   ),
-  -- LMG → K per tarikan capil. Satu LMG idealnya satu K; kalau campur, K yang
-  -- anggotanya terbanyak dipakai dan LMG-nya disebut di catatan.
-  lmg_k_semua AS (
-    SELECT kantor_id, tarikan_id, upper(trim("LMG")) AS lmg, trim("K") AS k,
-           COUNT(*) AS n
-    FROM {rs._q(rs.VIEW_CAPIL)}
-    WHERE trim("K") IN ('1', '2', '3')
-    GROUP BY 1, 2, 3, 4
-  ),
-  lmg_k AS (
-    SELECT DISTINCT ON (kantor_id, tarikan_id, lmg) kantor_id, tarikan_id, lmg, k
-    FROM lmg_k_semua
-    ORDER BY kantor_id, tarikan_id, lmg, n DESC, k
-  ),
-  lmg_campur AS (
-    SELECT kantor_id, tarikan_id, string_agg(lmg, ', ' ORDER BY lmg) AS lmg_campur
-    FROM (SELECT kantor_id, tarikan_id, lmg FROM lmg_k_semua
-          GROUP BY 1, 2, 3 HAVING COUNT(*) > 1) c
-    GROUP BY 1, 2
-  ),
   rekap_tarikan AS (
     SELECT kantor_id, tarikan_id, MIN(ditarik_pada) AS ditarik_pada,
       SUM(total_100_persen) FILTER (WHERE j = 'NOMINAL IFQ') AS wajib,
@@ -133,24 +128,11 @@ WITH
   ),
   p_rincian AS ({_pilih("rincian_tarikan")}
   ),
-  -- TUNAI_IFQ per instansi pada tarikan rincian terpilih, diberi K dari
-  -- tarikan capil terpilih bulan yang sama.
   tunai AS (
-    SELECT pr.awal_bulan, pr.kantor_id,
-      SUM(h.tunai_ifq) FILTER (WHERE m.k = '1') AS tunai_1,
-      SUM(h.tunai_ifq) FILTER (WHERE m.k = '2') AS tunai_2,
-      SUM(h.tunai_ifq) FILTER (WHERE m.k = '3') AS tunai_3,
-      SUM(h.tunai_ifq) FILTER (WHERE m.k IS NULL) AS tunai_tanpa_k,
-      string_agg(DISTINCT h.instansi, ', ')
-        FILTER (WHERE m.k IS NULL AND COALESCE(h.tunai_ifq, 0) <> 0) AS instansi_tanpa_k
+    SELECT pr.awal_bulan, pr.kantor_id, SUM(h.tunai_ifq) AS tunai
     FROM p_rincian pr
     JOIN {rs._q(rs.VIEW_RINCIAN)} h
       ON h.kantor_id = pr.kantor_id AND h.tarikan_id = pr.tarikan_id
-    LEFT JOIN p_capil pc
-      ON pc.awal_bulan = pr.awal_bulan AND pc.kantor_id = pr.kantor_id
-    LEFT JOIN lmg_k m
-      ON m.kantor_id = pc.kantor_id AND m.tarikan_id = pc.tarikan_id
-     AND m.lmg = upper(trim(h.instansi))
     GROUP BY pr.awal_bulan, pr.kantor_id
   ),
   kunci AS (
@@ -160,34 +142,41 @@ WITH
   )
 SELECT
   k.awal_bulan, k.kantor_id,
-  t.tunai_1, t.tunai_2, t.tunai_3, t.tunai_tanpa_k, t.instansi_tanpa_k,
-  c.aktif_1, c.aktif_2, c.aktif_3, c.petugas, lc.lmg_campur,
+  t.tunai,
+  c.aktif_1, c.aktif_2, c.aktif_3, c.petugas,
   r.wajib, r.pokok, r.sukarela, r.setor, r.cad,
   c.ditarik_pada  AT TIME ZONE %(zona)s AS ditarik_capil,
   r.ditarik_pada  AT TIME ZONE %(zona)s AS ditarik_finance
 FROM kunci k
   LEFT JOIN p_capil pc       ON pc.awal_bulan = k.awal_bulan AND pc.kantor_id = k.kantor_id
   LEFT JOIN capil_tarikan c  ON c.kantor_id = pc.kantor_id AND c.tarikan_id = pc.tarikan_id
-  LEFT JOIN lmg_campur lc    ON lc.kantor_id = pc.kantor_id AND lc.tarikan_id = pc.tarikan_id
   LEFT JOIN p_rekap pk       ON pk.awal_bulan = k.awal_bulan AND pk.kantor_id = k.kantor_id
   LEFT JOIN rekap_tarikan r  ON r.kantor_id = pk.kantor_id AND r.tarikan_id = pk.tarikan_id
   LEFT JOIN tunai t          ON t.awal_bulan = k.awal_bulan AND t.kantor_id = k.kantor_id
 ORDER BY k.awal_bulan, k.kantor_id
 """
 
-# Kolom template → nama nilai. Turunan (H, L, O) dihitung di _nilai_baris().
-KOLOM = {
-    "B": "tunai_1", "C": "tunai_2", "D": "tunai_3",
-    "E": "aktif_1", "F": "aktif_2", "G": "aktif_3",
-    "H": "total_anggota",
-    "I": "wajib", "J": "pokok", "K": "sukarela",
-    "L": "kontribusi",
-    "M": "setor", "N": "cad", "O": "akumulasi_cad",
-    "P": "petugas",
+# Judul header template → nilai yang mengisi kolom di bawahnya, kiri ke kanan.
+# Judul yang di-merge melebar (NASABAH AKTIF = 3 kolom) harus selebar daftarnya.
+# Turunan (total_anggota, kontribusi, akumulasi_cad) dihitung di _nilai_baris().
+HEADER = {
+    "NASABAH TUNAI":     ["tunai"],
+    "NASABAH AKTIF":     ["aktif_1", "aktif_2", "aktif_3"],
+    "TOTAL ANGGOTA":     ["total_anggota"],
+    "SIMPANAN WAJIB":    ["wajib"],
+    "SIMPANAN POKOK":    ["pokok"],
+    "SIMPANAN SUKARELA": ["sukarela"],
+    "TOTAL KONTRIBUSI":  ["kontribusi"],
+    "TOTAL SETOR":       ["setor"],
+    "CAD BULAN INI":     ["cad"],
+    "AKUMULASI CAD":     ["akumulasi_cad"],
+    "JUMLAH PETUGAS":    ["petugas"],
 }
+NILAI = [n for daftar in HEADER.values() for n in daftar]
 UANG = {"wajib", "pokok", "sukarela", "kontribusi", "setor", "cad", "akumulasi_cad"}
 
-KOL_JUDUL_BULAN = "A2"    # baris kedua judul (merge A2:P2), kosong di template
+KOL_JUDUL_BULAN = "A2"    # baris kedua judul (merge selebar tabel), kosong di template
+BARIS_HEADER    = 4
 BARIS_PERTAMA   = 6       # baris data pertama; baris 1-5 judul + header dua tingkat
 LABEL_TOTAL     = "TOTAL"
 LABEL_BULAN     = "BULAN"
@@ -232,9 +221,9 @@ def ambil_data(bulan: int, tahun: int) -> dict:
 
 
 def _nilai_baris(rec: dict, akumulasi: float) -> dict:
-    """Nilai satu baris (kunci = nama di KOLOM), termasuk kolom turunan."""
+    """Nilai satu baris (kunci = nama di HEADER), termasuk kolom turunan."""
     n = {k: rs._angka(rec.get(k)) for k in
-         ("tunai_1", "tunai_2", "tunai_3", "aktif_1", "aktif_2", "aktif_3", "petugas")}
+         ("tunai", "aktif_1", "aktif_2", "aktif_3", "petugas")}
     for k in ("wajib", "pokok", "sukarela", "setor", "cad"):
         n[k] = _uang(rec.get(k))
     n["total_anggota"] = n["aktif_1"] + n["aktif_2"] + n["aktif_3"]
@@ -251,10 +240,35 @@ def _cari_baris(ws, label: str, mulai: int) -> int:
                       f"— periksa {TEMPLATE}")
 
 
-def _tulis_total(ws, baris: int, nilai: dict) -> None:
-    # Ditulis sebagai angka, menggantikan =SUM(...) template: pratinjau file
-    # Telegram tidak menghitung ulang formula.
-    for kol, nama in KOLOM.items():
+def _peta_kolom(ws) -> dict:
+    """{nama nilai: huruf kolom}, dari judul di baris BARIS_HEADER."""
+    lebar = {}      # kolom kiri sebuah merge → jumlah kolomnya
+    for m in ws.merged_cells.ranges:
+        if m.min_row <= BARIS_HEADER <= m.max_row:
+            lebar[m.min_col] = m.max_col - m.min_col + 1
+    peta, ketemu = {}, set()
+    for kol in range(2, ws.max_column + 1):
+        judul = " ".join(str(ws.cell(BARIS_HEADER, kol).value or "").split()).upper()
+        if judul not in HEADER:
+            continue
+        daftar = HEADER[judul]
+        if lebar.get(kol, 1) != len(daftar):
+            raise ReportError(f"header {judul!r} di template selebar {lebar.get(kol, 1)} "
+                              f"kolom, seharusnya {len(daftar)} — periksa {TEMPLATE}")
+        for i, nama in enumerate(daftar):
+            peta[nama] = get_column_letter(kol + i)
+        ketemu.add(judul)
+    hilang = [j for j in HEADER if j not in ketemu]
+    if hilang:
+        raise ReportError("header tidak ditemukan di baris "
+                          f"{BARIS_HEADER} template: {', '.join(hilang)} — periksa {TEMPLATE}")
+    return peta
+
+
+def _tulis(ws, kolom: dict, baris: int, nilai: dict) -> None:
+    # Total ditulis sebagai angka, menggantikan =SUM(...) template: pratinjau
+    # file Telegram tidak menghitung ulang formula.
+    for nama, kol in kolom.items():
         v = nilai.get(nama, 0)
         ws[f"{kol}{baris}"] = round(v, 2) if nama in UANG else v
 
@@ -275,6 +289,7 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
     ws.title = f"{bulan}_{tahun % 100:02d}"
     ws[KOL_JUDUL_BULAN] = f"BULAN: {NAMA_BULAN[bulan]} {tahun}"
 
+    kolom = _peta_kolom(ws)
     baris_total = _cari_baris(ws, LABEL_TOTAL, BARIS_PERTAMA)
     kantor_template = {}
     for baris in range(BARIS_PERTAMA, baris_total):
@@ -305,30 +320,34 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
 
     # Tabel atas: bulan laporan per kantor.
     ini = per_bulan.get(bulan, {})
-    total = {nama: 0 for nama in KOLOM.values()}
+    total = {nama: 0 for nama in NILAI}
     for kantor, baris in kantor_template.items():
         nilai = ini.get(kantor)
         if nilai is None:
             continue    # kantor tanpa data: barisnya dibiarkan kosong
-        for kol, nama in KOLOM.items():
-            ws[f"{kol}{baris}"] = nilai[nama]
+        _tulis(ws, kolom, baris, nilai)
+        for nama in NILAI:
             total[nama] += nilai[nama]
-    _tulis_total(ws, baris_total, total)
+    _tulis(ws, kolom, baris_total, total)
 
     # Tabel bawah: total semua kantor per bulan di tahun laporan.
     baris_judul = _cari_baris(ws, LABEL_BULAN, baris_total + 1)
     baris_total_bawah = _cari_baris(ws, LABEL_TOTAL, baris_judul + 1)
-    total_bawah = {nama: 0 for nama in KOLOM.values()}
+    total_bawah = {nama: 0 for nama in NILAI}
     for baris in range(baris_judul + 1, baris_total_bawah):
         label = str(ws[f"A{baris}"].value or "").strip().upper()
         if label not in NAMA_BULAN or not per_bulan.get(NAMA_BULAN.index(label)):
             continue    # bulan sesudah bulan laporan / tanpa data: kosong
         sebulan = {nama: sum(v[nama] for v in per_bulan[NAMA_BULAN.index(label)].values())
-                   for nama in KOLOM.values()}
-        _tulis_total(ws, baris, sebulan)
+                   for nama in NILAI}
+        _tulis(ws, kolom, baris, sebulan)
         for nama, v in sebulan.items():
             total_bawah[nama] += v
-    _tulis_total(ws, baris_total_bawah, total_bawah)
+    _tulis(ws, kolom, baris_total_bawah, total_bawah)
+
+    _tambah_grafik(wb, ws, kolom, bulan, tahun,
+                   kantor=(BARIS_PERTAMA, baris_total - 1),
+                   bulanan=(baris_judul + 1, baris_total_bawah - 1))
 
     catatan = _catatan(data.get((tahun, bulan), {}), kantor_template, bulan, tahun)
 
@@ -340,17 +359,140 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
     return rs._kunci_xlsx(buf.getvalue()), nama_file, catatan
 
 
+# ── Grafik ──────────────────────────────────────────────────────────────────
+
+# Warna kategori dipakai berurutan, tidak pernah diputar ulang: seri pertama
+# selalu biru, kedua oranye, ketiga hijau-tosca (K1/K2/K3, wajib/pokok/sukarela).
+WARNA = ["2A78D6", "EB6834", "1BAF7A"]
+WARNA_GRID = "E1E0DC"
+WARNA_LATAR = "FFFFFF"
+FMT_RUPIAH = '#,##0.0,," jt"'     # 93.959.750 → "94,0 jt"
+FMT_ORANG = "#,##0"
+
+# Tata letak sheet GRAFIK: dua kolom grafik, lebar kolom sel dikunci supaya
+# jarak antargrafik tidak bergantung pada lebar kolom bawaan aplikasi.
+LEBAR_CM, TINGGI_CM, TINGGI_KANTOR_CM = 16, 7.5, 11
+LEBAR_KOLOM_SEL = 9.3             # ≈ 70 px; 9 kolom ≈ 16,5 cm
+JANGKAR_KOLOM = ["A", "J"]
+BARIS_PER_TINGKAT = 16            # baris 15 pt → 16 baris ≈ 8,5 cm
+
+
+def _gaya_sumbu(chart, fmt: str) -> None:
+    chart.x_axis.delete = False     # openpyxl 3.1 menyembunyikan sumbu bila tidak diisi
+    chart.y_axis.delete = False
+    chart.y_axis.numFmt = fmt
+    chart.y_axis.majorGridlines.spPr = GraphicalProperties(
+        ln=LineProperties(solidFill=WARNA_GRID, w=6350))
+    chart.y_axis.scaling.min = 0
+    chart.width, chart.height = LEBAR_CM, TINGGI_CM
+
+
+def _ref(ws, kolom: str, rentang: tuple) -> "Reference":
+    # Bentuk koordinat, bukan range_string: nama sheet "10_26" perlu dikutip.
+    i = column_index_from_string(kolom)
+    return Reference(ws, min_col=i, max_col=i, min_row=rentang[0], max_row=rentang[1])
+
+
+def _kolom(ws, judul, seri, kategori, rentang, fmt, *, tumpuk=False, mendatar=False):
+    """Diagram batang; `seri` = [(huruf kolom, nama)]. Legend hanya bila >1 seri."""
+    c = BarChart()
+    c.type = "bar" if mendatar else "col"
+    c.title = judul
+    if tumpuk:
+        c.grouping, c.overlap = "stacked", 100
+    c.gapWidth = 60
+    for i, (kol, nama) in enumerate(seri):
+        s = Series(_ref(ws, kol, rentang), title=nama)
+        s.graphicalProperties.solidFill = WARNA[i]
+        # Garis tepi warna latar = celah tipis antar segmen / batang.
+        s.graphicalProperties.line.solidFill = WARNA_LATAR
+        s.graphicalProperties.line.width = 12700
+        c.series.append(s)
+    c.set_categories(kategori)
+    _gaya_sumbu(c, fmt)
+    if mendatar:
+        c.x_axis.scaling.orientation = "maxMin"   # kantor pertama di atas
+        c.x_axis.tickLblSkip = 1                  # semua kode kantor tampil
+        c.height = TINGGI_KANTOR_CM
+    if len(seri) > 1:
+        c.legend.position = "b"
+    else:
+        c.legend = None             # satu seri: judul sudah menamainya
+    return c
+
+
+def _garis(ws, judul, kolom, kategori, rentang, fmt):
+    """Satu seri garis per grafik — skala wajib/pokok/sukarela terlalu berbeda
+    untuk berbagi sumbu (sukarela akan rata di dasar)."""
+    c = LineChart()
+    c.title = judul
+    s = Series(_ref(ws, kolom, rentang), title=judul)
+    s.graphicalProperties.line.solidFill = WARNA[0]
+    s.graphicalProperties.line.width = 25400
+    s.smooth = False
+    s.marker.symbol, s.marker.size = "circle", 7
+    s.marker.graphicalProperties = GraphicalProperties(solidFill=WARNA[0])
+    s.marker.graphicalProperties.line.solidFill = WARNA_LATAR
+    c.series.append(s)
+    c.set_categories(kategori)
+    c.display_blanks = "gap"        # bulan sesudah bulan laporan = kosong, bukan nol
+    _gaya_sumbu(c, fmt)
+    c.legend = None
+    return c
+
+
+def _tambah_grafik(wb, ws, kolom: dict, bulan: int, tahun: int, *,
+                   kantor: tuple, bulanan: tuple) -> None:
+    """
+    Sheet GRAFIK: tren bulanan (tabel bawah) dan perbandingan kantor bulan
+    laporan (tabel atas). Kolom dan baris yang dirujuk sama dengan yang diisi —
+    keduanya dicari dari label template.
+    """
+    g = wb.create_sheet("GRAFIK")
+    g["A1"] = f"GRAFIK REKAPITULASI SIMPANAN — {NAMA_BULAN[bulan]} {tahun}"
+    g["A1"].font = Font(bold=True, size=14)
+    for i in range(1, 19):
+        g.column_dimensions[get_column_letter(i)].width = LEBAR_KOLOM_SEL
+
+    bln = _ref(ws, "A", bulanan)
+    ktr = _ref(ws, "A", kantor)
+    aktif = [(kolom[f"aktif_{i}"], f"K{i}") for i in (1, 2, 3)]
+    label = f"{NAMA_BULAN[bulan]} {tahun}"
+
+    grafik = [
+        _garis(ws, "Nasabah Tunai per Bulan", kolom["tunai"], bln, bulanan, FMT_ORANG),
+        _kolom(ws, "Nasabah Aktif per Bulan", aktif, bln, bulanan, FMT_ORANG, tumpuk=True),
+        _garis(ws, "Simpanan Wajib per Bulan", kolom["wajib"], bln, bulanan, FMT_RUPIAH),
+        _garis(ws, "Simpanan Pokok per Bulan", kolom["pokok"], bln, bulanan, FMT_RUPIAH),
+        _garis(ws, "Simpanan Sukarela per Bulan", kolom["sukarela"], bln, bulanan, FMT_RUPIAH),
+        _kolom(ws, "Total Kontribusi vs Total Setor per Bulan",
+               [(kolom["kontribusi"], "Total kontribusi"), (kolom["setor"], "Total setor")],
+               bln, bulanan, FMT_RUPIAH),
+        _kolom(ws, "CAD Bulan Ini per Bulan", [(kolom["cad"], "CAD bulan ini")],
+               bln, bulanan, FMT_RUPIAH),
+        _garis(ws, "Akumulasi CAD", kolom["akumulasi_cad"], bln, bulanan, FMT_RUPIAH),
+        _kolom(ws, f"Komposisi Simpanan per Kantor — {label}",
+               [(kolom["wajib"], "Wajib"), (kolom["pokok"], "Pokok"),
+                (kolom["sukarela"], "Sukarela")],
+               ktr, kantor, FMT_RUPIAH, tumpuk=True, mendatar=True),
+        _kolom(ws, f"Nasabah Tunai vs Total Anggota per Kantor — {label}",
+               [(kolom["tunai"], "Nasabah tunai"), (kolom["total_anggota"], "Total anggota")],
+               ktr, kantor, FMT_ORANG, mendatar=True),
+    ]
+    for i, c in enumerate(grafik):
+        g.add_chart(c, f"{JANGKAR_KOLOM[i % 2]}{3 + (i // 2) * BARIS_PER_TINGKAT}")
+
+    # Cetak: A4 tegak, dua grafik selebar satu halaman; tanpa ini grafik
+    # terpotong di tengah oleh batas halaman bawaan.
+    g.page_setup.paperSize = g.PAPERSIZE_A4
+    g.page_setup.orientation = "portrait"
+    g.sheet_properties.pageSetUpPr.fitToPage = True
+    g.page_setup.fitToWidth, g.page_setup.fitToHeight = 1, 0
+
+
 def _catatan(data_bulan: dict, kantor_template: dict, bulan: int, tahun: int) -> list:
     """Hal yang perlu diketahui operator; ditulis ke log relay, bukan ke Telegram."""
     catatan = rs._catatan_tarikan(data_bulan, bulan, tahun)
-    for kantor, rec in sorted(data_bulan.items()):
-        if rec.get("instansi_tanpa_k"):
-            catatan.append(
-                f"{kantor}: {rs._angka(rec.get('tunai_tanpa_k'))} nasabah tunai tidak "
-                f"masuk kolom 1/2/3 — instansi tanpa LMG di capil: {rec['instansi_tanpa_k']}")
-        if rec.get("lmg_campur"):
-            catatan.append(f"{kantor}: LMG dengan K campuran (dipakai K terbanyak): "
-                           f"{rec['lmg_campur']}")
     kosong = sorted(set(kantor_template) - set(data_bulan))
     if kosong:
         catatan.append("Tanpa data di warehouse: " + ", ".join(kosong))

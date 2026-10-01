@@ -226,9 +226,7 @@ a builder needs `laporan_aktif()` and `bangun_laporan(bulan, tahun)`).
   per-(month, office) rows from the first finance pull up to the report month; the top
   table is the report month per office, the bottom table is all-office totals per month
   of that year (later months stay empty).
-- Columns: NASABAH TUNAI 1/2/3 = rincian `TUNAI_IFQ` split by K via `INSTANSI = LMG` in
-  capil (majority K when an LMG mixes K; unmatched instansi are logged, not placed);
-  NASABAH AKTIF 1/2/3 = capil rows per K; WAJIB/POKOK/SUKARELA = rekap `NOMINAL IFQ/ZKT/SDQ`
+- Columns: NASABAH TUNAI = `SUM(TUNAI_IFQ)` from rincian; NASABAH AKTIF 1/2/3 = capil rows per K; WAJIB/POKOK/SUKARELA = rekap `NOMINAL IFQ/ZKT/SDQ`
   `total_100_persen`; TOTAL SETOR = `SUM(disetor)` over all rekap rows except `TOTAL`;
   CAD = rekap `CAD` (trimmed — the file has `'CAD '`) `disetor`; JUMLAH PETUGAS = capil
   pengurus (LMG not PRA/PJ%/KPJ%).
@@ -236,8 +234,15 @@ a builder needs `laporan_aktif()` and `bangun_laporan(bulan, tahun)`).
   months whose finance pull is *from that month*. An office reusing an older pull shows
   that pull's CAD BULAN INI but does not add it again. Accuracy depends on finance raw
   tables never being reset.
-- Template rows are found by column-A labels (office codes, `TOTAL`, `BULAN`, month names),
-  so offices/rows can be added without code changes. Totals are written as numbers.
+- **Columns are found by their row-4 header text** (`HEADER` in `report_finance.py`), and
+  rows by column-A labels (office codes, `TOTAL`, `BULAN`, month names), so columns can be
+  moved and offices added without code changes. A missing header, or a merged header
+  whose width doesn't match its field list (NASABAH AKTIF = 3), fails the report with an
+  error naming it. Totals are written as numbers.
+- **Charts are generated in code on a `GRAFIK` sheet, never stored in the template** —
+  openpyxl drops existing charts when it loads a workbook. They reference the report's
+  own cells (monthly trends from the bottom table, per-office comparison from the top),
+  one y-axis per chart (CAD bulan ini and akumulasi are separate charts on purpose).
 
 ### Observability (`observability/`)
 
