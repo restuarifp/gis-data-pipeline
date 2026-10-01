@@ -240,14 +240,14 @@ a builder needs `laporan_aktif()` and `bangun_laporan(bulan, tahun)`).
   whose width doesn't match its field list (NASABAH AKTIF = 3), fails the report with an
   error naming it. Totals are written as numbers.
 - **Charts are generated in code, never stored in the template** — openpyxl drops existing
-  charts when it loads a workbook. They go on the report sheet itself, above the table:
-  `_sisipkan_baris()` inserts `BARIS_GRAFIK` rows at the header row (shifting merges and
-  row heights by hand — openpyxl's `insert_rows` doesn't), and charts are cell-anchored
-  (`TwoCellAnchor`) to the table's width via `TINGKAT`. The header row is found by
-  `NAMA KOPERASI` in column A, so nothing depends on fixed row numbers. One y-axis per
-  chart: the nasabah tunai + wajib/pokok/sukarela chart is an **index** (first month with
-  data = 100), its values written to hidden columns right of the monthly table
-  (`visible_cells_only = False`). Prints A4 portrait, one page wide, table on a new page.
+  charts when it loads a workbook. They go on the report sheet itself, below the monthly
+  table (two rows under its `TOTAL`), cell-anchored (`TwoCellAnchor`) to the table's width
+  via `TINGKAT`. The header row is found by `NAMA KOPERASI` in column A, so nothing depends
+  on fixed row numbers. One y-axis per chart: the nasabah tunai + wajib/pokok/sukarela
+  chart is an **index** (first month with data = 100), its values written to hidden
+  columns right of the monthly table (`visible_cells_only = False`). Prints A4 portrait,
+  one page wide, charts on a new page after the table; the print area is set explicitly
+  because the default stops at the last filled cell and clips the bottom charts.
 
 ### Observability (`observability/`)
 

@@ -29,10 +29,9 @@ benar, dan judul yang hilang/berubah menggagalkan laporan dengan pesan jelas:
 
 Grafik dibuat oleh kode, BUKAN disimpan di template: openpyxl membuang chart
 yang sudah ada saat membuka workbook, jadi chart di template akan hilang dari
-setiap laporan. Grafik ditaruh di sheet yang sama, di atas tabel: kode
-menyisipkan baris kosong di bawah judul, lalu tabel (dicari lewat label, bukan
-nomor baris) ikut turun. Grafik merujuk sel tabel itu sendiri; satu-satunya
-data tambahan adalah kolom indeks tersembunyi di kanan tabel bulanan.
+setiap laporan. Grafik ditaruh di sheet yang sama, di bawah tabel bulanan.
+Grafik merujuk sel tabel itu sendiri; satu-satunya data tambahan adalah kolom
+indeks tersembunyi di kanan tabel bulanan.
 
 AKUMULASI CAD dihitung ulang dari warehouse setiap kali, mulai dari bulan
 tarikan finance pertama. Jadi ia hanya selengkap riwayat tarikan finance
@@ -267,23 +266,6 @@ def _peta_kolom(ws, baris_header: int) -> dict:
     return peta
 
 
-def _sisipkan_baris(ws, sebelum: int, jumlah: int) -> None:
-    """
-    ws.insert_rows() yang juga menggeser merge dan tinggi baris — openpyxl
-    hanya memindahkan isi sel. Formula tidak disesuaikan; aman di sini karena
-    semua sel berformula di template (baris TOTAL) ditimpa angka.
-    """
-    tinggi = {r: d.height for r, d in ws.row_dimensions.items() if d.height}
-    ws.insert_rows(sebelum, jumlah)
-    for m in ws.merged_cells.ranges:
-        if m.min_row >= sebelum:
-            m.shift(0, jumlah)
-    for r in list(ws.row_dimensions):
-        ws.row_dimensions[r].height = None
-    for r, h in tinggi.items():
-        ws.row_dimensions[r + jumlah if r >= sebelum else r].height = h
-
-
 def _tulis(ws, kolom: dict, baris: int, nilai: dict) -> None:
     # Total ditulis sebagai angka, menggantikan =SUM(...) template: pratinjau
     # file Telegram tidak menghitung ulang formula.
@@ -308,11 +290,7 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
     ws.title = f"{bulan}_{tahun % 100:02d}"
     ws[KOL_JUDUL_BULAN] = f"BULAN: {NAMA_BULAN[bulan]} {tahun}"
 
-    # Ruang grafik di antara judul dan tabel; semua baris sesudahnya dicari
-    # lewat label, jadi pergeserannya tidak perlu diketahui siapa pun.
     baris_header = _cari_baris(ws, LABEL_HEADER, 1)
-    _sisipkan_baris(ws, baris_header, BARIS_GRAFIK)
-    baris_grafik, baris_header = baris_header, baris_header + BARIS_GRAFIK
     kolom = _peta_kolom(ws, baris_header)
     # Header dua tingkat: data mulai di bawah sel A header yang di-merge.
     baris_pertama = max((m.max_row for m in ws.merged_cells.ranges
@@ -375,7 +353,7 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
             total_bawah[nama] += v
     _tulis(ws, kolom, baris_total_bawah, total_bawah)
 
-    _tambah_grafik(ws, kolom, bulan, tahun, total_bulan, baris_grafik,
+    _tambah_grafik(ws, kolom, bulan, tahun, total_bulan, baris_total_bawah + 2,
                    kantor=(baris_pertama, baris_total - 1),
                    judul_bulanan=baris_judul,
                    bulanan=(baris_judul + 1, baris_total_bawah - 1))
@@ -403,15 +381,15 @@ FMT_INDEKS = "0"
 
 # Tata letak: grafik ditambatkan ke rentang sel (dua sudut), bukan ukuran cm,
 # jadi selalu selebar tabel apa pun lebar kolomnya. Tiap tingkat: (baris awal,
-# baris akhir, [nama grafik]) — baris relatif terhadap tempat header tabel
-# semula; satu nama = selebar tabel, dua = kiri | kanan.
+# baris akhir, [nama grafik]) — baris relatif terhadap baris pertama grafik
+# (dua baris di bawah TOTAL tabel bulanan); satu nama = selebar tabel, dua =
+# kiri | kanan.
 TINGKAT = [
     (0, 19, ["dinamika"]),
     (21, 37, ["aktif", "setor"]),
     (39, 54, ["cad"]),
     (56, 77, ["komposisi", "tunai_anggota"]),
 ]
-BARIS_GRAFIK = TINGKAT[-1][1] + 3     # disisipkan; tabel mulai 2 baris di bawah grafik
 JEDA_EMU = 114300                 # ±0,3 cm antara grafik kiri dan kanan
 
 # Grafik dinamika: satu sumbu untuk orang dan rupiah lewat indeks (bulan
@@ -516,7 +494,7 @@ def _tambah_grafik(ws, kolom: dict, bulan: int, tahun: int, total_bulan: dict,
                    baris_grafik: int, *,
                    kantor: tuple, judul_bulanan: int, bulanan: tuple) -> None:
     """
-    Grafik di ruang kosong antara judul dan tabel: tren bulanan (tabel bawah)
+    Grafik mulai di `baris_grafik`, di bawah tabel: tren bulanan (tabel bawah)
     dan perbandingan kantor bulan laporan (tabel atas).
     """
     bln = _ref(ws, "A", bulanan)
@@ -565,13 +543,16 @@ def _tambah_grafik(ws, kolom: dict, bulan: int, tahun: int, total_bulan: dict,
                 to=AnchorMarker(col=sampai, row=baris_grafik + ujung))
             ws.add_chart(c)
 
-    # Cetak: A4 tegak selebar satu halaman — grafik di halaman pertama, tabel
-    # mulai di halaman baru supaya header-nya tidak terbelah.
+    # Cetak: A4 tegak selebar satu halaman — tabel di halaman pertama, grafik
+    # mulai di halaman baru supaya tidak terbelah di tengah.
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.orientation = "portrait"
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
-    ws.row_breaks.append(Break(id=baris_grafik + BARIS_GRAFIK - 1))
+    ws.row_breaks.append(Break(id=baris_grafik - 1))
+    # Area cetak eksplisit sampai sebaris di bawah grafik terakhir; tanpa ini
+    # rentang cetak berhenti di sel terisi terakhir dan tepi bawah grafik terpotong.
+    ws.print_area = f"A1:{get_column_letter(akhir)}{baris_grafik + TINGKAT[-1][1] + 1}"
 
 
 def _catatan(data_bulan: dict, kantor_template: dict, bulan: int, tahun: int) -> list:
