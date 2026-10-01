@@ -27,10 +27,12 @@ benar, dan judul yang hilang/berubah menggagalkan laporan dengan pesan jelas:
                        bulan yang punya tarikan finance sendiri
   JUMLAH PETUGAS       capil dengan LMG bukan PRA / PJ% / KPJ% (= pengurus)
 
-Grafik (sheet GRAFIK) dibuat oleh kode, BUKAN disimpan di template: openpyxl
-membuang chart yang sudah ada saat membuka workbook, jadi chart di template
-akan hilang dari setiap laporan. Semua grafik merujuk sel tabel laporan itu
-sendiri, sehingga tetap benar kalau angkanya diedit tangan di Excel.
+Grafik dibuat oleh kode, BUKAN disimpan di template: openpyxl membuang chart
+yang sudah ada saat membuka workbook, jadi chart di template akan hilang dari
+setiap laporan. Grafik ditaruh di sheet yang sama, di atas tabel: kode
+menyisipkan baris kosong di bawah judul, lalu tabel (dicari lewat label, bukan
+nomor baris) ikut turun. Grafik merujuk sel tabel itu sendiri; satu-satunya
+data tambahan adalah kolom indeks tersembunyi di kanan tabel bulanan.
 
 AKUMULASI CAD dihitung ulang dari warehouse setiap kali, mulai dari bulan
 tarikan finance pertama. Jadi ia hanya selengkap riwayat tarikan finance
@@ -55,7 +57,8 @@ try:
     from openpyxl.chart import BarChart, LineChart, Reference, Series
     from openpyxl.chart.shapes import GraphicalProperties
     from openpyxl.drawing.line import LineProperties
-    from openpyxl.styles import Font
+    from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, TwoCellAnchor
+    from openpyxl.worksheet.pagebreak import Break
     from openpyxl.utils import column_index_from_string, get_column_letter
 except ImportError:  # pragma: no cover -- laporan_aktif() sudah mematikan fiturnya
     BarChart = None
@@ -176,8 +179,7 @@ NILAI = [n for daftar in HEADER.values() for n in daftar]
 UANG = {"wajib", "pokok", "sukarela", "kontribusi", "setor", "cad", "akumulasi_cad"}
 
 KOL_JUDUL_BULAN = "A2"    # baris kedua judul (merge selebar tabel), kosong di template
-BARIS_HEADER    = 4
-BARIS_PERTAMA   = 6       # baris data pertama; baris 1-5 judul + header dua tingkat
+LABEL_HEADER    = "NAMA KOPERASI"   # kolom A baris header tabel atas
 LABEL_TOTAL     = "TOTAL"
 LABEL_BULAN     = "BULAN"
 
@@ -240,15 +242,15 @@ def _cari_baris(ws, label: str, mulai: int) -> int:
                       f"— periksa {TEMPLATE}")
 
 
-def _peta_kolom(ws) -> dict:
-    """{nama nilai: huruf kolom}, dari judul di baris BARIS_HEADER."""
+def _peta_kolom(ws, baris_header: int) -> dict:
+    """{nama nilai: huruf kolom}, dari judul di baris header tabel atas."""
     lebar = {}      # kolom kiri sebuah merge → jumlah kolomnya
     for m in ws.merged_cells.ranges:
-        if m.min_row <= BARIS_HEADER <= m.max_row:
+        if m.min_row <= baris_header <= m.max_row:
             lebar[m.min_col] = m.max_col - m.min_col + 1
     peta, ketemu = {}, set()
     for kol in range(2, ws.max_column + 1):
-        judul = " ".join(str(ws.cell(BARIS_HEADER, kol).value or "").split()).upper()
+        judul = " ".join(str(ws.cell(baris_header, kol).value or "").split()).upper()
         if judul not in HEADER:
             continue
         daftar = HEADER[judul]
@@ -261,8 +263,25 @@ def _peta_kolom(ws) -> dict:
     hilang = [j for j in HEADER if j not in ketemu]
     if hilang:
         raise ReportError("header tidak ditemukan di baris "
-                          f"{BARIS_HEADER} template: {', '.join(hilang)} — periksa {TEMPLATE}")
+                          f"{baris_header} template: {', '.join(hilang)} — periksa {TEMPLATE}")
     return peta
+
+
+def _sisipkan_baris(ws, sebelum: int, jumlah: int) -> None:
+    """
+    ws.insert_rows() yang juga menggeser merge dan tinggi baris — openpyxl
+    hanya memindahkan isi sel. Formula tidak disesuaikan; aman di sini karena
+    semua sel berformula di template (baris TOTAL) ditimpa angka.
+    """
+    tinggi = {r: d.height for r, d in ws.row_dimensions.items() if d.height}
+    ws.insert_rows(sebelum, jumlah)
+    for m in ws.merged_cells.ranges:
+        if m.min_row >= sebelum:
+            m.shift(0, jumlah)
+    for r in list(ws.row_dimensions):
+        ws.row_dimensions[r].height = None
+    for r, h in tinggi.items():
+        ws.row_dimensions[r + jumlah if r >= sebelum else r].height = h
 
 
 def _tulis(ws, kolom: dict, baris: int, nilai: dict) -> None:
@@ -289,10 +308,19 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
     ws.title = f"{bulan}_{tahun % 100:02d}"
     ws[KOL_JUDUL_BULAN] = f"BULAN: {NAMA_BULAN[bulan]} {tahun}"
 
-    kolom = _peta_kolom(ws)
-    baris_total = _cari_baris(ws, LABEL_TOTAL, BARIS_PERTAMA)
+    # Ruang grafik di antara judul dan tabel; semua baris sesudahnya dicari
+    # lewat label, jadi pergeserannya tidak perlu diketahui siapa pun.
+    baris_header = _cari_baris(ws, LABEL_HEADER, 1)
+    _sisipkan_baris(ws, baris_header, BARIS_GRAFIK)
+    baris_grafik, baris_header = baris_header, baris_header + BARIS_GRAFIK
+    kolom = _peta_kolom(ws, baris_header)
+    # Header dua tingkat: data mulai di bawah sel A header yang di-merge.
+    baris_pertama = max((m.max_row for m in ws.merged_cells.ranges
+                         if m.min_col == 1 and m.min_row == baris_header),
+                        default=baris_header) + 1
+    baris_total = _cari_baris(ws, LABEL_TOTAL, baris_pertama)
     kantor_template = {}
-    for baris in range(BARIS_PERTAMA, baris_total):
+    for baris in range(baris_pertama, baris_total):
         kode = str(ws[f"A{baris}"].value or "").strip().upper()
         if kode:
             kantor_template[kode] = baris
@@ -334,6 +362,7 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
     baris_judul = _cari_baris(ws, LABEL_BULAN, baris_total + 1)
     baris_total_bawah = _cari_baris(ws, LABEL_TOTAL, baris_judul + 1)
     total_bawah = {nama: 0 for nama in NILAI}
+    total_bulan = {}    # baris tabel bawah → total sebulan (untuk grafik indeks)
     for baris in range(baris_judul + 1, baris_total_bawah):
         label = str(ws[f"A{baris}"].value or "").strip().upper()
         if label not in NAMA_BULAN or not per_bulan.get(NAMA_BULAN.index(label)):
@@ -341,12 +370,14 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
         sebulan = {nama: sum(v[nama] for v in per_bulan[NAMA_BULAN.index(label)].values())
                    for nama in NILAI}
         _tulis(ws, kolom, baris, sebulan)
+        total_bulan[baris] = sebulan
         for nama, v in sebulan.items():
             total_bawah[nama] += v
     _tulis(ws, kolom, baris_total_bawah, total_bawah)
 
-    _tambah_grafik(wb, ws, kolom, bulan, tahun,
-                   kantor=(BARIS_PERTAMA, baris_total - 1),
+    _tambah_grafik(ws, kolom, bulan, tahun, total_bulan, baris_grafik,
+                   kantor=(baris_pertama, baris_total - 1),
+                   judul_bulanan=baris_judul,
                    bulanan=(baris_judul + 1, baris_total_bawah - 1))
 
     catatan = _catatan(data.get((tahun, bulan), {}), kantor_template, bulan, tahun)
@@ -362,29 +393,42 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
 # ── Grafik ──────────────────────────────────────────────────────────────────
 
 # Warna kategori dipakai berurutan, tidak pernah diputar ulang: seri pertama
-# selalu biru, kedua oranye, ketiga hijau-tosca (K1/K2/K3, wajib/pokok/sukarela).
-WARNA = ["2A78D6", "EB6834", "1BAF7A"]
+# selalu biru, kedua oranye, ketiga hijau-tosca, keempat kuning.
+WARNA = ["2A78D6", "EB6834", "1BAF7A", "EDA100"]
 WARNA_GRID = "E1E0DC"
 WARNA_LATAR = "FFFFFF"
 FMT_RUPIAH = '#,##0.0,," jt"'     # 93.959.750 → "94,0 jt"
 FMT_ORANG = "#,##0"
+FMT_INDEKS = "0"
 
-# Tata letak sheet GRAFIK: dua kolom grafik, lebar kolom sel dikunci supaya
-# jarak antargrafik tidak bergantung pada lebar kolom bawaan aplikasi.
-LEBAR_CM, TINGGI_CM, TINGGI_KANTOR_CM = 16, 7.5, 11
-LEBAR_KOLOM_SEL = 9.3             # ≈ 70 px; 9 kolom ≈ 16,5 cm
-JANGKAR_KOLOM = ["A", "J"]
-BARIS_PER_TINGKAT = 16            # baris 15 pt → 16 baris ≈ 8,5 cm
+# Tata letak: grafik ditambatkan ke rentang sel (dua sudut), bukan ukuran cm,
+# jadi selalu selebar tabel apa pun lebar kolomnya. Tiap tingkat: (baris awal,
+# baris akhir, [nama grafik]) — baris relatif terhadap tempat header tabel
+# semula; satu nama = selebar tabel, dua = kiri | kanan.
+TINGKAT = [
+    (0, 19, ["dinamika"]),
+    (21, 37, ["aktif", "setor"]),
+    (39, 54, ["cad"]),
+    (56, 77, ["komposisi", "tunai_anggota"]),
+]
+BARIS_GRAFIK = TINGKAT[-1][1] + 3     # disisipkan; tabel mulai 2 baris di bawah grafik
+JEDA_EMU = 114300                 # ±0,3 cm antara grafik kiri dan kanan
+
+# Grafik dinamika: satu sumbu untuk orang dan rupiah lewat indeks (bulan
+# pertama yang berisi = 100). Dua sumbu-y menyesatkan, dan pada satu sumbu
+# rupiah sukarela & nasabah tunai akan rata di dasar.
+SERI_INDEKS = [("tunai", "Nasabah tunai"), ("wajib", "Simpanan wajib"),
+               ("pokok", "Simpanan pokok"), ("sukarela", "Simpanan sukarela")]
 
 
-def _gaya_sumbu(chart, fmt: str) -> None:
+def _gaya_sumbu(chart, fmt: str, *, mulai_nol: bool = True) -> None:
     chart.x_axis.delete = False     # openpyxl 3.1 menyembunyikan sumbu bila tidak diisi
     chart.y_axis.delete = False
     chart.y_axis.numFmt = fmt
     chart.y_axis.majorGridlines.spPr = GraphicalProperties(
         ln=LineProperties(solidFill=WARNA_GRID, w=6350))
-    chart.y_axis.scaling.min = 0
-    chart.width, chart.height = LEBAR_CM, TINGGI_CM
+    if mulai_nol:
+        chart.y_axis.scaling.min = 0
 
 
 def _ref(ws, kolom: str, rentang: tuple) -> "Reference":
@@ -413,7 +457,6 @@ def _kolom(ws, judul, seri, kategori, rentang, fmt, *, tumpuk=False, mendatar=Fa
     if mendatar:
         c.x_axis.scaling.orientation = "maxMin"   # kantor pertama di atas
         c.x_axis.tickLblSkip = 1                  # semua kode kantor tampil
-        c.height = TINGGI_KANTOR_CM
     if len(seri) > 1:
         c.legend.position = "b"
     else:
@@ -421,73 +464,114 @@ def _kolom(ws, judul, seri, kategori, rentang, fmt, *, tumpuk=False, mendatar=Fa
     return c
 
 
-def _garis(ws, judul, kolom, kategori, rentang, fmt):
-    """Satu seri garis per grafik — skala wajib/pokok/sukarela terlalu berbeda
-    untuk berbagi sumbu (sukarela akan rata di dasar)."""
+def _garis(ws, judul, seri, kategori, rentang, fmt):
+    """Diagram garis; `seri` = [(huruf kolom, nama)]. Legend hanya bila >1 seri."""
     c = LineChart()
     c.title = judul
-    s = Series(_ref(ws, kolom, rentang), title=judul)
-    s.graphicalProperties.line.solidFill = WARNA[0]
-    s.graphicalProperties.line.width = 25400
-    s.smooth = False
-    s.marker.symbol, s.marker.size = "circle", 7
-    s.marker.graphicalProperties = GraphicalProperties(solidFill=WARNA[0])
-    s.marker.graphicalProperties.line.solidFill = WARNA_LATAR
-    c.series.append(s)
+    for i, (kol, nama) in enumerate(seri):
+        s = Series(_ref(ws, kol, rentang), title=nama)
+        s.graphicalProperties.line.solidFill = WARNA[i]
+        s.graphicalProperties.line.width = 25400
+        s.smooth = False
+        s.marker.symbol, s.marker.size = "circle", 7
+        s.marker.graphicalProperties = GraphicalProperties(solidFill=WARNA[i])
+        s.marker.graphicalProperties.line.solidFill = WARNA_LATAR
+        c.series.append(s)
     c.set_categories(kategori)
     c.display_blanks = "gap"        # bulan sesudah bulan laporan = kosong, bukan nol
-    _gaya_sumbu(c, fmt)
-    c.legend = None
+    _gaya_sumbu(c, fmt, mulai_nol=False)
+    if len(seri) > 1:
+        c.legend.position = "b"
+    else:
+        c.legend = None
     return c
 
 
-def _tambah_grafik(wb, ws, kolom: dict, bulan: int, tahun: int, *,
-                   kantor: tuple, bulanan: tuple) -> None:
+def _tulis_indeks(ws, judul_bulanan: int, bulanan: tuple, total_bulan: dict) -> list:
     """
-    Sheet GRAFIK: tren bulanan (tabel bawah) dan perbandingan kantor bulan
-    laporan (tabel atas). Kolom dan baris yang dirujuk sama dengan yang diisi —
-    keduanya dicari dari label template.
+    Kolom indeks tersembunyi di kanan tabel bulanan: tiap seri dibagi nilai
+    bulan pertamanya yang bukan nol, ×100. Bulan tanpa data dibiarkan kosong
+    supaya garisnya terputus, bukan jatuh ke nol.
+    Kembalikan ([(huruf, nama)], semua nilai indeks).
     """
-    g = wb.create_sheet("GRAFIK")
-    g["A1"] = f"GRAFIK REKAPITULASI SIMPANAN — {NAMA_BULAN[bulan]} {tahun}"
-    g["A1"].font = Font(bold=True, size=14)
-    for i in range(1, 19):
-        g.column_dimensions[get_column_letter(i)].width = LEBAR_KOLOM_SEL
+    mulai = ws.max_column + 2       # satu kolom jeda dari tabel
+    seri, semua = [], []
+    for i, (nama, label) in enumerate(SERI_INDEKS):
+        huruf = get_column_letter(mulai + i)
+        ws[f"{huruf}{judul_bulanan}"] = f"INDEKS {label.upper()}"
+        dasar = next((v[nama] for b, v in sorted(total_bulan.items()) if v[nama]), None)
+        for baris in range(bulanan[0], bulanan[1] + 1):
+            v = total_bulan.get(baris)
+            if v is not None and dasar:
+                sel = ws[f"{huruf}{baris}"]
+                sel.value = round(v[nama] / dasar * 100, 1)
+                semua.append(sel.value)
+                sel.number_format = "0.0"
+        ws.column_dimensions[huruf].hidden = True
+        seri.append((huruf, label))
+    return seri, semua
 
+
+def _tambah_grafik(ws, kolom: dict, bulan: int, tahun: int, total_bulan: dict,
+                   baris_grafik: int, *,
+                   kantor: tuple, judul_bulanan: int, bulanan: tuple) -> None:
+    """
+    Grafik di ruang kosong antara judul dan tabel: tren bulanan (tabel bawah)
+    dan perbandingan kantor bulan laporan (tabel atas).
+    """
     bln = _ref(ws, "A", bulanan)
     ktr = _ref(ws, "A", kantor)
     aktif = [(kolom[f"aktif_{i}"], f"K{i}") for i in (1, 2, 3)]
     label = f"{NAMA_BULAN[bulan]} {tahun}"
 
-    grafik = [
-        _garis(ws, "Nasabah Tunai per Bulan", kolom["tunai"], bln, bulanan, FMT_ORANG),
-        _kolom(ws, "Nasabah Aktif per Bulan", aktif, bln, bulanan, FMT_ORANG, tumpuk=True),
-        _garis(ws, "Simpanan Wajib per Bulan", kolom["wajib"], bln, bulanan, FMT_RUPIAH),
-        _garis(ws, "Simpanan Pokok per Bulan", kolom["pokok"], bln, bulanan, FMT_RUPIAH),
-        _garis(ws, "Simpanan Sukarela per Bulan", kolom["sukarela"], bln, bulanan, FMT_RUPIAH),
-        _kolom(ws, "Total Kontribusi vs Total Setor per Bulan",
-               [(kolom["kontribusi"], "Total kontribusi"), (kolom["setor"], "Total setor")],
-               bln, bulanan, FMT_RUPIAH),
-        _kolom(ws, "CAD Bulan Ini per Bulan", [(kolom["cad"], "CAD bulan ini")],
-               bln, bulanan, FMT_RUPIAH),
-        _garis(ws, "Akumulasi CAD", kolom["akumulasi_cad"], bln, bulanan, FMT_RUPIAH),
-        _kolom(ws, f"Komposisi Simpanan per Kantor — {label}",
-               [(kolom["wajib"], "Wajib"), (kolom["pokok"], "Pokok"),
-                (kolom["sukarela"], "Sukarela")],
-               ktr, kantor, FMT_RUPIAH, tumpuk=True, mendatar=True),
-        _kolom(ws, f"Nasabah Tunai vs Total Anggota per Kantor — {label}",
-               [(kolom["tunai"], "Nasabah tunai"), (kolom["total_anggota"], "Total anggota")],
-               ktr, kantor, FMT_ORANG, mendatar=True),
-    ]
-    for i, c in enumerate(grafik):
-        g.add_chart(c, f"{JANGKAR_KOLOM[i % 2]}{3 + (i // 2) * BARIS_PER_TINGKAT}")
+    seri_indeks, nilai_indeks = _tulis_indeks(ws, judul_bulanan, bulanan, total_bulan)
+    dinamika = _garis(ws, "Dinamika Nasabah Tunai & Simpanan",
+                      seri_indeks, bln, bulanan, FMT_INDEKS)
+    dinamika.visible_cells_only = False     # datanya di kolom tersembunyi
+    dinamika.y_axis.title = "Indeks (bulan pertama = 100)"
+    if nilai_indeks:
+        # Sumbu dari dekat nilai terendah, bukan nol: yang dibaca di sini
+        # perubahan relatif, dan dari nol semua garis menumpuk di sekitar 100.
+        dinamika.y_axis.scaling.min = max(0, (min(nilai_indeks) // 10) * 10 - 10)
 
-    # Cetak: A4 tegak, dua grafik selebar satu halaman; tanpa ini grafik
-    # terpotong di tengah oleh batas halaman bawaan.
-    g.page_setup.paperSize = g.PAPERSIZE_A4
-    g.page_setup.orientation = "portrait"
-    g.sheet_properties.pageSetUpPr.fitToPage = True
-    g.page_setup.fitToWidth, g.page_setup.fitToHeight = 1, 0
+    grafik = {
+        "dinamika": dinamika,
+        "aktif": _kolom(ws, "Nasabah Aktif per Bulan", aktif, bln, bulanan, FMT_ORANG,
+                        tumpuk=True),
+        "setor": _kolom(ws, "Total Kontribusi vs Total Setor per Bulan",
+                        [(kolom["kontribusi"], "Total kontribusi"),
+                         (kolom["setor"], "Total setor")], bln, bulanan, FMT_RUPIAH),
+        "cad": _kolom(ws, "CAD Bulan Ini per Bulan", [(kolom["cad"], "CAD bulan ini")],
+                      bln, bulanan, FMT_RUPIAH),
+        "komposisi": _kolom(ws, f"Komposisi Simpanan per Kantor — {label}",
+                            [(kolom["wajib"], "Wajib"), (kolom["pokok"], "Pokok"),
+                             (kolom["sukarela"], "Sukarela")],
+                            ktr, kantor, FMT_RUPIAH, tumpuk=True, mendatar=True),
+        "tunai_anggota": _kolom(ws, f"Nasabah Tunai vs Total Anggota per Kantor — {label}",
+                                [(kolom["tunai"], "Nasabah tunai"),
+                                 (kolom["total_anggota"], "Total anggota")],
+                                ktr, kantor, FMT_ORANG, mendatar=True),
+    }
+
+    # Kolom 0-based: tabel A..kolom terakhir, dibelah dua di tengah.
+    akhir = max(column_index_from_string(h) for h in kolom.values())
+    tengah = 1 + (akhir - 1) // 2
+    for awal, ujung, nama in TINGKAT:
+        rentang = [(0, 0, akhir)] if len(nama) == 1 else [(0, 0, tengah), (tengah, JEDA_EMU, akhir)]
+        for n, (dari, geser, sampai) in zip(nama, rentang):
+            c = grafik[n]
+            c.anchor = TwoCellAnchor(
+                _from=AnchorMarker(col=dari, colOff=geser, row=baris_grafik - 1 + awal),
+                to=AnchorMarker(col=sampai, row=baris_grafik + ujung))
+            ws.add_chart(c)
+
+    # Cetak: A4 tegak selebar satu halaman — grafik di halaman pertama, tabel
+    # mulai di halaman baru supaya header-nya tidak terbelah.
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.orientation = "portrait"
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.page_setup.fitToWidth, ws.page_setup.fitToHeight = 1, 0
+    ws.row_breaks.append(Break(id=baris_grafik + BARIS_GRAFIK - 1))
 
 
 def _catatan(data_bulan: dict, kantor_template: dict, bulan: int, tahun: int) -> list:
