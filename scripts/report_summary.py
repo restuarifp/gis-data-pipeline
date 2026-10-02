@@ -170,12 +170,12 @@ WITH
       COUNT(*) FILTER (WHERE "Status_Aktivitas" = 'AM') AS pengurus_aktivitas_am,
       COUNT(*) FILTER (WHERE "Status_Aktivitas" = 'NA') AS pengurus_aktivitas_na
     FROM capil
-    WHERE "LMG" NOT LIKE 'PRA' AND "LMG" NOT LIKE 'PJ%%' AND "LMG" NOT LIKE 'KPJ%'
+    WHERE "LMG" NOT LIKE 'PRA' AND "LMG" NOT LIKE 'PJ%%' AND "LMG" NOT LIKE 'KPJ%%'
     GROUP BY kantor_id
   ),
   baris AS (
     SELECT kantor_id,
-      COUNT(DISTINCT "LMG") FILTER (WHERE "LMG" LIKE 'KPJ%') AS baris
+      COUNT(DISTINCT "LMG") FILTER (WHERE "LMG" LIKE 'KPJ%%') AS baris
     FROM capil
     GROUP BY kantor_id
   ),
@@ -189,7 +189,7 @@ WITH
       COUNT(*) FILTER (WHERE "Status_Aktivitas" = 'AM') AS anggota_aktivitas_am,
       COUNT(*) FILTER (WHERE "Status_Aktivitas" = 'NA') AS anggota_aktivitas_na
     FROM capil
-    WHERE "LMG" LIKE 'PRA' OR "LMG" LIKE 'PJ%%' OR "LMG" LIKE 'KPJ%'
+    WHERE "LMG" LIKE 'PRA' OR "LMG" LIKE 'PJ%%' OR "LMG" LIKE 'KPJ%%'
     GROUP BY kantor_id
   ),
   jenjang AS (
