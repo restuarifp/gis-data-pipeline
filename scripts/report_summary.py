@@ -25,7 +25,10 @@ dimulai (zona waktu REPORT_TIMEZONE). Konsekuensinya:
   * Kantor yang belum punya tarikan sebelum akhir bulan itu tidak punya data.
     Kantor yang tarikan terakhirnya jatuh di bulan sebelumnya memakai tarikan
     lama itu — keduanya disebut di catatan (log relay).
-  * DAKWAH HASIL tetap juga disaring Bln_Integrasi/Th_Integrasi = bulan itu.
+  * Pengecualian: DAKWAH HASIL (kolom X) dihitung dari tarikan capil
+    *terbaru*, disaring Bln_Integrasi/Th_Integrasi = bulan laporan. Yang
+    berintegrasi di bulan X biasanya baru diinput setelah bulan X lewat, jadi
+    potret akhir bulan hampir selalu berisi nol untuknya.
   * Baris "JUMLAH BULAN LALU" dan "SELISIH" diambil dari *arsip* laporan bulan
     sebelumnya (REPORT_HISTORY_DIR), bukan dari warehouse. Tiap laporan yang
     selesai dibangun menyimpan potretnya sendiri, jadi pembanding baru ada
@@ -143,7 +146,9 @@ def _potret(view: str) -> str:
 #  * sumbernya potret akhir bulan dari view riwayat (CTE capil/rekap/rincian),
 #    bukan staging yang hanya berisi tarikan terakhir;
 #  * CTE `rekrut` memakai parameter %(bulan)s / %(tahun)s alih-alih
-#    CURRENT_DATE - 1 bulan, supaya laporan bulan mana pun bisa diminta.
+#    CURRENT_DATE - 1 bulan, supaya laporan bulan mana pun bisa diminta. Ia
+#    membaca tarikan capil terbaru (CTE capil_terbaru), bukan potret akhir
+#    bulan — sama seperti Metabase yang membaca staging.
 SQL = f"""
 WITH
   capil   AS ({_potret(VIEW_CAPIL)}
@@ -151,6 +156,13 @@ WITH
   rekap   AS ({_potret(VIEW_REKAP)}
   ),
   rincian AS ({_potret(VIEW_RINCIAN)}
+  ),
+  capil_terbaru AS (
+    SELECT h.*
+    FROM {_q(VIEW_CAPIL)} h
+    JOIN (SELECT kantor_id, MAX(tarikan_id) AS tarikan_id
+          FROM {_q(VIEW_CAPIL)} GROUP BY kantor_id) p
+      ON p.kantor_id = h.kantor_id AND p.tarikan_id = h.tarikan_id
   ),
   -- Waktu tarikan yang terpakai, dalam jam lokal, untuk catatan di log.
   tarikan AS (
@@ -202,9 +214,9 @@ WITH
   ),
   rekrut AS (
     SELECT kantor_id, COUNT(*) AS rekrut
-    FROM capil
-    WHERE "Bln_Integrasi"::int = %(bulan)s
-      AND "Th_Integrasi"::int  = %(tahun)s
+    FROM capil_terbaru
+    WHERE NULLIF(trim("Bln_Integrasi"), '')::numeric::int = %(bulan)s
+      AND NULLIF(trim("Th_Integrasi"), '')::numeric::int  = %(tahun)s
     GROUP BY kantor_id
   ),
   total_tunai AS (

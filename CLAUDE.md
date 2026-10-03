@@ -176,7 +176,9 @@ and reply immediately; the finished `.xlsx` arrives as a Telegram document.
   (default Asia/Jakarta). This only works because every pull is appended —
   capil via Airbyte **Full refresh | Append** (switch one to Overwrite and its
   history is gone), finance via `excel-loader`, which always appends.
-  DAKWAH HASIL is additionally filtered on `Bln_Integrasi`/`Th_Integrasi`.
+  Exception: DAKWAH HASIL (`X`) counts the *latest* capil pull filtered on
+  `Bln_Integrasi`/`Th_Integrasi` = report month — integrations are entered after
+  the month ends, so the snapshot would always give 0.
   Offices falling back to an older pull, or with no finance pull yet, are
   noted in the relay log. History views discover offices from `sources.yml`,
   so a new office needs no new history model; `hist_finance_rincian` has no

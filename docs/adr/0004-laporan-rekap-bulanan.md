@@ -51,7 +51,7 @@ Append, jadi tabel raw menyimpan setiap tarikan. Laporan kini membaca view
 (`dbt/models/history/`, macro `hist_pulls`), yang menyimpan semua tarikan
 beserta `tarikan_id` dan `ditarik_pada`, lalu per kantor per sumber memilih
 tarikan terakhir sebelum tanggal 1 bulan berikutnya (`REPORT_TIMEZONE`, default
-Asia/Jakarta). DAKWAH HASIL tetap juga disaring `Bln_Integrasi`/`Th_Integrasi`.
+Asia/Jakarta). DAKWAH HASIL dikecualikan: dihitung dari tarikan capil *terbaru* yang disaring `Bln_Integrasi`/`Th_Integrasi` = bulan laporan, karena integrasi baru diinput setelah bulannya lewat (potret akhir bulan selalu nol).
 
 Ini keputusan yang sadar dibuat di sisi dbt, bukan query ke raw dari relay:
 aturan staging (mis. `K IS NOT NULL`) cukup ditulis di satu tempat per lapisan.
