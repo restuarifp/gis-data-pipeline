@@ -146,8 +146,8 @@ The **Relay Notifikasi** (see `CONTEXT.md`): a tiny stdlib-only HTTP server that
 - **Mini App auth**: every `/api/*` call re-verifies the `initData` HMAC against the bot token (`hash` and `signature` excluded from the data-check string) *and* that the user is either listed in `TELEGRAM_DM_USER_IDS` (no round-trip needed — the id was written by hand in `.env`) or a member of `TELEGRAM_CHAT_ID` via `getChatMember` (cached 5 min, fail-closed). There is no session or cookie — `initData` is the credential, and `MINI_APP_AUTH_MAX_AGE` (default 24h) caps its life. The page never validates `sources`/`select` itself; it forwards them and shows the control server's 400 (same rule as the text bot).
 - **Mini App needs a public HTTPS URL.** Telegram refuses `http://`, so `MINI_APP_URL` must point at a reverse proxy/tunnel that forwards to `/app`; empty = feature off. `web_app` buttons are private-chat-only, so in the group `/app` uses a direct link (`MINI_APP_DIRECT_LINK`, from BotFather `/newapp`). That's also why `/start`, `/app`, `/help` are answered in DMs — for group members only, and only to open the panel.
 - Actions taken from the panel are announced to the group ("dimulai oleh @siapa lewat Mini App"); completion is still reported only by `watch_jobs()`.
-- **Laporan Rekap Bulanan** (`docs/adr/0004-laporan-rekap-bulanan.md`, builder in `scripts/report_summary.py`): `/laporan [MM-YYYY]` and the Mini App's *laporan* tab query the warehouse directly, fill `docs/template/summary.xlsx`, and push the result to Telegram with `sendDocument`. The only text sent
-alongside it is one line naming who asked; everything else goes to the log. See
+- **Laporan Rekap Bulanan** (`docs/adr/0004-laporan-rekap-bulanan.md`, builder in `scripts/report_summary.py`): `/laporan [MM-YYYY]` and the Mini App's *laporan* tab query the warehouse directly, fill `docs/template/summary.xlsx`, and push the result to Telegram with `sendDocument`. The file is sent
+with no caption (who asked is only logged); everything else goes to the log. See
 the section below.
 
 ### Laporan Rekap Bulanan (`scripts/report_summary.py`)
@@ -218,7 +218,7 @@ and reply immediately; the finished `.xlsx` arrives as a Telegram document.
 
 `/keuangan [MM-YYYY]` and the *Laporan keuangan* button in the Mini App's laporan tab
 (`POST /api/report {"jenis": "keuangan"}`) fill `docs/template/monthly-finance-report.xlsx`
-and send it with `sendDocument`. Delivery, password, locking and the one-line caption are
+and send it with `sendDocument`. Delivery, password, locking and the empty caption are
 shared with the Rekap Bulanan (`LAPORAN` in `notif_relay.py` maps `jenis` → builder module;
 a builder needs `laporan_aktif()` and `bangun_laporan(bulan, tahun)`).
 

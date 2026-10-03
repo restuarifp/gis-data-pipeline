@@ -694,11 +694,11 @@ def pasang_menu_button() -> None:
 # server; laporan tidak punya control server, jadi kuncinya di sini.
 _kunci_laporan = threading.Lock()
 
-# Jenis laporan → (modul pembangun, caption). Modulnya memenuhi kontrak yang
-# sama: laporan_aktif() dan bangun_laporan(bulan, tahun) → (isi, nama, catatan).
+# Jenis laporan → modul pembangun. Modulnya memenuhi kontrak yang sama:
+# laporan_aktif() dan bangun_laporan(bulan, tahun) → (isi, nama, catatan).
 LAPORAN = {
-    "rekap":    (report_summary, "Berikut summary excel yang di-request oleh {oleh}"),
-    "keuangan": (report_finance, "Berikut laporan keuangan yang di-request oleh {oleh}"),
+    "rekap":    report_summary,
+    "keuangan": report_finance,
 }
 
 
@@ -735,7 +735,7 @@ def buat_dan_kirim_laporan(bulan: int, tahun: int, oleh: str, tujuan: list,
             send_telegram("⏳ Laporan lain masih disusun; coba lagi sebentar.", chat)
         return
     try:
-        modul, caption = LAPORAN[jenis]
+        modul = LAPORAN[jenis]
         isi, nama_file, catatan = modul.bangun_laporan(bulan, tahun)
     except report_summary.ReportError as exc:
         log.warning("Laporan %s-%s gagal: %s", bulan, tahun, exc)
@@ -750,10 +750,11 @@ def buat_dan_kirim_laporan(bulan: int, tahun: int, oleh: str, tujuan: list,
     finally:
         _kunci_laporan.release()
 
-    # Satu kalimat saja — sisanya sudah terbaca dari file itu sendiri.
-    caption = caption.format(oleh=html.escape(oleh))
+    # Filenya dikirim tanpa caption — isinya sudah menjelaskan diri sendiri.
+    # Pemesannya cukup tercatat di log.
+    log.info("Laporan %s %s-%s diminta oleh %s.", jenis, bulan, tahun, oleh)
     for chat in tujuan:
-        kirim_dokumen(nama_file, isi, caption, chat)
+        kirim_dokumen(nama_file, isi, chat_id=chat)
 
     # Catatan (kantor tanpa baris di template, arsip gagal ditulis) sengaja
     # tidak lagi ikut ke Telegram — pesannya harus bersih. Tetap ditulis ke log
@@ -772,7 +773,7 @@ def _tujuan_laporan(chat_id) -> list:
 
 def kirim_laporan(args: list, message: dict, chat_id, reply_to,
                   jenis: str = "rekap") -> None:
-    bisa, alasan = LAPORAN[jenis][0].laporan_aktif()
+    bisa, alasan = LAPORAN[jenis].laporan_aktif()
     if not bisa:
         send_telegram(f"⚠️ Laporan belum bisa dipakai: {html.escape(alasan)}",
                       chat_id, reply_to)
@@ -884,7 +885,7 @@ def api_report(body: dict, user: dict) -> dict:
     jenis = str(body.get("jenis") or "rekap").lower()
     if jenis not in LAPORAN:
         raise WebAppError(f"jenis laporan tidak dikenal: {jenis}", 400)
-    bisa, alasan = LAPORAN[jenis][0].laporan_aktif()
+    bisa, alasan = LAPORAN[jenis].laporan_aktif()
     if not bisa:
         raise WebAppError(alasan, 400)
 
