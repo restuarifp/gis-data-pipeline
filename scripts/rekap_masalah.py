@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-rekap_masalah.py — rekap hasil pengecekan file Excel keuangan, dalam bahasa sehari-hari
+rekap_masalah.py — rekap hasil pengecekan file Excel (keuangan / capil), dalam bahasa sehari-hari
 
-Mengubah last_result excel-loader (lihat excel_loader.process_source) menjadi
+Mengubah last_result excel-loader atau capil-loader (lihat
+excel_loader.process_source; `dataset` di hasilnya menentukan istilahnya) menjadi
 SATU pesan Telegram untuk semua kantor: siapa yang datanya masuk, siapa yang
 ditolak, dan untuk yang ditolak — sel mana yang salah dan cara membetulkannya.
 
@@ -31,8 +32,27 @@ BATAS_PESAN = 3900          # batas Telegram 4096, sisakan ruang untuk tag HTML
 CONTOH_SEL_PER_JENIS = 5    # sel "bukan angka" yang ditulis satu per satu per sheet
 
 # Jenis masalah yang bukan kesalahan pengisi file.
-JENIS_SISTEM = {"folder_gagal", "unduh_gagal", "gagal_simpan",
+JENIS_SISTEM = {"folder_gagal", "unduh_gagal", "gagal_simpan", "kontrak_gagal",
                 "nama_kantor_tidak_valid", "kantor_di_luar_pola"}
+
+# Istilah per dataset (hasil["dataset"] dari loader; hasil lama tanpa field itu = finance).
+ISTILAH = {
+    "finance": {"data": "data keuangan", "koneksi": "finance"},
+    "capil":   {"data": "data capil",    "koneksi": "capil"},
+}
+
+
+def _istilah(hasil: dict) -> dict:
+    return ISTILAH.get(hasil.get("dataset") or "finance", ISTILAH["finance"])
+
+
+def _sheet_dibaca(hasil: dict) -> str:
+    """'REKAP dan RINCIAN' / 'DATA' / 'sheet pertama' — untuk catatan sheet tak dikenal."""
+    nama = hasil.get("sheet_dibaca") or ([] if hasil.get("dataset") == "capil"
+                                         else ["REKAP", "RINCIAN"])
+    if not nama:
+        return "sheet pertama"
+    return " dan ".join(_c(x) for x in nama)
 
 
 def _e(v) -> str:
@@ -94,6 +114,13 @@ def _kalimat_galat(kelompok: dict, sheet_lain: list) -> list:
     `sheet_lain` = sheet tak dikenal di kantor ini, petunjuk sheet yang diganti nama.
     """
     out = []
+    for m in kelompok.get("file_hilang", []):
+        kalimat = (f"File {_c(m.get('file'))} tidak ditemukan di folder kantor ini. "
+                   f"Nama file harus persis {_c(m.get('file'))}.")
+        if m.get("detail"):
+            kalimat += (f" Ada file lain: {_e(m['detail'])} — kalau salah satunya yang "
+                        f"dimaksud, ganti namanya jadi {_c(m.get('file'))}.")
+        out.append(kalimat)
     for m in kelompok.get("file_rusak", []):
         out.append(f"File {_c(m.get('file'))} tidak bisa dibuka — mungkin rusak atau "
                    f"bukan file Excel (.xlsx) asli. Buka lalu simpan ulang sebagai .xlsx.")
@@ -164,15 +191,16 @@ def _kalimat_sistem(m: dict) -> str:
         "folder_gagal": "folder di Nextcloud tidak bisa dibaca",
         "unduh_gagal": f"file {_c(m.get('file', ''))} gagal diunduh dari Nextcloud",
         "gagal_simpan": "data sudah benar tapi gagal disimpan ke database",
+        "kontrak_gagal": "susunan kolom tabel capil di database tidak bisa dibaca",
         "nama_kantor_tidak_valid": "nama folder kantor tidak bisa dipakai",
         "kantor_di_luar_pola": "kode kantor di luar pola A1/B2/…, tidak ikut model riwayat dbt",
     }.get(m["jenis"], _e(m["jenis"]))
     return teks + (_kutip(m["detail"]) if m.get("detail") else "")
 
 
-def _kalimat_catatan(m: dict) -> str:
+def _kalimat_catatan(m: dict, hasil: dict) -> str:
     if m["jenis"] == "sheet_tak_dikenal":
-        return f"sheet {_c(m.get('sheet'))} tidak dibaca (yang dibaca hanya REKAP dan RINCIAN)"
+        return f"sheet {_c(m.get('sheet'))} tidak dibaca (yang dibaca hanya {_sheet_dibaca(hasil)})"
     if m["jenis"] == "kolom_tambahan":
         return (f"sheet {_c(m.get('sheet'))}: kolom tambahan tidak dibaca "
                 f"({', '.join(_c(_kolom(k)) for k in str(m.get('kolom', '')).split(', '))})")
@@ -220,7 +248,8 @@ def susun(hasil: dict, durasi: str = "", diulang: bool = False) -> str:
             tetap.append(k)
 
     judul = "⚠️" if (ditolak or hasil.get("error")) else "✅"
-    kepala = [f"{judul} <b>Rekap pengecekan data keuangan</b>"]
+    istilah = _istilah(hasil)
+    kepala = [f"{judul} <b>Rekap pengecekan {istilah['data']}</b>"]
     info = [datetime.now(ZONA).strftime("%d/%m %H:%M")]
     if kantor:
         info.append(f"{len(kantor)} kantor diperiksa")
@@ -266,7 +295,7 @@ def susun(hasil: dict, durasi: str = "", diulang: bool = False) -> str:
             elif m["jenis"] == "sheet_tak_dikenal" and ada_sheet_hilang:
                 continue  # sudah disebut di kalimat "sheet tidak ada"
             elif not m.get("galat"):
-                catatan.append(f"<b>{_e(nama)}</b>: {_kalimat_catatan(m)}")
+                catatan.append(f"<b>{_e(nama)}</b>: {_kalimat_catatan(m, hasil)}")
             else:
                 if m["jenis"] == "sheet_hilang":
                     tempat = (None, None)  # hilang dari semua file, bukan dari satu tempat
@@ -289,9 +318,9 @@ def susun(hasil: dict, durasi: str = "", diulang: bool = False) -> str:
     if sistem:
         badan += ["", "⚙️ <b>Masalah sistem</b> (untuk admin)"] + [f"• {x}" for x in sistem]
     if airbyte:
-        badan += ["", "⚠️ <b>Airbyte masih mengisi data keuangan</b> "
+        badan += ["", f"⚠️ <b>Airbyte masih mengisi {istilah['data']}</b> "
                   f"{_e(', '.join(airbyte))} — matikan (disable, jangan reset) koneksi Airbyte "
-                  "finance kantor tersebut."]
+                  f"{istilah['koneksi']} kantor tersebut."]
     if catatan:
         badan += ["", "ℹ️ <b>Catatan</b> (data tetap dimasukkan)"] + [f"• {x}" for x in catatan]
 

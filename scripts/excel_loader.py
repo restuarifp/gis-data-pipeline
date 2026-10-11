@@ -2,18 +2,23 @@
 """
 excel_loader.py
 
-Mengambil file .xlsx finance dari folder sumber di Nextcloud (via WebDAV),
-membaca sheet REKAP dan RINCIAN, lalu menyimpannya LANGSUNG ke PostgreSQL —
-menggantikan jalur lama split_excel.py → upload per-sheet → Airbyte.
-Lihat docs/adr/0005-loader-excel-langsung-ke-postgres.md.
+Mengambil file .xlsx dari folder sumber di Nextcloud (via WebDAV), membaca
+sheet yang dikenal kontraknya, lalu menyimpannya LANGSUNG ke PostgreSQL —
+menggantikan Airbyte. Satu image, dua dataset (LOADER_DATASET):
 
-Tabel tujuan (sama persis dengan yang dulu ditulis Airbyte, supaya dbt,
-hist_* dan Laporan Rekap Bulanan tidak perlu berubah):
-  sheet REKAP   -> raw_finance_rekap_<kantor_id>
-  sheet RINCIAN -> raw_finance_rincian_<kantor_id>
+  finance (default, service excel-loader) — docs/adr/0005
+    <Kantor>/Finance/*.xlsx, sheet REKAP   -> raw_finance_rekap_<kantor_id>
+                             sheet RINCIAN -> raw_finance_rincian_<kantor_id>
+    kantor_id = komponen path tepat di atas 'Finance': .../A1/Finance -> a1.
 
-  kantor_id diambil dari komponen path tepat di atas subfolder 'Finance'
-  (lihat _kantor_name), di-lowercase: .../A1/Finance -> a1.
+  capil (service capil-loader) — docs/adr/0006
+    <Kantor>/data.xlsx (CAPIL_FILE), satu sheet     -> raw_<kantor_id>
+    kantor_id = komponen path terakhir: .../A1 -> a1.
+    Kolomnya tidak ditulis di kode: kontraknya dibaca dari tabel raw kantor itu
+    (bentuk buatan Airbyte), atau dari tabel capil kantor lain untuk kantor baru.
+
+Tabel tujuan sama persis dengan yang dulu ditulis Airbyte, supaya dbt, hist_*
+dan Laporan Rekap Bulanan tidak perlu berubah.
 
 Setiap muatan adalah satu "tarikan" gaya Airbyte mode Append: baris baru dengan
 _airbyte_generation_id = MAX + 1, bukan menimpa. Kolom _airbyte_* sengaja
@@ -24,12 +29,13 @@ Mode:
   python excel_loader.py           -- jalankan sekali lalu keluar
   python excel_loader.py A2/Finance [B1/Finance ...]
                                    -- jalankan sekali untuk folder tertentu saja
+                                      (capil: python excel_loader.py A2 B1)
   python excel_loader.py --watch   -- loop berkala (SCHEDULE_INTERVAL_MINUTES)
   python excel_loader.py --serve   -- server kontrol HTTP (job_control) di gisnet,
                                       dipakai bot Telegram untuk memicu run
 
 Path sumber:
-  NEXTCLOUD_SOURCE_PATHS relatif terhadap NEXTCLOUD_SOURCE_HOME (bila di-set),
+  NEXTCLOUD_SOURCE_PATHS (finance) / CAPIL_SOURCE_PATHS (capil) relatif terhadap NEXTCLOUD_SOURCE_HOME (bila di-set),
   sehingga prefix panjang tidak perlu diulang di tiap entri. Lihat resolve_source().
 """
 
@@ -99,6 +105,23 @@ TIMEZONE = os.getenv("LOAD_TIMEZONE") or os.getenv("REPORT_TIMEZONE") or "Asia/J
 # tarikan Airbyte lama, dan dipakai untuk mendeteksi Airbyte yang masih aktif.
 PENANDA_LOADER = "excel-loader"
 
+# Dataset yang dimuat container ini. Dua service, satu image: excel-loader
+# (finance, perintah /load) dan capil-loader (capil, perintah /sync) — masing-
+# masing punya server kontrol, lock, dan log sendiri.
+LOADER_DATASET = os.getenv("LOADER_DATASET", "finance").strip().lower() or "finance"
+if LOADER_DATASET not in ("finance", "capil"):
+    raise ValueError(f"LOADER_DATASET={LOADER_DATASET!r} tidak dikenal (finance | capil)")
+CAPIL = LOADER_DATASET == "capil"
+
+# Capil: satu file per kantor di folder kantornya, berdampingan dengan file lain
+# yang bukan urusan loader — karena itu hanya file bernama ini yang dibaca.
+CAPIL_FILE  = os.getenv("CAPIL_FILE", "data.xlsx").strip() or "data.xlsx"
+# Kosong = sheet pertama workbook. Diisi = sheet bernama ini (tak peka huruf besar).
+CAPIL_SHEET = os.getenv("CAPIL_SHEET", "").strip()
+# Tabel yang bentuknya ditiru untuk kantor capil baru; kosong = tabel capil
+# pertama yang ada (raw_a1, raw_a2, …).
+CAPIL_TABEL_ACUAN = os.getenv("CAPIL_TABEL_ACUAN", "").strip()
+
 if os.getenv("NEXTCLOUD_DEST_PATH", "").strip():
     # Dulu wajib (folder hasil split). Tidak dipakai lagi; bukan error supaya
     # .env lama tetap jalan, tapi disebut supaya tidak dikira masih berpengaruh.
@@ -159,7 +182,16 @@ _raw_sources = (
     or os.environ.get("NEXTCLOUD_SOURCE_PATH")
     or ""
 )
-if not _raw_sources:
+if CAPIL:
+    # Folder kantor. Kosong = induk dari setiap folder finance (A1/Finance -> A1),
+    # karena data.xlsx tinggal satu tingkat di atas folder Finance.
+    _raw_sources = os.environ.get("CAPIL_SOURCE_PATHS", "").strip() or ",".join(
+        re.sub(r"(?i)/+finance/*$", "", p.strip()) for p in re.split(r"[,\n]", _raw_sources)
+        if p.strip()
+    )
+    if not _raw_sources:
+        raise ValueError("Set CAPIL_SOURCE_PATHS (atau NEXTCLOUD_SOURCE_PATHS) di .env")
+elif not _raw_sources:
     raise ValueError("Set NEXTCLOUD_SOURCE_PATHS (atau NEXTCLOUD_SOURCE_PATH) di .env")
 
 print(f"[excel-loader] RAW SOURCE: {repr(_raw_sources)}", flush=True)
@@ -200,7 +232,7 @@ SESSION.headers.update({"Content-Type": "application/xml; charset=utf-8"})
 
 JENIS_FINANCE = ["FI", "ZF", "AQQ", "FDY", "IFQ", "LQT", "SDQ", "SNK", "TDY", "ZKT"]
 
-DATASETS = {
+KONTRAK_FINANCE = {
     "REKAP": {
         "tabel": "raw_finance_rekap_{kantor}",
         "teks":  ["JENIS"],
@@ -212,6 +244,16 @@ DATASETS = {
         "angka": [f"{p}_{j}" for p in ("TUNAI", "NOMINAL") for j in JENIS_FINANCE],
     },
 }
+
+# Capil: ±50 kolom teks yang namanya buatan Airbyte (huruf besar-kecil campur,
+# mis. "Alamat_Negara", "No_" dari judul "No."). Daftarnya TIDAK ditulis di sini:
+# _kontrak_capil() membacanya dari tabel raw di database, persis dengan urutan
+# kolomnya. Urutan itu penting — stg_*_capil memakai dbt_utils.star() dan
+# mart_capil menggabungkan semua kantor dengan UNION ALL berdasarkan posisi.
+KONTRAK_CAPIL = {"CAPIL": {"tabel": "raw_{kantor}", "teks": None, "angka": []}}
+
+DATASETS = KONTRAK_CAPIL if CAPIL else KONTRAK_FINANCE
+POLA_TABEL_CAPIL = re.compile(r"^raw_[a-z][0-9]+$")
 
 # kantor_id harus aman jadi bagian nama tabel. Pola dbt (hist_pulls) lebih
 # sempit — '[a-z][0-9]+' — kantor di luar pola itu tetap dimuat tapi diberi
@@ -307,6 +349,15 @@ def _nama_kolom(header) -> str:
     return re.sub(r"\W+", "_", str(header).strip()).strip("_").upper()
 
 
+def _lipat(nama) -> str:
+    """
+    Kunci pencocokan judul kolom dengan nama kolom kontrak, tak peka huruf besar
+    dan tanda baca: 'No.' / 'No_' -> 'no', 'TUNAI IFQ' / 'TUNAI_IFQ' -> 'tunai_ifq'.
+    Yang ditulis ke database tetap nama kanonik dari kontrak.
+    """
+    return re.sub(r"\W+", "_", str(nama).strip()).strip("_").lower()
+
+
 def _ke_angka(nilai):
     """Nilai sel -> Decimal, None untuk sel kosong. ValueError kalau bukan angka."""
     if nilai is None:
@@ -381,18 +432,22 @@ def baca_sheet(ws_nilai, ws_rumus, kontrak: dict) -> tuple[list[dict], list[dict
     if not header or all(h is None or not str(h).strip() for h in header):
         return [], [_masalah("sheet_kosong")]
 
+    wajib = kontrak["teks"] + kontrak["angka"]
+    kanonik = {_lipat(k): k for k in wajib}
+
     posisi: dict[str, int] = {}
     for i, h in enumerate(header):
         if h is None or not str(h).strip():
             continue
-        nama = _nama_kolom(h)
+        # Judul di luar kontrak: capil ditulis seperti di file (namanya campur
+        # huruf besar-kecil), finance dinormalisasi seperti sebelumnya.
+        nama = kanonik.get(_lipat(h)) or (str(h).strip() if CAPIL else _nama_kolom(h))
         if nama in posisi:
             masalah.append(_masalah("kolom_ganda", kolom=nama,
                                     sel=f"{get_column_letter(i + 1)}1"))
             continue
         posisi[nama] = i
 
-    wajib = kontrak["teks"] + kontrak["angka"]
     for k in wajib:
         if k not in posisi:
             masalah.append(_masalah("kolom_hilang", kolom=k))
@@ -452,10 +507,25 @@ def _sidik(baris: list[dict]) -> str:
     return hashlib.sha256(kanonik.encode("utf-8")).hexdigest()
 
 
-def baca_workbook(isi: bytes) -> tuple[dict, list[dict]]:
+def _kunci_sheet(nama: str, urutan: int):
+    """Sheet ini dimuat sebagai dataset apa? None = bukan urusan kontrak."""
+    if not CAPIL:
+        kunci = nama.strip().upper()
+        return kunci if kunci in DATASETS else None
+    if CAPIL_SHEET:
+        return "CAPIL" if nama.strip().upper() == CAPIL_SHEET.upper() else None
+    return "CAPIL" if urutan == 0 else None
+
+
+def nama_sheet(kunci: str) -> str:
+    """Nama sheet yang diharapkan untuk satu kunci dataset (untuk pesan sheet_hilang)."""
+    return CAPIL_SHEET if CAPIL and CAPIL_SHEET else kunci
+
+
+def baca_workbook(isi: bytes, kontrak: dict) -> tuple[dict, list[dict]]:
     """
-    Baca semua sheet yang dikenal kontrak.
-    Kembalikan ({NAMA_SHEET: baris}, masalah) — setiap masalah sudah membawa
+    Baca semua sheet yang dikenal kontrak ({kunci: kontrak sheet}).
+    Kembalikan ({KUNCI: baris}, masalah) — setiap masalah sudah membawa
     nama sheet-nya. Sheet lain diabaikan dengan catatan. File yang tidak bisa
     dibuka sama sekali melempar exception.
     """
@@ -464,15 +534,15 @@ def baca_workbook(isi: bytes) -> tuple[dict, list[dict]]:
     hasil: dict[str, list[dict]] = {}
     masalah: list[dict] = []
     try:
-        for nama in wb_nilai.sheetnames:
-            kunci = nama.strip().upper()
-            if kunci not in DATASETS:
+        for urutan, nama in enumerate(wb_nilai.sheetnames):
+            kunci = _kunci_sheet(nama, urutan)
+            if kunci is None:
                 masalah.append(_masalah("sheet_tak_dikenal", galat=False, sheet=nama))
                 continue
             if kunci in hasil:
                 masalah.append(_masalah("sheet_ganda", sheet=nama))
                 continue
-            baris, temuan = baca_sheet(wb_nilai[nama], wb_rumus[nama], DATASETS[kunci])
+            baris, temuan = baca_sheet(wb_nilai[nama], wb_rumus[nama], kontrak[kunci])
             hasil[kunci] = baris
             masalah += [{**m, "sheet": nama} for m in temuan]
     finally:
@@ -487,9 +557,16 @@ def _pastikan_tabel(cur, tabel: str, kontrak: dict) -> None:
     """
     Buat tabel raw kalau belum ada, dengan bentuk yang sama dengan buatan Airbyte.
     Kantor baru jadi tidak butuh koneksi Airbyte — cukup foldernya di
-    NEXTCLOUD_SOURCE_PATHS dan tabelnya di dbt sources.yml.
+    NEXTCLOUD_SOURCE_PATHS / CAPIL_SOURCE_PATHS dan tabelnya di dbt sources.yml.
+
+    Kontrak capil membawa `acuan`: tabel kantor lain yang ditiru utuh (LIKE),
+    supaya urutan kolomnya sama dan UNION ALL di mart_capil tetap cocok.
     """
     ident = sql.Identifier(DB_SCHEMA, tabel)
+    if kontrak.get("acuan"):
+        cur.execute(sql.SQL("CREATE TABLE IF NOT EXISTS {} (LIKE {})").format(
+            ident, sql.Identifier(DB_SCHEMA, kontrak["acuan"])))
+        return
     kolom = [sql.SQL("{} character varying").format(sql.Identifier(k)) for k in kontrak["teks"]]
     kolom += [sql.SQL("{} numeric").format(sql.Identifier(k)) for k in kontrak["angka"]]
     cur.execute(sql.SQL("""
@@ -547,7 +624,7 @@ def _muat_dataset(cur, tabel: str, kontrak: dict, baris: list[dict], meta: dict)
         # bisa lebih kecil dari milik loader dan tarikannya jadi tak terlihat.
         ringkasan["airbyte_aktif"] = True
         log.warning("    ⚠ %s: %d baris baru dari Airbyte setelah muatan loader — "
-                    "matikan koneksi Airbyte finance kantor ini.", tabel, baris_airbyte)
+                    "matikan koneksi Airbyte %s kantor ini.", tabel, baris_airbyte, LOADER_DATASET)
 
     if sidik_akhir == meta["sha256"] and bulan_sama:
         ringkasan["status"] = "tidak berubah"
@@ -577,6 +654,54 @@ def _muat_dataset(cur, tabel: str, kontrak: dict, baris: list[dict], meta: dict)
     return ringkasan
 
 
+# Tipe kolom raw yang diperlakukan sebagai angka; selain ini dibaca sebagai teks.
+TIPE_ANGKA = {"numeric", "bigint", "integer", "smallint", "double precision", "real"}
+
+
+def _kolom_tabel(cur, tabel: str) -> list[tuple[str, str]]:
+    """Kolom data (tanpa _airbyte_*) suatu tabel, urut posisi. Kosong = tabel tidak ada."""
+    cur.execute("""
+        SELECT column_name, data_type FROM information_schema.columns
+         WHERE table_schema = %s AND table_name = %s
+           AND column_name NOT LIKE '\\_airbyte\\_%%'
+         ORDER BY ordinal_position""", (DB_SCHEMA, tabel))
+    return cur.fetchall()
+
+
+def _kontrak_capil(conn, tabel: str) -> dict:
+    """
+    Kontrak sheet capil untuk satu kantor, dibaca dari database.
+
+    Tabel kantor itu sudah ada (dibuat Airbyte dulu) -> kolomnya itulah kontraknya,
+    persis nama dan urutannya. Belum ada (kantor baru) -> tiru tabel capil kantor
+    lain (CAPIL_TABEL_ACUAN, atau yang pertama ditemukan). Melempar LookupError
+    kalau tidak ada satu pun tabel capil untuk ditiru.
+    """
+    with conn, conn.cursor() as cur:
+        kolom, acuan = _kolom_tabel(cur, tabel), None
+        if not kolom:
+            if CAPIL_TABEL_ACUAN:
+                calon = [CAPIL_TABEL_ACUAN]
+            else:
+                cur.execute("SELECT table_name FROM information_schema.tables "
+                            "WHERE table_schema = %s ORDER BY table_name", (DB_SCHEMA,))
+                calon = [t for (t,) in cur.fetchall() if POLA_TABEL_CAPIL.match(t)]
+            for t in calon:
+                kolom = _kolom_tabel(cur, t)
+                if kolom:
+                    acuan = t
+                    break
+    if not kolom:
+        raise LookupError(f"tabel {tabel} belum ada dan tidak ada tabel capil lain "
+                          f"di schema {DB_SCHEMA} untuk ditiru bentuknya")
+    return {"CAPIL": {
+        "tabel": KONTRAK_CAPIL["CAPIL"]["tabel"],
+        "teks":  [k for k, tipe in kolom if tipe not in TIPE_ANGKA],
+        "angka": [k for k, tipe in kolom if tipe in TIPE_ANGKA],
+        "acuan": acuan,
+    }}
+
+
 # ── Proses utama ────────────────────────────────────────────────────────────
 
 def _kantor_name(source_path: str) -> str:
@@ -586,7 +711,7 @@ def _kantor_name(source_path: str) -> str:
     Struktur folder: <nama kantor>/Finance/finance.xlsx — folder yang di-scan
     adalah <nama kantor>/Finance, sehingga nama kantor = komponen tepat DI ATAS
     subfolder 'Finance'. Jika komponen terakhir bukan 'Finance', komponen
-    terakhir dipakai apa adanya.
+    terakhir dipakai apa adanya — itulah kasus capil (<nama kantor>/data.xlsx).
     """
     parts = [p for p in source_path.strip("/").split("/") if p]
     if not parts:
@@ -617,7 +742,7 @@ def _tolak(hasil: dict) -> dict:
 
 def process_source(conn, source_path: str) -> dict:
     """
-    Muat semua sheet finance dari satu folder sumber dalam SATU transaksi.
+    Muat semua sheet dataset ini dari satu folder sumber dalam SATU transaksi.
 
     Semua-atau-tidak-sama-sekali per kantor: kalau satu sheet bermasalah atau
     gagal ditulis, tidak ada tabel kantor itu yang berubah — sama dengan aturan
@@ -645,9 +770,27 @@ def process_source(conn, source_path: str) -> dict:
         catat(_masalah("folder_gagal", sistem=True, detail=str(exc)[:300]))
         return _tolak(hasil)
 
-    if not files:
-        catat(_masalah("folder_kosong"))
-        return _tolak(hasil)
+    if CAPIL:
+        # Folder kantor berisi file lain juga; yang dibaca hanya CAPIL_FILE.
+        cocok = [f for f in files if f.lower() == CAPIL_FILE.lower()]
+        if not cocok:
+            catat(_masalah("file_hilang", file=CAPIL_FILE,
+                           detail=", ".join(files[:10]) or None))
+            return _tolak(hasil)
+        files = cocok[:1]
+        tabel = DATASETS["CAPIL"]["tabel"].format(kantor=kantor_id)
+        try:
+            kontrak = _kontrak_capil(conn, tabel)
+        except Exception as exc:
+            catat(_masalah("kontrak_gagal", sistem=True, detail=str(exc)[:300]))
+            return _tolak(hasil)
+        if kontrak["CAPIL"]["acuan"]:
+            log.info("  %s belum ada — dibuat meniru %s.", tabel, kontrak["CAPIL"]["acuan"])
+    else:
+        kontrak = DATASETS
+        if not files:
+            catat(_masalah("folder_kosong"))
+            return _tolak(hasil)
     log.info("  Ditemukan %d file: %s", len(files), files)
 
     # Baca & periksa semuanya dulu, baru buka transaksi.
@@ -662,7 +805,7 @@ def process_source(conn, source_path: str) -> dict:
             ada_file_rusak = True
             continue
         try:
-            sheets, temuan = baca_workbook(isi)
+            sheets, temuan = baca_workbook(isi, kontrak)
         except Exception as exc:
             log.error("    ✗ Gagal membuka %s: %s: %s", filename, type(exc).__name__, exc)
             catat(_masalah("file_rusak", file=filename, detail=str(exc)[:300]))
@@ -685,7 +828,7 @@ def process_source(conn, source_path: str) -> dict:
     if not ada_file_rusak:
         for kunci in DATASETS:
             if kunci not in data:
-                catat(_masalah("sheet_hilang", sheet=kunci))
+                catat(_masalah("sheet_hilang", sheet=nama_sheet(kunci)))
 
     for m in hasil["masalah"]:
         _log_masalah(m)
@@ -696,8 +839,8 @@ def process_source(conn, source_path: str) -> dict:
         with conn:  # commit bila sukses, rollback bila ada exception
             with conn.cursor() as cur:
                 for kunci, (baris, meta) in data.items():
-                    tabel = DATASETS[kunci]["tabel"].format(kantor=kantor_id)
-                    r = _muat_dataset(cur, tabel, DATASETS[kunci], baris, meta)
+                    tabel = kontrak[kunci]["tabel"].format(kantor=kantor_id)
+                    r = _muat_dataset(cur, tabel, kontrak[kunci], baris, meta)
                     hasil["tabel"].append(r)
                     log.info("    %s %s: %s (%d baris, tarikan #%s)",
                              "✓" if r["status"] == "dimuat" else "=",
@@ -724,7 +867,7 @@ def run_once(sources: list[str] | None = None) -> dict:
     """
     targets = sources or SOURCE_PATHS
 
-    log.info("=== Mulai run excel-loader ===")
+    log.info("=== Mulai run excel-loader (%s) ===", LOADER_DATASET)
     log.info("  Tujuan  : %s@%s/%s (schema %s)", DB["user"], DB["host"], DB["dbname"], DB_SCHEMA)
     log.info("  Sumber  : %d folder%s", len(targets), " (dipilih manual)" if sources else "")
     for i, p in enumerate(targets, 1):
@@ -734,8 +877,8 @@ def run_once(sources: list[str] | None = None) -> dict:
         conn = psycopg2.connect(connect_timeout=15, **DB)
     except Exception as exc:
         log.error("Gagal konek ke database: %s", exc)
-        return {"ok": False, "error": f"gagal konek ke database: {str(exc)[:300]}",
-                "kantor": []}
+        return {"ok": False, "dataset": LOADER_DATASET,
+                "error": f"gagal konek ke database: {str(exc)[:300]}", "kantor": []}
 
     try:
         ringkasan = [process_source(conn, s) for s in targets]
@@ -747,7 +890,10 @@ def run_once(sources: list[str] | None = None) -> dict:
         log.info("=== Run selesai (semua sukses) ===")
     else:
         log.error("=== Run selesai DENGAN KEGAGALAN — lihat error di atas ===")
-    return {"ok": ok, "kantor": ringkasan}
+    return {"ok": ok, "dataset": LOADER_DATASET,
+            # Nama sheet yang dibaca, untuk kalimat rekap; [] = sheet pertama.
+            "sheet_dibaca": [nama_sheet(k) for k in DATASETS] if not CAPIL or CAPIL_SHEET else [],
+            "kantor": ringkasan}
 
 
 def validate_params(params: dict) -> dict:
@@ -797,7 +943,8 @@ def main() -> None:
         import job_control
 
         runner = job_control.serve(
-            "load",
+            # Nama job = perintah bot yang memicunya: /load (finance), /sync (capil).
+            "sync" if CAPIL else "load",
             lambda params: run_once(params.get("sources")),
             validate=validate_params,
             background="--watch" in flag,
@@ -807,6 +954,9 @@ def main() -> None:
                 "db": f"{DB['host']}/{DB['dbname']}.{DB_SCHEMA}",
                 "interval_menit": SCHEDULE_MINUTES,
                 "fitur": "load-db",  # penanda image loader (bukan split-excel lama)
+                "dataset": LOADER_DATASET,
+                **({"file": CAPIL_FILE, "sheet": CAPIL_SHEET or "(sheet pertama)"}
+                   if CAPIL else {}),
             },
         )
         if "--watch" not in flag:

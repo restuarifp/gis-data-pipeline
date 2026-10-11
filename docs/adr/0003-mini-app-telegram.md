@@ -1,6 +1,7 @@
 # Mini App Telegram: panel web dilayani relay, otorisasi lewat initData
 
 > Catatan 2026-09-30: tab/job `split` kini `load` (ADR 0005).
+> Catatan 2026-10-11: tab `sync` kini memilih kantor untuk `capil-loader`, bukan koneksi Airbyte; `/api/connections` dan `/api/sync` dihapus (ADR 0006).
 
 Perintah teks (`/split`, `/dbt`, `/sync`, `/status`, `/logs`) tetap ada, tapi
 operator harus hafal namanya dan mengetik path folder dengan benar dari ponsel.

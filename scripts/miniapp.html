@@ -157,8 +157,8 @@
 <section id="tab-run" hidden>
   <div class="tabs" style="position:static;margin-bottom:12px">
     <button role="tab" data-job="load" aria-selected="true">load</button>
-    <button role="tab" data-job="dbt"   aria-selected="false">dbt</button>
     <button role="tab" data-job="sync"  aria-selected="false">sync</button>
+    <button role="tab" data-job="dbt"   aria-selected="false">dbt</button>
     <button role="tab" data-job="report" aria-selected="false">laporan</button>
   </div>
 
@@ -200,9 +200,11 @@
   </div>
 
   <div class="card" id="pane-sync" hidden>
-    <div class="top"><h2>Airbyte</h2><span class="pill" id="pill-sync">—</span></div>
-    <div class="sub">Picu sync satu koneksi (capil). Hasilnya dilaporkan lewat webhook Airbyte ke grup.</div>
-    <div id="sync-body"></div>
+    <div class="top"><h2>capil-loader</h2><span class="pill" id="pill-sync">—</span></div>
+    <div class="sub">Ambil data.xlsx (capil) tiap kantor dari Nextcloud, muat langsung ke database.</div>
+    <label class="field">Kantor</label>
+    <div class="chips" id="chips-sync"></div>
+    <div class="sub" id="hint-sync" style="margin-top:9px"></div>
   </div>
 </section>
 
@@ -210,6 +212,7 @@
   <div class="row">
     <div class="tabs grow" style="position:static;margin:0">
       <button role="tab" data-log="load" aria-selected="true">load</button>
+      <button role="tab" data-log="sync"  aria-selected="false">sync</button>
       <button role="tab" data-log="dbt"   aria-selected="false">dbt</button>
     </div>
     <button class="ghost" id="log-auto" aria-pressed="true">Auto ⟳</button>
@@ -293,9 +296,11 @@ function kapan(ts) {
 }
 
 /* ── State ───────────────────────────────────────────────────────────── */
-let state = { jobs: {}, airbyte: { enabled: false }, user: null };
+let state = { jobs: {}, user: null };
 let tab = "status", job = "load", logJob = "load", logAuto = true;
-let pilihanSumber = new Set();   // kosong = semua folder
+// Folder pilihan per job loader; kosong = semua folder sumber job itu.
+const pilihanSumber = { load: new Set(), sync: new Set() };
+const LOADER = { load: "excel-loader", sync: "capil-loader" };
 let sedangKirim = false;
 let jenisLaporan = "rekap";      // tombol laporan terakhir; MainButton tab laporan ikut memakainya
 
@@ -311,7 +316,7 @@ function statusPill(st) {
 function renderCards() {
   const rep = state.report || {};
   const wrap = $("#cards");
-  const urut = ["load", "dbt"];
+  const urut = ["load", "sync", "dbt"];
   wrap.innerHTML = urut.map((nama) => {
     const st = state.jobs[nama] || {};
     const p = statusPill(st);
@@ -334,7 +339,8 @@ function renderCards() {
         const tanda = !k.ok ? "❌" : dimuat ? "✅" : "＝";
         return `<span title="${esc(k.error || "")}">${tanda}${esc(k.kantor)}</span>`;
       }).join(" ")}</div>`);
-    if (nama === "load" && st.info && info.fitur !== "load-db")
+    if (info.file) baris.push(`<div><b>File</b> · <code>${esc(info.file)}</code> · ${esc(info.sheet || "")}</div>`);
+    if (LOADER[nama] && st.info && info.fitur !== "load-db")
       baris.push(`<div style="color:var(--warn)">⚠️ bukan image excel-loader — perlu rebuild</div>`);
     if (st.error) baris.push(`<div style="color:var(--warn)">${esc(st.error)}</div>`);
     return `<div class="card">
@@ -344,13 +350,6 @@ function renderCards() {
           ${st.running ? "sedang berjalan…" : "▶ Jalankan " + esc(nama)}</button>
       </div>`;
   }).join("") + `<div class="card">
-      <div class="top"><h2>Airbyte</h2><span class="pill ${state.airbyte.enabled ? "ok" : "warn"}">
-        ${state.airbyte.enabled ? "terkonfigurasi" : "belum diatur"}</span></div>
-      <div class="sub">${state.airbyte.enabled
-        ? "Picu sync koneksi dari tab Jalankan."
-        : "Set AIRBYTE_URL, AIRBYTE_CLIENT_ID, dan AIRBYTE_CLIENT_SECRET di .env."}</div>
-    </div>
-    <div class="card">
       <div class="top"><h2>Rekap Bulanan</h2><span class="pill ${rep.enabled ? "ok" : "warn"}">
         ${rep.enabled ? "siap" : "belum aktif"}</span></div>
       <div class="sub">${rep.enabled
@@ -366,39 +365,42 @@ function renderCards() {
     b.addEventListener("click", () => { buzz(); bukaTab("run", b.dataset.goto); }));
 }
 
-function renderChips() {
-  const info = (state.jobs.load || {}).info || {};
+function renderChips(nama) {
+  const info = (state.jobs[nama] || {}).info || {};
   const sumber = info.sources || [];
-  const box = $("#chips-load");
+  const pilihan = pilihanSumber[nama];
+  const box = $("#chips-" + nama);
   if (!sumber.length) {
-    box.innerHTML = '<span class="sub">Daftar folder belum bisa dibaca dari excel-loader.</span>';
+    box.innerHTML = `<span class="sub">Daftar folder belum bisa dibaca dari ${LOADER[nama]}.</span>`;
     return;
   }
-  const semua = pilihanSumber.size === 0;
+  const semua = pilihan.size === 0;
   box.innerHTML =
     `<button class="chip all" data-src="" aria-pressed="${semua}">Semua (${sumber.length})</button>` +
     sumber.map((s) => {
-      // Nama kantor = folder di atas "Finance" (…/A1/Finance -> A1), sama dengan
-      // _kantor_name() di excel_loader.py; path lengkapnya tetap di tooltip.
+      // Nama kantor = folder di atas "Finance" (…/A1/Finance -> A1), atau folder
+      // terakhir untuk capil (…/A1 -> A1), sama dengan _kantor_name() di
+      // excel_loader.py; path lengkapnya tetap di tooltip.
       const bagian = String(s).split("/").filter(Boolean);
       const nama = bagian.length > 1 && bagian[bagian.length - 1].toLowerCase() === "finance"
         ? bagian[bagian.length - 2] : bagian.pop();
-      return `<button class="chip" data-src="${esc(s)}" aria-pressed="${pilihanSumber.has(s)}"
+      return `<button class="chip" data-src="${esc(s)}" aria-pressed="${pilihan.has(s)}"
                 title="${esc(s)}">${esc(nama)}</button>`;
     }).join("");
 
-  $$("#chips-load .chip").forEach((c) => c.addEventListener("click", () => {
+  $$(`#chips-${nama} .chip`).forEach((c) => c.addEventListener("click", () => {
     buzz();
     const v = c.dataset.src;
-    if (!v) pilihanSumber.clear();
-    else if (pilihanSumber.has(v)) pilihanSumber.delete(v);
-    else pilihanSumber.add(v);
-    renderChips();
+    if (!v) pilihan.clear();
+    else if (pilihan.has(v)) pilihan.delete(v);
+    else pilihan.add(v);
+    renderChips(nama);
     syncMainButton();
   }));
-  $("#hint-load").textContent = pilihanSumber.size
-    ? pilihanSumber.size + " folder dipilih"
-    : "Tanpa pilihan = semua folder di NEXTCLOUD_SOURCE_PATHS.";
+  $("#hint-" + nama).textContent = pilihan.size
+    ? pilihan.size + " folder dipilih"
+    : "Tanpa pilihan = semua folder di " +
+      (nama === "sync" ? "CAPIL_SOURCE_PATHS." : "NEXTCLOUD_SOURCE_PATHS.");
 }
 
 function renderReport() {
@@ -432,28 +434,6 @@ function renderReport() {
     ? `<span style="color:var(--warn)">${esc(alasan)}</span>` : "";
 }
 
-async function renderSync() {
-  const box = $("#sync-body");
-  if (!state.airbyte.enabled) {
-    box.innerHTML = '<div class="sub" style="margin-top:12px">Airbyte belum dikonfigurasi di .env.</div>';
-    return;
-  }
-  box.innerHTML = '<div class="sub" style="margin-top:12px">Memuat daftar koneksi…</div>';
-  try {
-    const data = await api("connections");
-    const list = data.connections || [];
-    if (!list.length) { box.innerHTML = '<div class="sub" style="margin-top:12px">Tidak ada koneksi.</div>'; return; }
-    box.innerHTML =
-      '<label class="field" for="sync-conn">Koneksi</label><select id="sync-conn">' +
-      list.map((k) => `<option value="${esc(k.connectionId)}">${esc(k.name)}${
-        k.status && k.status !== "active" ? " (" + esc(k.status) + ")" : ""}</option>`).join("") +
-      "</select>";
-  } catch (e) {
-    if (!fatal) box.innerHTML = `<div class="sub" style="margin-top:12px;color:var(--warn)">${esc(e.message)}</div>`;
-  }
-  syncMainButton();
-}
-
 function renderLog(teks) {
   const el = $("#log");
   const bawah = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
@@ -468,16 +448,15 @@ function renderLog(teks) {
 
 /* ── Aksi ────────────────────────────────────────────────────────────── */
 function ringkasAksi() {
-  if (job === "load")
-    return pilihanSumber.size ? `excel-loader · ${pilihanSumber.size} folder` : "excel-loader · semua folder";
+  if (LOADER[job]) {
+    const n = pilihanSumber[job].size;
+    return `${LOADER[job]} · ` + (n ? `${n} folder` : "semua folder");
+  }
   if (job === "dbt") {
     const sel = $("#dbt-select").value.trim();
     return `dbt ${$("#dbt-cmd").value}` + (sel ? ` --select ${sel}` : "");
   }
-  if (job === "report")
-    return `${jenisLaporan} · ${NAMA_BULAN[$("#rep-bulan").value - 1]} ${$("#rep-tahun").value}`;
-  const c = $("#sync-conn");
-  return c ? `sync · ${c.selectedOptions[0].textContent}` : "sync";
+  return `${jenisLaporan} · ${NAMA_BULAN[$("#rep-bulan").value - 1]} ${$("#rep-tahun").value}`;
 }
 
 function konfirmasi(pesan) {
@@ -501,13 +480,10 @@ async function jalankan(nama, langsung) {
         jenis: jenisLaporan,
         bulan: Number($("#rep-bulan").value), tahun: Number($("#rep-tahun").value),
       }) });
-    } else if (nama === "sync") {
-      const c = $("#sync-conn");
-      if (!c) throw new Error("koneksi belum dipilih");
-      hasil = await api("sync", { method: "POST", body: JSON.stringify({ connection_id: c.value }) });
     } else {
       const body = { job: nama };
-      if (nama === "load" && !langsung && pilihanSumber.size) body.sources = Array.from(pilihanSumber);
+      if (LOADER[nama] && !langsung && pilihanSumber[nama].size)
+        body.sources = Array.from(pilihanSumber[nama]);
       if (nama === "dbt" && !langsung) {
         body.command = $("#dbt-cmd").value;
         const sel = $("#dbt-select").value.trim();
@@ -547,7 +523,8 @@ async function muat() {
     state = await api("state");
     if (state.user) $("#who").textContent = "@" + (state.user.username || state.user.first_name || "");
     renderCards();
-    renderChips();
+    renderChips("load");
+    renderChips("sync");
     renderReport();
     syncMainButton();
   } catch (e) {
@@ -601,7 +578,6 @@ $$('[data-job]').forEach((b) => b.addEventListener("click", () => {
   job = b.dataset.job;
   $$('[data-job]').forEach((x) => x.setAttribute("aria-selected", String(x === b)));
   ["load", "dbt", "sync", "report"].forEach((j) => { $("#pane-" + j).hidden = j !== job; });
-  if (job === "sync" && !$("#sync-conn")) renderSync();
   syncMainButton();
 }));
 
@@ -627,7 +603,7 @@ $("#rep-fin").addEventListener("click", () => { buzz(); jenisLaporan = "keuangan
 
 if (tg && tg.MainButton) tg.MainButton.onClick(() => jalankan(job, false));
 
-muat().then(() => { if (job === "sync") renderSync(); });
+muat();
 detak();
 </script>
 </body>

@@ -1,5 +1,6 @@
 # Trigger job lewat Telegram: HTTP internal, bukan Docker socket
 
+> Catatan 2026-10-11: `/sync` kini memicu `capil-loader` lewat control server seperti `/load` (ADR 0006); bagian Airbyte di bawah tidak berlaku lagi.
 > Catatan 2026-09-30: `split-excel` digantikan `excel-loader` dan `/split` menjadi `/load` (ADR 0005). Keputusan di sini tetap berlaku untuk job barunya.
 
 Operator memicu `split-excel` (dan `dbt run`) dari grup Telegram yang sudah dipakai

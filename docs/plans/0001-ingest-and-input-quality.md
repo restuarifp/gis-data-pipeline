@@ -1,4 +1,4 @@
-> **Status:** in progress. 2026-09-30: §2 done for **finance** — `excel-loader` writes straight to Postgres, Airbyte finance connections retired (ADR 0005); validation is a hard-coded contract in the loader, not yet `contracts/*.yml`. Capil still on Airbyte. Execute the rest phase by phase; see "Suggested order".
+> **Status:** in progress. 2026-09-30: §2 done for **finance** — `excel-loader` writes straight to Postgres, Airbyte finance connections retired (ADR 0005); validation is a hard-coded contract in the loader, not yet `contracts/*.yml`. 2026-10-11: §2 done for **capil** too — `capil-loader` (same script, `LOADER_DATASET=capil`), contract read from the existing raw table, Airbyte code removed from the relay (ADR 0006). Execute the rest phase by phase; see "Suggested order".
 
 # Evaluation: input quality, Airbyte memory, and multi-division growth
 

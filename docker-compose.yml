@@ -83,7 +83,7 @@ services:
 
   # Membaca finance.xlsx tiap kantor dari Nextcloud dan menulisnya langsung ke
   # raw_finance_rekap_<kantor> / raw_finance_rincian_<kantor> — menggantikan
-  # split-excel + koneksi Airbyte finance (docs/adr/0005). Capil masih lewat Airbyte.
+  # split-excel + koneksi Airbyte finance (docs/adr/0005). Dipicu /load.
   excel-loader:
     build:
       context: .
@@ -93,6 +93,26 @@ services:
     env_file:
       - .env
     # Belasan file Excel kecil per run; openpyxl read_only jauh di bawah ini.
+    mem_limit: 512m
+    depends_on:
+      - postgres-db
+    networks:
+      - gisnet
+
+  # Image yang sama, dataset capil: <Kantor>/data.xlsx -> raw_<kantor> —
+  # menggantikan koneksi Airbyte capil (docs/adr/0006). Dipicu /sync. Server
+  # kontrolnya terpisah dari excel-loader, jadi run finance yang lama tidak
+  # membuat /sync ditolak 409 (dan sebaliknya).
+  capil-loader:
+    build:
+      context: .
+      dockerfile: Dockerfile.excel-loader
+    container_name: capil_loader
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - LOADER_DATASET=capil
     mem_limit: 512m
     depends_on:
       - postgres-db

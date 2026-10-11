@@ -65,7 +65,7 @@ diubah tanpa menyentuh jalur tulis database.
   Kalau Airbyte tetap menulis, generation id-nya bisa lebih kecil dari milik
   loader sehingga tarikannya tak terlihat. Loader mendeteksi baris non-loader
   yang lebih baru dari muatannya dan menandainya ⚠️ di pesan Telegram.
-- `/sync` dan webhook Airbyte tetap ada, sekarang hanya untuk capil.
+- `/sync` dan webhook Airbyte tetap ada, sekarang hanya untuk capil. *(Dilampaui ADR 0006: capil juga pindah ke loader, kode Airbyte dihapus.)*
 - Kantor finance baru tidak butuh koneksi Airbyte: tambahkan folder ke
   `NEXTCLOUD_SOURCE_PATHS`; tabelnya dibuat loader pada muatan pertama. Model dbt
   (`sources.yml`, `stg_*`, mart) tetap perlu ditambahkan seperti biasa.

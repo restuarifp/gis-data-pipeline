@@ -2,20 +2,15 @@
 """
 notif_relay.py — Relay Notifikasi
 
-Menerima webhook dari Airbyte (kini hanya koneksi capil) lalu menerjemahkannya
-menjadi pesan Telegram.
-Airbyte tidak bisa memanggil Telegram Bot API secara langsung (bentuk payload
-berbeda), jadi layanan kecil ini yang menjembatani.
+Bot Telegram pipeline. Pengiriman ke Telegram bersifat *best-effort* (lihat
+docs/adr/0001-notifikasi-telegram-best-effort.md): retry backoff di thread
+background, kegagalan final hanya ditulis ke log.
 
-Bersifat *best-effort* (lihat docs/adr/0001-notifikasi-telegram-best-effort.md):
-selalu membalas 200 ke Airbyte seketika, lalu mengirim ke Telegram di thread
-background dengan retry backoff. Kegagalan final hanya ditulis ke log —
-pesannya hilang, Airbyte tidak pernah dibuat menganggap job bermasalah.
+Dulu relay ini juga menerima webhook Airbyte; sejak capil pindah ke capil-loader
+(docs/adr/0006) Airbyte tidak dipakai lagi dan POST di luar /api/* dibalas 404.
 
-Satu webhook (satu Job) = satu pesan Telegram.
-
-Sekaligus bot dua arah: loop long-polling getUpdates menerima perintah dari grup
-TELEGRAM_CHAT_ID (/load, /dbt, /status, /logs, /help) lalu memicu job lewat
+Bot dua arah: loop long-polling getUpdates menerima perintah dari grup
+TELEGRAM_CHAT_ID (/load, /sync, /dbt, /status, /logs, /help) lalu memicu job lewat
 server kontrol HTTP internal di gisnet — bukan lewat Docker socket. Lihat
 docs/adr/0002-trigger-job-via-telegram.md dan scripts/job_control.py.
 
@@ -31,12 +26,9 @@ Endpoint:
   GET  /app         -- halaman Mini App (HTML)
   GET  /api/state   -- status semua job + config aktif (butuh initData)
   GET  /api/logs    -- ekor log satu job (butuh initData)
-  GET  /api/connections -- daftar koneksi Airbyte (butuh initData)
-  POST /api/run     -- picu load/dbt (butuh initData)
-  POST /api/sync    -- picu sync Airbyte (butuh initData)
+  POST /api/run     -- picu load/sync/dbt (butuh initData)
   POST /api/report  -- susun Rekap Bulanan / Laporan Keuangan (jenis) .xlsx lalu
                        kirim ke Telegram (butuh initData)
-  POST <apa saja>   -- terima webhook Airbyte, balas 200 seketika
   GET  /            -- health check, balas 200 "ok"
 
 Konfigurasi via environment (lihat .env.example):
@@ -48,6 +40,7 @@ Konfigurasi via environment (lihat .env.example):
   TELEGRAM_RETRY_BACKOFF_SECONDS (opsional, default 3)
   TELEGRAM_BOT_ENABLED         (opsional, default true) -- matikan loop perintah
   LOAD_CONTROL_URL             (opsional, default http://excel-loader:8080)
+  CAPIL_CONTROL_URL            (opsional, default http://capil-loader:8080)
   DBT_CONTROL_URL              (opsional, default http://dbt-runner:8080)
   TELEGRAM_POLL_TIMEOUT        (opsional, default 50)
   MINI_APP_URL                 (opsional) -- URL HTTPS publik ke /app; kosong = Mini App mati
@@ -122,10 +115,14 @@ REQUEST_TIMEOUT = 15  # detik, per-attempt ke api.telegram.org
 # ── Bot (perintah dari Telegram) ────────────────────────────────────────────
 # Job yang bisa dipicu; masing-masing menjalankan server kontrol job_control di
 # gisnet. Relay TIDAK menyentuh Docker socket — lihat docs/adr/0002.
+# /load = finance (excel-loader), /sync = capil (capil-loader, image yang sama).
 JOBS = {
     "load": os.getenv("LOAD_CONTROL_URL", "http://excel-loader:8080").rstrip("/"),
+    "sync": os.getenv("CAPIL_CONTROL_URL", "http://capil-loader:8080").rstrip("/"),
     "dbt":  os.getenv("DBT_CONTROL_URL", "http://dbt-runner:8080").rstrip("/"),
 }
+# Job loader Excel: hasilnya dilaporkan sebagai rekap per kantor (rekap_masalah).
+JOB_LOADER = ("load", "sync")
 # Nama lama yang masih diterima dari Telegram/Mini App supaya kebiasaan operator
 # tidak langsung patah. split-excel sudah digantikan excel-loader (ADR 0005).
 ALIAS_JOB = {"split": "load"}
@@ -134,12 +131,10 @@ if os.getenv("SPLIT_CONTROL_URL", "").strip():
     # http://split-excel:8080, service yang sudah tidak ada.
     log.warning("SPLIT_CONTROL_URL diabaikan — service split-excel sudah diganti "
                 "excel-loader. Pakai LOAD_CONTROL_URL (default http://excel-loader:8080).")
-# Airbyte (perintah /sync). Airbyte tidak ada di compose stack ini, jadi URL-nya
-# harus yang terjangkau DARI DALAM container relay — bukan localhost.
-AIRBYTE_URL           = os.getenv("AIRBYTE_URL", "").strip().rstrip("/")
-AIRBYTE_CLIENT_ID     = os.getenv("AIRBYTE_CLIENT_ID", "").strip()
-AIRBYTE_CLIENT_SECRET = os.getenv("AIRBYTE_CLIENT_SECRET", "").strip()
-AIRBYTE_WORKSPACE_ID  = os.getenv("AIRBYTE_WORKSPACE_ID", "").strip()
+if os.getenv("AIRBYTE_URL", "").strip():
+    # /sync dulu memicu Airbyte; kini memicu capil-loader (ADR 0006).
+    log.warning("AIRBYTE_URL diabaikan — Airbyte tidak dipakai lagi; /sync kini memuat "
+                "data.xlsx lewat capil-loader. Hapus AIRBYTE_* dari .env.")
 
 POLL_TIMEOUT   = int(os.getenv("TELEGRAM_POLL_TIMEOUT", "50"))   # long-poll getUpdates
 WATCH_INTERVAL = int(os.getenv("JOB_WATCH_INTERVAL_SECONDS", "10"))
@@ -183,7 +178,7 @@ def _daftar_id(nama: str) -> set:
 
 
 # Operator yang boleh memakai bot lewat chat privat. Grup TELEGRAM_CHAT_ID tetap
-# jalur utama (dan tetap satu-satunya penerima notifikasi Airbyte); daftar ini
+# jalur utama (penerima semua laporan run); daftar ini
 # hanya menambah pintu DM untuk orang yang id-nya memang ditulis operator di .env.
 DM_USER_IDS = _daftar_id("TELEGRAM_DM_USER_IDS")
 
@@ -202,70 +197,6 @@ def _fmt_duration(seconds) -> str:
     return f"{menit}m {detik}s"
 
 
-def format_message(payload: dict) -> str:
-    """
-    Ubah payload webhook Airbyte menjadi pesan Telegram (parse_mode HTML).
-
-    Defensif terhadap beberapa bentuk payload:
-      - Custom webhook Airbyte terbaru: field terstruktur di bawah `data`.
-      - Notifikasi gaya Slack/legacy: hanya berisi field `text`.
-      - Bentuk lain: dump JSON mentah agar tidak ada event yang hilang diam-diam.
-    """
-    # Bentuk Slack/legacy: teruskan apa adanya.
-    text = payload.get("text")
-    if text and not payload.get("data"):
-        return html.escape(str(text))
-
-    data = payload.get("data") or payload
-
-    def g(*keys, default="-"):
-        for k in keys:
-            v = data.get(k)
-            if v not in (None, ""):
-                return v
-        return default
-
-    def name_of(obj):
-        if isinstance(obj, dict):
-            return obj.get("name") or obj.get("id") or "-"
-        return obj if obj not in (None, "") else "-"
-
-    # Tentukan sukses/gagal. `success` bila ada; jika tidak, tebak dari errorMessage.
-    success = data.get("success")
-    if success is None:
-        success = not (data.get("errorMessage") or data.get("errorType"))
-
-    connection  = name_of(data.get("connection"))
-    source      = name_of(data.get("source"))
-    destination = name_of(data.get("destination"))
-    job_id      = g("jobId", "job_id")
-    records     = g("recordsCommitted", "recordsEmitted", "records_committed")
-    duration    = _fmt_duration(data.get("durationInSeconds"))
-
-    e = lambda v: html.escape(str(v))
-
-    if success:
-        lines = [
-            "✅ <b>Airbyte sync berhasil</b>",
-            f"Koneksi: <b>{e(connection)}</b>",
-            f"{e(source)} → {e(destination)}",
-            f"Job: <code>{e(job_id)}</code>",
-            f"Records: {e(records)}",
-            f"Durasi: {e(duration)}",
-        ]
-    else:
-        error_msg = g("errorMessage", "errorType", default="(tidak ada detail)")
-        lines = [
-            "❌ <b>Airbyte sync GAGAL</b>",
-            f"Koneksi: <b>{e(connection)}</b>",
-            f"{e(source)} → {e(destination)}",
-            f"Job: <code>{e(job_id)}</code>",
-            f"Durasi: {e(duration)}",
-            f"Error: {e(error_msg)}",
-        ]
-    return "\n".join(lines)
-
-
 # ── Pengiriman ke Telegram (background, best-effort) ────────────────────────
 
 def send_telegram(text: str, chat_id=None, reply_to=None, reply_markup=None) -> None:
@@ -273,8 +204,8 @@ def send_telegram(text: str, chat_id=None, reply_to=None, reply_markup=None) -> 
     Kirim satu pesan ke Telegram dengan retry linear backoff.
     Dipanggil dari thread background; kegagalan final hanya di-log.
 
-    chat_id/reply_to opsional dipakai balasan perintah bot; default-nya tetap
-    grup TELEGRAM_CHAT_ID sehingga jalur notifikasi Airbyte tidak berubah.
+    chat_id/reply_to opsional dipakai balasan perintah bot; default-nya grup
+    TELEGRAM_CHAT_ID.
     """
     body = {
         "chat_id": chat_id or TELEGRAM_CHAT_ID,
@@ -339,183 +270,6 @@ def kirim_dokumen(nama_file: str, isi: bytes, caption: str = "", chat_id=None) -
 
     log.error("Dokumen %s dijatuhkan setelah %d percobaan.", nama_file, MAX_RETRIES)
     return False
-
-
-def dispatch(payload: dict) -> None:
-    """Format lalu kirim di thread ini (sudah dipanggil dari thread background)."""
-    try:
-        text = format_message(payload)
-    except Exception:  # noqa: BLE001 -- jangan pernah menjatuhkan thread relay
-        log.exception("Gagal memformat payload; mengirim dump mentah.")
-        text = html.escape(json.dumps(payload, ensure_ascii=False)[:3500])
-    send_telegram(text)
-
-
-# ── Airbyte Public API ──────────────────────────────────────────────────────
-
-_token_lock = threading.Lock()
-_token = {"nilai": None, "kedaluwarsa": 0.0}
-
-
-class AirbyteError(Exception):
-    """Kegagalan yang layak ditampilkan apa adanya ke operator di Telegram."""
-
-
-def airbyte_aktif() -> bool:
-    return bool(AIRBYTE_URL and AIRBYTE_CLIENT_ID and AIRBYTE_CLIENT_SECRET)
-
-
-def _ambil_token(paksa: bool = False) -> str:
-    """
-    Access token Public API, di-cache sampai mendekati kedaluwarsa.
-
-    Catatan bentuk body: field-nya `grant-type` (tanda hubung), bukan `grant_type`
-    seperti konvensi OAuth. Salah tanda hubung dibalas 401 — bukan 400 — jadi
-    gejalanya menyamar sebagai kredensial salah.
-    """
-    with _token_lock:
-        if not paksa and _token["nilai"] and time.time() < _token["kedaluwarsa"]:
-            return _token["nilai"]
-
-        try:
-            resp = requests.post(
-                f"{AIRBYTE_URL}/api/public/v1/applications/token",
-                json={
-                    "client_id": AIRBYTE_CLIENT_ID,
-                    "client_secret": AIRBYTE_CLIENT_SECRET,
-                    "grant-type": "client_credentials",
-                },
-                timeout=REQUEST_TIMEOUT,
-            )
-        except requests.RequestException as exc:
-            raise AirbyteError(f"tidak bisa menghubungi Airbyte: {exc}") from exc
-
-        if not resp.ok:
-            raise AirbyteError(
-                f"gagal ambil token ({resp.status_code}): {resp.text[:200]}"
-            )
-
-        data = resp.json()
-        nilai = data.get("access_token")
-        if not nilai:
-            raise AirbyteError(f"respons token tanpa access_token: {str(data)[:200]}")
-
-        umur = float(data.get("expires_in") or 180)
-        _token["nilai"] = nilai
-        _token["kedaluwarsa"] = time.time() + max(umur - 30, 30)  # sisakan margin
-        return nilai
-
-
-def _api(metode: str, path: str, **kwargs):
-    """Panggil Public API; sekali retry dengan token baru kalau kena 401."""
-    for percobaan in (1, 2):
-        token = _ambil_token(paksa=(percobaan == 2))
-        try:
-            resp = requests.request(
-                metode,
-                f"{AIRBYTE_URL}/api/public/v1{path}",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=REQUEST_TIMEOUT,
-                **kwargs,
-            )
-        except requests.RequestException as exc:
-            raise AirbyteError(f"tidak bisa menghubungi Airbyte: {exc}") from exc
-
-        if resp.status_code == 401 and percobaan == 1:
-            continue  # token kedaluwarsa lebih cepat dari perkiraan
-        if not resp.ok:
-            raise AirbyteError(f"{metode} {path} → {resp.status_code}: {resp.text[:300]}")
-        return resp.json() if resp.content else {}
-
-    raise AirbyteError("token ditolak dua kali berturut-turut")
-
-
-def daftar_koneksi() -> list:
-    """
-    Semua koneksi, diurutkan alfabetis menurut nama.
-
-    Airbyte mengembalikannya dalam urutan yang tidak dijamin dan bisa berubah
-    antar panggilan; diurutkan di sini supaya setiap pemakainya — daftar di
-    Mini App, daftar /sync, maupun daftar kandidat saat nama ambigu — menampilkan
-    urutan yang sama dan stabil.
-    """
-    params = {"limit": 100}
-    if AIRBYTE_WORKSPACE_ID:
-        params["workspaceIds"] = AIRBYTE_WORKSPACE_ID
-    koneksi = _api("GET", "/connections", params=params).get("data", [])
-    return sorted(koneksi, key=lambda k: (k.get("name") or "").lower())
-
-
-def cari_koneksi(nama: str) -> dict:
-    """
-    Cocokkan nama koneksi yang diketik operator. Persis dulu, baru sebagian.
-
-    Kalau ambigu, lebih baik gagal dan menampilkan kandidat daripada menebak —
-    memicu sync koneksi yang salah berarti menulis data ke tabel kantor lain.
-    """
-    koneksi = daftar_koneksi()
-    kunci = nama.strip().lower()
-
-    persis = [k for k in koneksi if (k.get("name") or "").lower() == kunci]
-    if len(persis) == 1:
-        return persis[0]
-
-    sebagian = [k for k in koneksi if kunci in (k.get("name") or "").lower()]
-    if len(sebagian) == 1:
-        return sebagian[0]
-    if not sebagian:
-        raise AirbyteError(
-            f"koneksi {nama!r} tidak ditemukan. Ketik /sync tanpa argumen "
-            f"untuk melihat daftarnya."
-        )
-    nama_kandidat = ", ".join(k.get("name", "?") for k in sebagian[:10])
-    raise AirbyteError(f"nama {nama!r} cocok ke beberapa koneksi: {nama_kandidat}")
-
-
-def mulai_sync(args: list, chat_id, reply_to) -> None:
-    if not airbyte_aktif():
-        send_telegram(
-            "⚠️ Airbyte belum dikonfigurasi. Set <code>AIRBYTE_URL</code>, "
-            "<code>AIRBYTE_CLIENT_ID</code>, dan <code>AIRBYTE_CLIENT_SECRET</code> "
-            "di .env lalu <code>docker compose up -d notif-relay</code>.",
-            chat_id, reply_to,
-        )
-        return
-
-    try:
-        if not args:
-            koneksi = daftar_koneksi()
-            if not koneksi:
-                send_telegram("Tidak ada koneksi di Airbyte.", chat_id, reply_to)
-                return
-            baris = "\n".join(
-                f"• <code>{html.escape(k.get('name', '?'))}</code>"
-                f"{'' if k.get('status') == 'active' else ' <i>(' + html.escape(str(k.get('status'))) + ')</i>'}"
-                for k in koneksi
-            )
-            send_telegram(
-                f"<b>Koneksi Airbyte</b>\n{baris}\n\nPakai: <code>/sync nama-koneksi</code>",
-                chat_id, reply_to,
-            )
-            return
-
-        target = cari_koneksi(" ".join(args))
-        hasil = _api("POST", "/jobs", json={
-            "connectionId": target["connectionId"],
-            "jobType": "sync",
-        })
-    except AirbyteError as exc:
-        send_telegram(f"❌ Airbyte: {html.escape(str(exc))}", chat_id, reply_to)
-        return
-
-    # Laporan selesai datang lewat webhook Airbyte ke relay ini — jalur yang sudah
-    # berjalan sejak awal. Tidak ada pemantau tambahan di sini.
-    send_telegram(
-        f"▶️ Sync <b>{html.escape(target.get('name', '?'))}</b> dimulai "
-        f"(job {hasil.get('jobId', '?')}).\n"
-        f"<i>Hasilnya menyusul lewat notifikasi Airbyte.</i>",
-        chat_id, reply_to,
-    )
 
 
 # ── Mini App: otentikasi initData ───────────────────────────────────────────
@@ -813,7 +567,6 @@ def api_state(user: dict) -> dict:
     baku_bulan, baku_tahun = report_summary.bulan_default()
     return {
         "jobs": status_semua_job(),
-        "airbyte": {"enabled": airbyte_aktif()},
         "report": {"enabled": bisa_laporan, "reason": alasan_laporan,
                    "bulan": baku_bulan, "tahun": baku_tahun,
                    "keuangan": {"enabled": bisa_keuangan, "reason": alasan_keuangan}},
@@ -843,7 +596,7 @@ def api_run(body: dict, user: dict) -> dict:
         raise WebAppError(f"job tidak dikenal: {nama}", 400)
 
     params = {}
-    if nama == "load":
+    if nama in JOB_LOADER:
         sumber = body.get("sources") or []
         if not isinstance(sumber, list):
             raise WebAppError("sources harus berupa list", 400)
@@ -916,44 +669,6 @@ def api_report(body: dict, user: dict) -> dict:
     return {"ok": True, "message": f"{nama} {label} sedang disusun; filenya dikirim ke Telegram."}
 
 
-def api_connections() -> dict:
-    if not airbyte_aktif():
-        raise WebAppError("Airbyte belum dikonfigurasi.", 400)
-    try:
-        koneksi = daftar_koneksi()
-    except AirbyteError as exc:
-        raise WebAppError(str(exc)[:300], 502) from exc
-    return {"connections": [
-        {"connectionId": k.get("connectionId"), "name": k.get("name"), "status": k.get("status")}
-        for k in koneksi
-    ]}
-
-
-def api_sync(body: dict, user: dict) -> dict:
-    if not airbyte_aktif():
-        raise WebAppError("Airbyte belum dikonfigurasi.", 400)
-    connection_id = str(body.get("connection_id") or "").strip()
-    nama = str(body.get("name") or "").strip()
-    try:
-        if not connection_id:
-            if not nama:
-                raise WebAppError("connection_id atau name wajib diisi.", 400)
-            target = cari_koneksi(nama)
-            connection_id, nama = target["connectionId"], target.get("name", nama)
-        hasil = _api("POST", "/jobs", json={"connectionId": connection_id, "jobType": "sync"})
-    except AirbyteError as exc:
-        raise WebAppError(str(exc)[:300], 502) from exc
-
-    label = nama or connection_id
-    threading.Thread(
-        target=send_telegram,
-        args=(f"▶️ Sync <b>{html.escape(label)}</b> dimulai oleh "
-              f"{html.escape(sebut(user))} lewat Mini App (job {hasil.get('jobId', '?')}).",),
-        daemon=True,
-    ).start()
-    return {"ok": True, "message": f"Sync {label} dimulai (job {hasil.get('jobId', '?')})."}
-
-
 # ── Bot: perintah dari grup Telegram ────────────────────────────────────────
 
 BANTUAN = (
@@ -961,14 +676,14 @@ BANTUAN = (
     "/load — muat finance.xlsx semua folder di NEXTCLOUD_SOURCE_PATHS ke database\n"
     "/load <i>A1/Finance</i> — hanya folder tertentu (relatif ke NEXTCLOUD_SOURCE_HOME, "
     "boleh beberapa dipisah spasi)\n"
+    "/sync — muat data.xlsx (capil) semua kantor ke database\n"
+    "/sync <i>A1 B2</i> — hanya kantor tertentu\n"
     "/dbt — jalankan <code>dbt run</code>\n"
-    "/sync — daftar koneksi Airbyte (capil)\n"
-    "/sync <i>nama-koneksi</i> — picu sync koneksi itu\n"
     "/laporan — kirim Rekap Bulanan (.xlsx) untuk bulan lalu\n"
     "/laporan <i>8-2026</i> — rekap bulan tertentu (MM-YYYY)\n"
     "/keuangan [<i>8-2026</i>] — kirim Laporan Keuangan (.xlsx) bulan lalu / bulan tertentu\n"
     "/status — job sedang jalan atau tidak, plus hasil run terakhir\n"
-    "/logs [load|dbt] — ekor log run terakhir\n"
+    "/logs [load|sync|dbt] — ekor log run terakhir\n"
     "/app — buka Panel Pipeline (Mini App): status, tombol jalankan, log\n"
     "/id — tampilkan user id Anda (untuk didaftarkan ke TELEGRAM_DM_USER_IDS)\n"
     "/help — pesan ini"
@@ -1017,16 +732,17 @@ def _ambil_pelanggan(nama: str) -> set:
         return _pelanggan.pop(nama, set())
 
 
-# Rekap terakhir yang benar-benar dikirim untuk job load: sidik masalahnya dan
-# kapan. In-memory — relay restart paling banyak mengulang satu rekap.
-_rekap_terakhir = {"sidik": "", "waktu": 0.0}
+# Rekap terakhir yang benar-benar dikirim per job loader: sidik masalahnya dan
+# kapan. In-memory — relay restart paling banyak mengulang satu rekap per job.
+_rekap_terakhir = {nama: {"sidik": "", "waktu": 0.0} for nama in JOB_LOADER}
 
 
-def _lapor_muatan(st: dict, pelanggan: set) -> None:
+def _lapor_muatan(nama: str, st: dict, pelanggan: set) -> None:
     """
-    Satu rekap untuk seluruh run excel-loader (semua kantor sekaligus), dalam
-    bahasa sehari-hari — lihat rekap_masalah.py. Menggantikan notifikasi Airbyte
-    finance per koneksi dan pesan gagal per kantor.
+    Satu rekap untuk seluruh run loader (semua kantor sekaligus), dalam bahasa
+    sehari-hari — lihat rekap_masalah.py. Menggantikan notifikasi Airbyte per
+    koneksi dan pesan gagal per kantor. Finance (/load) dan capil (/sync)
+    masing-masing punya rekap dan ingatan dedupe sendiri.
 
     Run terjadwal tidak mengirim apa pun bila tidak ada data baru DAN keadaan
     masalahnya sama dengan rekap terakhir (termasuk "tidak ada masalah"). Masalah
@@ -1036,18 +752,19 @@ def _lapor_muatan(st: dict, pelanggan: set) -> None:
     hasil = st.get("last_result") or {}
     sidik = rekap_masalah.sidik(hasil)
     sekarang = time.time()
-    sama = sidik == _rekap_terakhir["sidik"]
-    basi = sekarang - _rekap_terakhir["waktu"] >= REKAP_ULANG_JAM * 3600
+    terakhir = _rekap_terakhir[nama]
+    sama = sidik == terakhir["sidik"]
+    basi = sekarang - terakhir["waktu"] >= REKAP_ULANG_JAM * 3600
     manual = bool(pelanggan) or st.get("last_trigger") != "jadwal"
 
     if not manual and not rekap_masalah.dimuat(hasil) and sama and (not sidik or not basi):
-        log.info("Run terjadwal load: tidak ada data baru, masalah sama dengan rekap "
-                 "terakhir; tidak diumumkan.")
+        log.info("Run terjadwal %s: tidak ada data baru, masalah sama dengan rekap "
+                 "terakhir; tidak diumumkan.", nama)
         return
 
     pesan = rekap_masalah.susun(hasil, _fmt_duration(st.get("duration_s")),
                                 diulang=bool(sidik) and sama and not manual)
-    _rekap_terakhir.update(sidik=sidik, waktu=sekarang)
+    terakhir.update(sidik=sidik, waktu=sekarang)
     send_telegram(pesan)
     for chat_id in pelanggan:
         send_telegram(pesan, chat_id)
@@ -1061,8 +778,8 @@ def _lapor_selesai(nama: str, st: dict) -> None:
     rincian = ""
     pelanggan = _ambil_pelanggan(nama)
 
-    if nama == "load" and st.get("last_result"):
-        _lapor_muatan(st, pelanggan)
+    if nama in JOB_LOADER and st.get("last_result"):
+        _lapor_muatan(nama, st, pelanggan)
         return
     if sumber:
         rincian = "\n" + "\n".join(f"• <code>{html.escape(str(s))}</code>" for s in sumber)
@@ -1162,9 +879,9 @@ def picu_job(nama: str, params: dict):
 def mulai_job(nama: str, args: list, chat_id, reply_to) -> None:
     """Panggil POST /run pada control server job, lalu balas ke Telegram."""
     body = {}
-    if nama == "load" and args:
+    if nama in JOB_LOADER and args:
         # Diteruskan apa adanya — validasi path hanya hidup di resolve_source()
-        # milik excel-loader, supaya tidak ada dua aturan yang bisa berbeda.
+        # milik loader, supaya tidak ada dua aturan yang bisa berbeda.
         body["sources"] = args
     elif nama == "dbt" and args:
         body["select"] = " ".join(args)
@@ -1213,11 +930,18 @@ def kirim_status(chat_id, reply_to) -> None:
                 baris.append("   sumber: " + ", ".join(
                     f"<code>{html.escape(str(s))}</code>" for s in info["sources"]
                 ))
-            if nama == "load" and info.get("db"):
+            if nama == "sync" and info.get("file"):
+                baris.append(f"   file: <code>{html.escape(str(info['file']))}</code> · "
+                             f"{html.escape(str(info.get('sheet') or ''))}")
+            if nama in JOB_LOADER and info.get("db"):
                 baris.append(f"   db: <code>{html.escape(str(info['db']))}</code>")
-            if nama == "load" and info.get("fitur") != "load-db":
-                baris.append("   ⚠️ <i>bukan image excel-loader — rebuild: "
-                             "<code>docker compose up -d --build excel-loader</code></i>")
+            service = "excel-loader" if nama == "load" else "capil-loader"
+            if nama in JOB_LOADER and info.get("fitur") != "load-db":
+                baris.append(f"   ⚠️ <i>bukan image excel-loader — rebuild: "
+                             f"<code>docker compose up -d --build {service}</code></i>")
+            elif nama == "sync" and info.get("dataset") != "capil":
+                baris.append("   ⚠️ <i>container ini tidak memuat capil — cek "
+                             "<code>LOADER_DATASET=capil</code> di service capil-loader</i>")
         except Exception as exc:  # noqa: BLE001
             baris.append(f"⚠️ <b>{nama}</b>: tidak bisa dihubungi ({html.escape(str(exc)[:120])})")
     send_telegram("\n".join(baris), chat_id, reply_to)
@@ -1334,8 +1058,6 @@ def handle_command(message: dict) -> None:
         kirim_status(chat_id, reply_to)
     elif perintah == "logs":
         kirim_logs(args, chat_id, reply_to)
-    elif perintah == "sync":
-        mulai_sync(args, chat_id, reply_to)
     elif perintah in ("laporan", "rekap"):
         kirim_laporan(args, message, chat_id, reply_to)
     elif perintah == "keuangan":
@@ -1376,10 +1098,10 @@ def poll_updates() -> None:
             )
             if resp.status_code in (401, 404):
                 # Token salah/dicabut: retry tidak akan pernah berhasil. Hentikan
-                # loop perintah, tapi biarkan relay webhook Airbyte tetap jalan.
+                # loop perintah, tapi biarkan server HTTP (Mini App) tetap jalan.
                 log.error(
                     "getUpdates ditolak (%s): TELEGRAM_BOT_TOKEN tidak valid. "
-                    "Bot perintah dimatikan; relay webhook tetap berjalan.",
+                    "Bot perintah dimatikan; server HTTP tetap berjalan.",
                     resp.status_code,
                 )
                 return
@@ -1459,12 +1181,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                 return 200, api_state(user)
             if path == "/api/logs":
                 return 200, api_logs((query.get("job") or ["load"])[0])
-            if path == "/api/connections":
-                return 200, api_connections()
             if path == "/api/run":
                 return 200, api_run(body, user)
-            if path == "/api/sync":
-                return 200, api_sync(body, user)
             if path == "/api/report":
                 return 200, api_report(body, user)
             return 404, {"error": f"endpoint tidak dikenal: {path}"}
@@ -1499,34 +1217,21 @@ class RelayHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
 
-        # Jalur Mini App dicek lebih dulu: sisa path apa pun tetap milik webhook
-        # Airbyte (URL-nya diisi operator dan tidak selalu "/").
-        if path.startswith("/api/"):
-            try:
-                body = json.loads(raw.decode("utf-8")) if raw.strip() else {}
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                self._json(400, {"error": "body bukan JSON valid"})
-                return
-            if not isinstance(body, dict):
-                self._json(400, {"error": "body harus berupa object JSON"})
-                return
-            self._json(*self._api_mini_app(path, query, body))
+        if not path.startswith("/api/"):
+            # Dulu tujuan webhook Airbyte. Airbyte sudah tidak dipakai (ADR 0006);
+            # 404 membuat notifikasi Airbyte yang masih menyala kelihatan gagal di
+            # UI-nya, bukan tertelan diam-diam.
+            self._kirim(404, b"tidak ada di sini", "text/plain; charset=utf-8")
             return
-
-        # Balas 200 SEKETIKA — Airbyte tidak boleh menunggu Telegram (ADR 0001).
-        self._ok()
-
         try:
-            payload = json.loads(raw.decode("utf-8")) if raw else {}
+            body = json.loads(raw.decode("utf-8")) if raw.strip() else {}
         except (json.JSONDecodeError, UnicodeDecodeError):
-            log.warning("Payload webhook bukan JSON valid; diabaikan.")
+            self._json(400, {"error": "body bukan JSON valid"})
             return
-
-        if not isinstance(payload, dict):
-            payload = {"text": str(payload)}
-
-        # Kirim di background; handler-nya sudah selesai membalas Airbyte.
-        threading.Thread(target=dispatch, args=(payload,), daemon=True).start()
+        if not isinstance(body, dict):
+            self._json(400, {"error": "body harus berupa object JSON"})
+            return
+        self._json(*self._api_mini_app(path, query, body))
 
     def log_message(self, fmt, *args):  # redam akses-log bawaan yang berisik
         log.debug("%s - %s", self.address_string(), fmt % args)
