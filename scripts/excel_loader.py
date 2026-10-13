@@ -85,6 +85,11 @@ SCHEDULE_MINUTES   = int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "60"))
 # Retry saat Nextcloud membalas 423 Locked / 5xx sesaat ketika file diunduh.
 WEBDAV_MAX_RETRIES           = int(os.getenv("WEBDAV_MAX_RETRIES", "5"))
 WEBDAV_RETRY_BACKOFF_SECONDS = float(os.getenv("WEBDAV_RETRY_BACKOFF_SECONDS", "3"))
+# (connect, read) dalam detik. Tanpa timeout, koneksi Nextcloud yang putus di
+# tengah jalan membuat run menggantung selamanya — lock single-flight ikut
+# tertahan, jadi jadwal berikutnya dan /load ditolak sampai container di-restart.
+WEBDAV_TIMEOUT = (float(os.getenv("WEBDAV_CONNECT_TIMEOUT_SECONDS", "15")),
+                  float(os.getenv("WEBDAV_READ_TIMEOUT_SECONDS", "120")))
 
 # Warehouse tujuan. Defaultnya cocok dengan compose stack ini.
 DB = {
@@ -286,6 +291,7 @@ def list_xlsx(folder: str) -> list[str]:
         "PROPFIND",
         _url(folder),
         headers={"Depth": "1"},
+        timeout=WEBDAV_TIMEOUT,
         data=b"""<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
   <d:prop><d:displayname/><d:resourcetype/></d:prop>
@@ -330,13 +336,20 @@ def download(folder: str, filename: str) -> bytes:
     url = _url(str(PurePosixPath(folder) / filename))
     resp = None
     for attempt in range(1, WEBDAV_MAX_RETRIES + 1):
-        resp = SESSION.get(url)
-        if resp.status_code != 423 and resp.status_code < 500:
-            break
+        try:
+            resp = SESSION.get(url, timeout=WEBDAV_TIMEOUT)
+            if resp.status_code != 423 and resp.status_code < 500:
+                break
+            sebab = str(resp.status_code)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            # Putus/timeout juga biasanya sesaat; percobaan terakhir dilempar ke atas.
+            if attempt == WEBDAV_MAX_RETRIES:
+                raise
+            sebab = type(exc).__name__
         if attempt < WEBDAV_MAX_RETRIES:
             wait = WEBDAV_RETRY_BACKOFF_SECONDS * attempt
-            log.warning("    ⏳ %d saat unduh, percobaan %d/%d — tunggu %.0fs: %s",
-                        resp.status_code, attempt, WEBDAV_MAX_RETRIES, wait, filename)
+            log.warning("    ⏳ %s saat unduh, percobaan %d/%d — tunggu %.0fs: %s",
+                        sebab, attempt, WEBDAV_MAX_RETRIES, wait, filename)
             time.sleep(wait)
     resp.raise_for_status()
     return resp.content
