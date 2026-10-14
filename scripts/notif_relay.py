@@ -671,23 +671,90 @@ def api_report(body: dict, user: dict) -> dict:
 
 # ── Bot: perintah dari grup Telegram ────────────────────────────────────────
 
-BANTUAN = (
-    "<b>Perintah yang tersedia</b>\n"
-    "/load — muat finance.xlsx semua folder di NEXTCLOUD_SOURCE_PATHS ke database\n"
-    "/load <i>A1/Finance</i> — hanya folder tertentu (relatif ke NEXTCLOUD_SOURCE_HOME, "
-    "boleh beberapa dipisah spasi)\n"
-    "/sync — muat data.xlsx (capil) semua kantor ke database\n"
-    "/sync <i>A1 B2</i> — hanya kantor tertentu\n"
-    "/dbt — jalankan <code>dbt run</code>\n"
-    "/laporan — kirim Rekap Bulanan (.xlsx) untuk bulan lalu\n"
-    "/laporan <i>8-2026</i> — rekap bulan tertentu (MM-YYYY)\n"
-    "/keuangan [<i>8-2026</i>] — kirim Laporan Keuangan (.xlsx) bulan lalu / bulan tertentu\n"
-    "/status — job sedang jalan atau tidak, plus hasil run terakhir\n"
-    "/logs [load|sync|dbt] — ekor log run terakhir\n"
-    "/app — buka Panel Pipeline (Mini App): status, tombol jalankan, log\n"
-    "/id — tampilkan user id Anda (untuk didaftarkan ke TELEGRAM_DM_USER_IDS)\n"
-    "/help — pesan ini"
-)
+# Satu-satunya daftar perintah: dipakai untuk /help DAN menu "/" Telegram
+# (setMyCommands), supaya keduanya tidak bisa berbeda lagi. Kolom ke-3 = job yang
+# harus bisa dihubungi agar perintah itu tampil (None = selalu tampil). Perintah
+# lama (/split) sengaja tidak masuk menu — tetap diterima lewat ALIAS_JOB.
+PERINTAH = [
+    # (perintah, deskripsi menu, job, baris bantuan)
+    ("load", "Muat data keuangan (finance.xlsx) ke database", "load",
+     "/load — muat finance.xlsx semua folder di NEXTCLOUD_SOURCE_PATHS ke database\n"
+     "/load <i>A1/Finance</i> — hanya folder tertentu (relatif ke NEXTCLOUD_SOURCE_HOME, "
+     "boleh beberapa dipisah spasi)"),
+    ("sync", "Muat data capil (data.xlsx) ke database", "sync",
+     "/sync — muat data.xlsx (capil) semua kantor ke database\n"
+     "/sync <i>A1 B2</i> — hanya kantor tertentu"),
+    ("dbt", "Jalankan dbt run", "dbt",
+     "/dbt — jalankan <code>dbt run</code>"),
+    ("laporan", "Kirim Rekap Bulanan (.xlsx)", None,
+     "/laporan — kirim Rekap Bulanan (.xlsx) untuk bulan lalu\n"
+     "/laporan <i>8-2026</i> — rekap bulan tertentu (MM-YYYY)"),
+    ("keuangan", "Kirim Laporan Keuangan (.xlsx)", None,
+     "/keuangan [<i>8-2026</i>] — kirim Laporan Keuangan (.xlsx) bulan lalu / bulan tertentu"),
+    ("status", "Status job load/sync/dbt + hasil run terakhir", None,
+     "/status — job sedang jalan atau tidak, plus hasil run terakhir"),
+    ("logs", "Ekor log run terakhir (load|sync|dbt)", None,
+     "/logs [load|sync|dbt] — ekor log run terakhir"),
+    ("app", "Buka Panel Pipeline (Mini App)", None,
+     "/app — buka Panel Pipeline (Mini App): status, tombol jalankan, log"),
+    ("id", "Tampilkan user id Anda", None,
+     "/id — tampilkan user id Anda (untuk didaftarkan ke TELEGRAM_DM_USER_IDS)"),
+    ("help", "Daftar perintah", None,
+     "/help — pesan ini"),
+]
+
+# Nama service compose per job, untuk pesan "belum aktif".
+SERVICE_JOB = {"load": "excel-loader", "sync": "capil-loader", "dbt": "dbt-runner"}
+MENU_REFRESH_SECONDS = int(os.getenv("TELEGRAM_MENU_REFRESH_SECONDS", "600"))
+
+
+def job_tersedia(nama: str) -> bool:
+    """True bila server kontrol job menjawab /status."""
+    try:
+        return requests.get(f"{JOBS[nama]}/status", timeout=3).ok
+    except requests.RequestException:
+        return False
+
+
+def perintah_aktif() -> list:
+    """PERINTAH tanpa perintah job yang server kontrolnya tidak bisa dihubungi."""
+    hidup = {j: job_tersedia(j) for j in JOBS}
+    return [p for p in PERINTAH if p[2] is None or hidup.get(p[2])]
+
+
+def bantuan() -> str:
+    return "<b>Perintah yang tersedia</b>\n" + "\n".join(p[3] for p in perintah_aktif())
+
+
+def pasang_menu_perintah() -> None:
+    """
+    Daftarkan menu "/" bot dari PERINTAH lewat setMyCommands, lalu perbarui
+    berkala. Menggantikan daftar yang dulu diisi manual di BotFather (split/sync
+    Airbyte) — job yang servicenya mati tidak ditampilkan, dan muncul lagi
+    otomatis begitu servicenya hidup.
+    """
+    terakhir = None
+    while True:
+        menu = [{"command": p[0], "description": p[1]} for p in perintah_aktif()]
+        if menu != terakhir:
+            try:
+                ok = True
+                # Default + scope grup/privat: BotFather atau versi lama bisa saja
+                # sudah memasang daftar per-scope yang menimpa default.
+                for scope in ({"type": "default"}, {"type": "all_group_chats"},
+                              {"type": "all_private_chats"}):
+                    r = requests.post(f"{TELEGRAM_BASE}/setMyCommands",
+                                      json={"commands": menu, "scope": scope},
+                                      timeout=REQUEST_TIMEOUT)
+                    ok = ok and r.ok
+                if ok:
+                    terakhir = menu
+                    log.info("Menu perintah Telegram: %s", " ".join("/" + m["command"] for m in menu))
+                else:
+                    log.warning("setMyCommands gagal: %s", r.text[:300])
+            except requests.RequestException as exc:
+                log.warning("setMyCommands gagal: %s", exc)
+        time.sleep(MENU_REFRESH_SECONDS if terakhir == menu else 60)
 
 
 def _fmt_waktu(ts) -> str:
@@ -889,8 +956,11 @@ def mulai_job(nama: str, args: list, chat_id, reply_to) -> None:
     try:
         kode, data = picu_job(nama, body)
     except requests.RequestException as exc:
+        log.warning("Job %s tidak bisa dihubungi: %s", nama, exc)
         send_telegram(
-            f"❌ Tidak bisa menghubungi <b>{nama}</b>: {html.escape(str(exc)[:300])}",
+            f"⚠️ <b>/{nama}</b> belum tersedia: service "
+            f"<code>{SERVICE_JOB.get(nama, nama)}</code> tidak aktif di server.\n\n"
+            f"{bantuan()}",
             chat_id, reply_to,
         )
         return
@@ -1053,7 +1123,7 @@ def handle_command(message: dict) -> None:
     elif perintah == "app":
         kirim_panel(chat_id, reply_to)
     elif perintah in ("help", "start"):
-        send_telegram(BANTUAN, chat_id, reply_to, tombol_mini_app(chat_id) or None)
+        send_telegram(bantuan(), chat_id, reply_to, tombol_mini_app(chat_id) or None)
     elif perintah == "status":
         kirim_status(chat_id, reply_to)
     elif perintah == "logs":
@@ -1072,7 +1142,7 @@ def handle_command(message: dict) -> None:
         mulai_job(perintah, args, chat_id, reply_to)
     else:
         send_telegram(f"Perintah tidak dikenal: <code>/{html.escape(perintah)}</code>\n\n"
-                      f"{BANTUAN}", chat_id, reply_to)
+                      f"{bantuan()}", chat_id, reply_to)
 
 
 def poll_updates() -> None:
@@ -1245,6 +1315,7 @@ def main() -> None:
             log.info("TELEGRAM_DM_USER_IDS kosong: perintah hanya dilayani di grup "
                      "(ketik /id di grup untuk melihat user id).")
         threading.Thread(target=poll_updates, daemon=True).start()
+        threading.Thread(target=pasang_menu_perintah, daemon=True).start()
     else:
         log.info("Bot Telegram dimatikan (TELEGRAM_BOT_ENABLED=false).")
 
