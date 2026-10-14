@@ -368,7 +368,9 @@ def _lipat(nama) -> str:
     dan tanda baca: 'No.' / 'No_' -> 'no', 'TUNAI IFQ' / 'TUNAI_IFQ' -> 'tunai_ifq'.
     Yang ditulis ke database tetap nama kanonik dari kontrak.
     """
-    return re.sub(r"\W+", "_", str(nama).strip()).strip("_").lower()
+    # Garis bawah ikut dilipat: Airbyte menamai 'Aset Hak Milik Tanah (m2)' sebagai
+    # 'Aset_Hak_Milik_Tanah__m2_' (dobel + ekor '_'), dan itu harus tetap cocok.
+    return re.sub(r"[\W_]+", "_", str(nama).strip()).strip("_").lower()
 
 
 def _ke_angka(nilai):
@@ -470,6 +472,7 @@ def baca_sheet(ws_nilai, ws_rumus, kontrak: dict) -> tuple[list[dict], list[dict
     ada = [k for k in wajib if k in posisi]  # kolom yang hilang tetap dilaporkan di atas
 
     baris: list[dict] = []
+    rumus_kosong: dict[str, list[str]] = {}
     kosong_beruntun = 0
     for nomor, (nilai, rumus) in enumerate(zip(it_nilai, it_rumus), start=2):
         # Template finance memformat seluruh kolom sampai baris 1.048.576, dan
@@ -507,9 +510,20 @@ def baca_sheet(ws_nilai, ws_rumus, kontrak: dict) -> tuple[list[dict], list[dict
             i = posisi[k]
             f = rumus[i] if i < len(rumus) else None
             if mentah[k] is None and isinstance(f, str) and f.startswith("="):
-                masalah.append(_masalah("formula_tanpa_hasil",
-                                        sel=f"{get_column_letter(i + 1)}{nomor}", kolom=k))
+                alamat = f"{get_column_letter(i + 1)}{nomor}"
+                if CAPIL:
+                    # Capil: catatan saja, dikumpulkan per kolom. Kolom formulanya
+                    # (Usia_*, Status_Pemberdayaan, ...) turunan dan tidak dipakai
+                    # dbt/laporan; Airbyte dulu juga memuatnya kosong.
+                    rumus_kosong.setdefault(k, []).append(alamat)
+                else:
+                    # Finance: galat — total kosong jadi nol di laporan.
+                    masalah.append(_masalah("formula_tanpa_hasil", sel=alamat, kolom=k))
         baris.append(rekaman)
+
+    for k, sel_sel in rumus_kosong.items():
+        masalah.append(_masalah("formula_tanpa_hasil", galat=False, kolom=k,
+                                sel=sel_sel[0], jumlah=len(sel_sel)))
 
     return baris, masalah
 
@@ -704,6 +718,9 @@ def _kontrak_capil(conn, tabel: str) -> dict:
                 if kolom:
                     acuan = t
                     break
+    # Kolom 'null' = buatan Airbyte untuk judul kolom yang kosong; tidak bisa
+    # dicocokkan dengan judul apa pun, jadi bukan kontrak — dibiarkan NULL.
+    kolom = [(k, t) for k, t in kolom if k.lower() != "null"]
     if not kolom:
         raise LookupError(f"tabel {tabel} belum ada dan tidak ada tabel capil lain "
                           f"di schema {DB_SCHEMA} untuk ditiru bentuknya")

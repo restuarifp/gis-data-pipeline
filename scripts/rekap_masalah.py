@@ -204,6 +204,10 @@ def _kalimat_catatan(m: dict, hasil: dict) -> str:
     if m["jenis"] == "kolom_tambahan":
         return (f"sheet {_c(m.get('sheet'))}: kolom tambahan tidak dibaca "
                 f"({', '.join(_c(_kolom(k)) for k in str(m.get('kolom', '')).split(', '))})")
+    if m["jenis"] == "formula_tanpa_hasil":
+        return (f"sheet {_c(m.get('sheet'))}: {m.get('jumlah', 1)} sel rumus kolom "
+                f"{_c(_kolom(m.get('kolom', '')))} belum ada hasil hitungnya (mis. "
+                f"{_c(m.get('sel'))}), dimuat kosong — buka di OnlyOffice/Excel lalu simpan ulang")
     return _e(m["jenis"])
 
 
