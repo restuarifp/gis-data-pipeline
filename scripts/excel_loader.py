@@ -50,7 +50,7 @@ import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urlparse
@@ -396,6 +396,10 @@ def _ke_angka(nilai):
 def _ke_teks(nilai):
     if nilai is None:
         return None
+    if isinstance(nilai, timedelta):
+        # Sel angka berformat durasi/jam ([h]:mm) dibaca openpyxl sebagai timedelta;
+        # str()-nya "11668 days, 0:00:00". Kembalikan ke angka Excel aslinya.
+        nilai = nilai.total_seconds() / 86400
     if isinstance(nilai, float) and nilai.is_integer():
         nilai = int(nilai)  # 123.0 dari Excel -> '123', bukan '123.0'
     teks = str(nilai)
