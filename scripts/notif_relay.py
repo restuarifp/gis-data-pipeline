@@ -770,7 +770,10 @@ def pasang_menu_perintah() -> None:
                     log.warning("setMyCommands gagal: %s", r.text[:300])
             except requests.RequestException as exc:
                 log.warning("setMyCommands gagal: %s", exc)
-        time.sleep(MENU_REFRESH_SECONDS if terakhir == menu else 60)
+        # Ada service yang belum menjawab (mis. baru start bersamaan dengan relay)
+        # atau setMyCommands gagal -> cek lagi semenit lagi, bukan 10 menit.
+        lengkap = len(menu) == len(PERINTAH)
+        time.sleep(MENU_REFRESH_SECONDS if terakhir == menu and lengkap else 60)
 
 
 def _fmt_waktu(ts) -> str:
