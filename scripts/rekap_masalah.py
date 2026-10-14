@@ -205,10 +205,36 @@ def _kalimat_catatan(m: dict, hasil: dict) -> str:
         return (f"sheet {_c(m.get('sheet'))}: kolom tambahan tidak dibaca "
                 f"({', '.join(_c(_kolom(k)) for k in str(m.get('kolom', '')).split(', '))})")
     if m["jenis"] == "formula_tanpa_hasil":
-        return (f"sheet {_c(m.get('sheet'))}: {m.get('jumlah', 1)} sel rumus kolom "
-                f"{_c(_kolom(m.get('kolom', '')))} belum ada hasil hitungnya (mis. "
-                f"{_c(m.get('sel'))}), dimuat kosong — buka di OnlyOffice/Excel lalu simpan ulang")
+        return _rumus_kosong([m])
     return _e(m["jenis"])
+
+
+def _rentang(m: dict) -> str:
+    """'I233' atau 'I233–I2224' (sel pertama–terakhir yang bermasalah)."""
+    awal, akhir = m.get("sel"), m.get("sel_akhir")
+    return awal if not akhir or akhir == awal else f"{awal}–{akhir}"
+
+
+def _rumus_kosong(daftar: list) -> str:
+    """Semua kolom berumus tanpa hasil di satu kantor -> satu frasa pendek."""
+    kolom = []
+    for m in daftar:
+        n = m.get("jumlah", 1)
+        kolom.append(f"{_e(_kolom(m.get('kolom', '')))} {_c(_rentang(m))}"
+                     + (f" ({n} sel)" if n > 1 else ""))
+    return ("rumus belum terhitung, dimuat kosong: " + ", ".join(kolom)
+            + " — buka file di OnlyOffice/Excel lalu simpan ulang")
+
+
+def _catatan_kantor(daftar: list, hasil: dict) -> str:
+    """Semua catatan (tidak menolak data) satu kantor -> satu kalimat."""
+    rumus = [m for m in daftar if m["jenis"] == "formula_tanpa_hasil"]
+    lain = [m for m in daftar if m["jenis"] != "formula_tanpa_hasil"]
+    bagian = [_kalimat_sistem(m) if (m.get("sistem") or m["jenis"] in JENIS_SISTEM)
+              else _kalimat_catatan(m, hasil) for m in lain]
+    if rumus:
+        bagian.append(_rumus_kosong(rumus))
+    return "; ".join(bagian)
 
 
 def dimuat(hasil: dict) -> bool:
@@ -288,22 +314,27 @@ def susun(hasil: dict, durasi: str = "", diulang: bool = False) -> str:
         galat_di = {(m.get("file"), m.get("sheet")) for m in masalah if m.get("galat")}
         ada_sheet_hilang = any(m["jenis"] == "sheet_hilang" for m in masalah)
         sheet_lain = [m.get("sheet") for m in masalah if m["jenis"] == "sheet_tak_dikenal"]
+        catatan_kantor = []  # digabung jadi SATU baris untuk kantor ini
         for m in masalah:
             tempat = (m.get("file"), m.get("sheet"))
             if m.get("sistem") or m["jenis"] in JENIS_SISTEM:
-                (sistem if m.get("galat") else catatan).append(
-                    f"<b>{_e(nama)}</b>: {_kalimat_sistem(m)}")
+                if m.get("galat"):
+                    sistem.append(f"<b>{_e(nama)}</b>: {_kalimat_sistem(m)}")
+                else:
+                    catatan_kantor.append(m)
             elif m["jenis"] == "kolom_tambahan" and tempat in galat_di:
                 # Jadi petunjuk di kalimat "judul kolom tidak ditemukan".
                 per_tempat.setdefault(tempat, {}).setdefault(m["jenis"], []).append(m)
             elif m["jenis"] == "sheet_tak_dikenal" and ada_sheet_hilang:
                 continue  # sudah disebut di kalimat "sheet tidak ada"
             elif not m.get("galat"):
-                catatan.append(f"<b>{_e(nama)}</b>: {_kalimat_catatan(m, hasil)}")
+                catatan_kantor.append(m)
             else:
                 if m["jenis"] == "sheet_hilang":
                     tempat = (None, None)  # hilang dari semua file, bukan dari satu tempat
                 per_tempat.setdefault(tempat, {}).setdefault(m["jenis"], []).append(m)
+        if catatan_kantor:
+            catatan.append(f"<b>{_e(nama)}</b>: {_catatan_kantor(catatan_kantor, hasil)}")
         if per_tempat:
             rincian.append(f"\n<b>{_e(nama)}</b>")
             # Masalah tingkat kantor (tanpa file/sheet) ditulis paling atas, tanpa judul.

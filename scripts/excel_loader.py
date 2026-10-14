@@ -527,7 +527,7 @@ def baca_sheet(ws_nilai, ws_rumus, kontrak: dict) -> tuple[list[dict], list[dict
 
     for k, sel_sel in rumus_kosong.items():
         masalah.append(_masalah("formula_tanpa_hasil", galat=False, kolom=k,
-                                sel=sel_sel[0], jumlah=len(sel_sel)))
+                                sel=sel_sel[0], sel_akhir=sel_sel[-1], jumlah=len(sel_sel)))
 
     return baris, masalah
 

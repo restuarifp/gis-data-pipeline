@@ -126,6 +126,18 @@ JOB_LOADER = ("load", "sync")
 # Nama lama yang masih diterima dari Telegram/Mini App supaya kebiasaan operator
 # tidak langsung patah. split-excel sudah digantikan excel-loader (ADR 0005).
 ALIAS_JOB = {"split": "load"}
+# Di Telegram kedua loader dipicu lewat satu perintah: /sync keuangan | /sync capil.
+# Nama job internal (load/sync) tetap — dipakai Mini App dan server kontrol.
+LABEL_JOB = {"load": "sync keuangan", "sync": "sync capil", "dbt": "dbt"}
+# Kata setelah /sync (dan /logs) -> job. Kata pertama tiap job = nama resminya.
+SUBPERINTAH_SYNC = {
+    "keuangan": "load", "finance": "load", "keu": "load",
+    "capil": "sync",
+}
+
+
+def label(nama: str) -> str:
+    return LABEL_JOB.get(nama, nama)
 if os.getenv("SPLIT_CONTROL_URL", "").strip():
     # Sengaja tidak dipakai sebagai fallback: nilainya di .env lama menunjuk ke
     # http://split-excel:8080, service yang sudah tidak ada.
@@ -619,13 +631,13 @@ def api_run(body: dict, user: dict) -> dict:
         rincian = _rincian_params(params)
         threading.Thread(
             target=send_telegram,
-            args=(f"▶️ <b>{nama}</b> dimulai oleh {html.escape(sebut(user))} "
+            args=(f"▶️ <b>{label(nama)}</b> dimulai oleh {html.escape(sebut(user))} "
                   f"lewat Mini App.{rincian}",),
             daemon=True,
         ).start()
-        return {"ok": True, "message": f"{nama} dimulai. Hasilnya dilaporkan ke grup."}
+        return {"ok": True, "message": f"{label(nama)} dimulai. Hasilnya dilaporkan ke grup."}
     if kode == 409:
-        raise WebAppError(f"{nama} masih berjalan.", 409)
+        raise WebAppError(f"{label(nama)} masih berjalan.", 409)
     raise WebAppError(str((data or {}).get("error") or f"ditolak ({kode})")[:300], 400)
 
 
@@ -677,13 +689,13 @@ def api_report(body: dict, user: dict) -> dict:
 # lama (/split) sengaja tidak masuk menu — tetap diterima lewat ALIAS_JOB.
 PERINTAH = [
     # (perintah, deskripsi menu, job, baris bantuan)
-    ("load", "Muat data keuangan (finance.xlsx) ke database", "load",
-     "/load — muat finance.xlsx semua folder di NEXTCLOUD_SOURCE_PATHS ke database\n"
-     "/load <i>A1/Finance</i> — hanya folder tertentu (relatif ke NEXTCLOUD_SOURCE_HOME, "
-     "boleh beberapa dipisah spasi)"),
-    ("sync", "Muat data capil (data.xlsx) ke database", "sync",
-     "/sync — muat data.xlsx (capil) semua kantor ke database\n"
-     "/sync <i>A1 B2</i> — hanya kantor tertentu"),
+    ("sync", "Muat Excel ke database: /sync keuangan atau /sync capil", ("load", "sync"),
+     "/sync keuangan — muat <code>finance.xlsx</code> (sheet REKAP & RINCIAN) semua kantor\n"
+     "/sync keuangan <i>A1 B2</i> — hanya kantor tertentu\n"
+     "/sync capil — muat <code>data.xlsx</code> (data capil) semua kantor\n"
+     "/sync capil <i>A1 B2</i> — hanya kantor tertentu\n"
+     "<i>File dibaca dari folder kantor di Nextcloud; file yang tidak berubah dilewati. "
+     "Hasilnya (kantor masuk/ditolak + sel yang perlu diperbaiki) dikirim ke grup.</i>"),
     ("dbt", "Jalankan dbt run", "dbt",
      "/dbt — jalankan <code>dbt run</code>"),
     ("laporan", "Kirim Rekap Bulanan (.xlsx)", None,
@@ -691,10 +703,10 @@ PERINTAH = [
      "/laporan <i>8-2026</i> — rekap bulan tertentu (MM-YYYY)"),
     ("keuangan", "Kirim Laporan Keuangan (.xlsx)", None,
      "/keuangan [<i>8-2026</i>] — kirim Laporan Keuangan (.xlsx) bulan lalu / bulan tertentu"),
-    ("status", "Status job load/sync/dbt + hasil run terakhir", None,
+    ("status", "Status sync keuangan/capil & dbt + hasil run terakhir", None,
      "/status — job sedang jalan atau tidak, plus hasil run terakhir"),
-    ("logs", "Ekor log run terakhir (load|sync|dbt)", None,
-     "/logs [load|sync|dbt] — ekor log run terakhir"),
+    ("logs", "Ekor log run terakhir (keuangan|capil|dbt)", None,
+     "/logs [keuangan|capil|dbt] — ekor log run terakhir"),
     ("app", "Buka Panel Pipeline (Mini App)", None,
      "/app — buka Panel Pipeline (Mini App): status, tombol jalankan, log"),
     ("id", "Tampilkan user id Anda", None,
@@ -719,7 +731,11 @@ def job_tersedia(nama: str) -> bool:
 def perintah_aktif() -> list:
     """PERINTAH tanpa perintah job yang server kontrolnya tidak bisa dihubungi."""
     hidup = {j: job_tersedia(j) for j in JOBS}
-    return [p for p in PERINTAH if p[2] is None or hidup.get(p[2])]
+    def tampil(job):
+        if job is None:
+            return True
+        return any(hidup.get(j) for j in (job if isinstance(job, tuple) else (job,)))
+    return [p for p in PERINTAH if tampil(p[2])]
 
 
 def bantuan() -> str:
@@ -765,12 +781,12 @@ def _fmt_waktu(ts) -> str:
 
 def _ringkas_status(nama: str, st: dict) -> str:
     if st.get("running"):
-        return f"⏳ <b>{nama}</b>: berjalan ({_fmt_duration(st.get('duration_s'))})"
+        return f"⏳ <b>{label(nama)}</b>: berjalan ({_fmt_duration(st.get('duration_s'))})"
     if st.get("last_finished") is None:
-        return f"💤 <b>{nama}</b>: belum pernah jalan sejak service start"
+        return f"💤 <b>{label(nama)}</b>: belum pernah jalan sejak service start"
     tanda = "✅" if st.get("last_ok") else "❌"
     return (
-        f"{tanda} <b>{nama}</b>: selesai {_fmt_waktu(st.get('last_finished'))} "
+        f"{tanda} <b>{label(nama)}</b>: selesai {_fmt_waktu(st.get('last_finished'))} "
         f"({_fmt_duration(st.get('duration_s'))})"
     )
 
@@ -852,7 +868,7 @@ def _lapor_selesai(nama: str, st: dict) -> None:
         rincian = "\n" + "\n".join(f"• <code>{html.escape(str(s))}</code>" for s in sumber)
 
     if st.get("last_ok"):
-        pesan = f"✅ <b>{nama}</b> selesai ({durasi}).{rincian}"
+        pesan = f"✅ <b>{label(nama)}</b> selesai ({durasi}).{rincian}"
     else:
         ekor = ""
         try:
@@ -860,7 +876,7 @@ def _lapor_selesai(nama: str, st: dict) -> None:
             ekor = "\n".join(teks.splitlines()[-15:])
         except Exception as exc:  # noqa: BLE001
             log.warning("Gagal ambil log %s: %s", nama, exc)
-        pesan = f"❌ <b>{nama}</b> GAGAL ({durasi}).{rincian}"
+        pesan = f"❌ <b>{label(nama)}</b> GAGAL ({durasi}).{rincian}"
         if ekor:
             # Log teknis sebagai kutipan yang bisa dibuka-tutup, bukan blok kode:
             # yang perlu disalin operator adalah nama job/folder di atas, bukan log.
@@ -958,7 +974,7 @@ def mulai_job(nama: str, args: list, chat_id, reply_to) -> None:
     except requests.RequestException as exc:
         log.warning("Job %s tidak bisa dihubungi: %s", nama, exc)
         send_telegram(
-            f"⚠️ <b>/{nama}</b> belum tersedia: service "
+            f"⚠️ <b>/{label(nama)}</b> belum tersedia: service "
             f"<code>{SERVICE_JOB.get(nama, nama)}</code> tidak aktif di server.\n\n"
             f"{bantuan()}",
             chat_id, reply_to,
@@ -969,13 +985,13 @@ def mulai_job(nama: str, args: list, chat_id, reply_to) -> None:
         # Hasilnya dilaporkan oleh watch_jobs(), bukan di sini — supaya run
         # terjadwal dan run manual sama-sama dapat satu pesan, tanpa dobel.
         langgan_hasil(nama, chat_id)
-        send_telegram(f"▶️ <b>{nama}</b> dimulai.{_rincian_params(body)}", chat_id, reply_to)
+        send_telegram(f"▶️ <b>{label(nama)}</b> dimulai.{_rincian_params(body)}", chat_id, reply_to)
     elif kode == 409:
-        send_telegram(f"⏳ <b>{nama}</b> masih berjalan; permintaan diabaikan.",
+        send_telegram(f"⏳ <b>{label(nama)}</b> masih berjalan; permintaan diabaikan.",
                       chat_id, reply_to)
     else:
         send_telegram(
-            f"❌ <b>{nama}</b> ditolak ({kode}): "
+            f"❌ <b>{label(nama)}</b> ditolak ({kode}): "
             f"{html.escape(str((data or {}).get('error', ''))[:500])}",
             chat_id, reply_to,
         )
@@ -1013,25 +1029,25 @@ def kirim_status(chat_id, reply_to) -> None:
                 baris.append("   ⚠️ <i>container ini tidak memuat capil — cek "
                              "<code>LOADER_DATASET=capil</code> di service capil-loader</i>")
         except Exception as exc:  # noqa: BLE001
-            baris.append(f"⚠️ <b>{nama}</b>: tidak bisa dihubungi ({html.escape(str(exc)[:120])})")
+            baris.append(f"⚠️ <b>{label(nama)}</b>: tidak bisa dihubungi ({html.escape(str(exc)[:120])})")
     send_telegram("\n".join(baris), chat_id, reply_to)
 
 
 def kirim_logs(args: list, chat_id, reply_to) -> None:
-    nama = (args[0] if args else "load").lower()
-    nama = ALIAS_JOB.get(nama, nama)
+    nama = (args[0] if args else "keuangan").lower()
+    nama = SUBPERINTAH_SYNC.get(nama, ALIAS_JOB.get(nama, nama))
     if nama not in JOBS:
-        send_telegram(f"Job tidak dikenal: {html.escape(nama)}. "
-                      f"Pilihan: {', '.join(JOBS)}", chat_id, reply_to)
+        send_telegram(f"Log tidak dikenal: {html.escape(nama)}. "
+                      f"Pilihan: keuangan, capil, dbt", chat_id, reply_to)
         return
     try:
         teks = requests.get(f"{JOBS[nama]}/logs", timeout=REQUEST_TIMEOUT).text
     except requests.RequestException as exc:
-        send_telegram(f"❌ Gagal ambil log {nama}: {html.escape(str(exc)[:300])}",
+        send_telegram(f"❌ Gagal ambil log {label(nama)}: {html.escape(str(exc)[:300])}",
                       chat_id, reply_to)
         return
     ekor = "\n".join(teks.splitlines()[-30:]) or "(belum ada log)"
-    send_telegram(f"<b>Log {nama}</b>\n<pre>{html.escape(ekor[:3500])}</pre>",
+    send_telegram(f"<b>Log {label(nama)}</b>\n<pre>{html.escape(ekor[:3500])}</pre>",
                   chat_id, reply_to)
 
 
@@ -1132,17 +1148,47 @@ def handle_command(message: dict) -> None:
         kirim_laporan(args, message, chat_id, reply_to)
     elif perintah == "keuangan":
         kirim_laporan(args, message, chat_id, reply_to, "keuangan")
-    elif perintah in ALIAS_JOB:
-        baru = ALIAS_JOB[perintah]
-        send_telegram(f"ℹ️ <code>/{perintah}</code> sudah diganti <code>/{baru}</code> — "
-                      f"file tidak lagi dipecah, langsung dimuat ke database.",
-                      chat_id, reply_to)
-        mulai_job(baru, args, chat_id, reply_to)
+    elif perintah in ("sync", "load", "split"):
+        perintah_sync(perintah, args, chat_id, reply_to)
     elif perintah in JOBS:
         mulai_job(perintah, args, chat_id, reply_to)
     else:
         send_telegram(f"Perintah tidak dikenal: <code>/{html.escape(perintah)}</code>\n\n"
                       f"{bantuan()}", chat_id, reply_to)
+
+
+PETUNJUK_SYNC = (
+    "<b>/sync — muat file Excel kantor ke database</b>\n"
+    "Pilih datanya dulu:\n"
+    "• <code>/sync keuangan</code> — <code>finance.xlsx</code> (sheet REKAP & RINCIAN) semua kantor\n"
+    "• <code>/sync capil</code> — <code>data.xlsx</code> (data capil) semua kantor\n"
+    "Tambahkan kode kantor untuk memuat sebagian saja, mis. "
+    "<code>/sync keuangan A1 B2</code> atau <code>/sync capil C3</code>.\n"
+    "<i>File yang tidak berubah dilewati. Hasilnya — kantor yang masuk, yang ditolak, "
+    "dan sel yang perlu diperbaiki — dikirim ke grup.</i>"
+)
+
+
+def perintah_sync(perintah: str, args: list, chat_id, reply_to) -> None:
+    """/sync keuangan|capil [kantor…]; /load dan /split lama = /sync keuangan."""
+    if perintah != "sync":
+        send_telegram(f"ℹ️ <code>/{perintah}</code> sudah diganti "
+                      f"<code>/sync keuangan</code>.", chat_id, reply_to)
+        args = ["keuangan"] + args
+    if not args or args[0].lower() not in SUBPERINTAH_SYNC:
+        awal = (f"Data <code>{html.escape(args[0])}</code> tidak dikenal.\n\n"
+                if args else "")
+        send_telegram(awal + PETUNJUK_SYNC, chat_id, reply_to)
+        return
+    nama = SUBPERINTAH_SYNC[args[0].lower()]
+    kantor = args[1:]
+    if nama == "load":
+        # finance.xlsx ada di <Kantor>/Finance; kode kantor saja (A1) dilengkapi,
+        # path lengkap (A1/Finance) diteruskan apa adanya.
+        kantor = [k if "/" in k else f"{k.upper()}/Finance" for k in kantor]
+    else:
+        kantor = [k if "/" in k else k.upper() for k in kantor]
+    mulai_job(nama, kantor, chat_id, reply_to)
 
 
 def poll_updates() -> None:
