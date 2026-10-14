@@ -80,7 +80,7 @@ log = logging.getLogger(__name__)
 NEXTCLOUD_URL      = os.environ["NEXTCLOUD_URL"]           # https://cloud.example.com
 NEXTCLOUD_USER     = os.environ["NEXTCLOUD_USER"]
 NEXTCLOUD_PASSWORD = os.environ["NEXTCLOUD_PASSWORD"]
-SCHEDULE_MINUTES   = int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "60"))
+SCHEDULE_MINUTES   = int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "120"))
 
 # Retry saat Nextcloud membalas 423 Locked / 5xx sesaat ketika file diunduh.
 WEBDAV_MAX_RETRIES           = int(os.getenv("WEBDAV_MAX_RETRIES", "5"))
