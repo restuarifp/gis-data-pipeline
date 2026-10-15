@@ -341,7 +341,10 @@ def download(folder: str, filename: str) -> bytes:
             if resp.status_code != 423 and resp.status_code < 500:
                 break
             sebab = str(resp.status_code)
-        except (requests.ConnectionError, requests.Timeout) as exc:
+        except (requests.ConnectionError, requests.Timeout,
+                requests.exceptions.ChunkedEncodingError) as exc:
+            # ChunkedEncodingError = koneksi putus di tengah unduhan ("Connection broken:
+            # BrokenPipeError"); bukan turunan ConnectionError, jadi harus disebut sendiri.
             # Putus/timeout juga biasanya sesaat; percobaan terakhir dilempar ke atas.
             if attempt == WEBDAV_MAX_RETRIES:
                 raise
