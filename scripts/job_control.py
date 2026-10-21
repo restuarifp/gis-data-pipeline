@@ -16,6 +16,8 @@ Endpoint (hanya di dalam gisnet, tidak dipublish ke host):
   GET  /status  -- JSON: running, last_started, last_finished, last_ok, duration_s,
                    last_trigger ('manual' | 'jadwal'), last_result (ringkasan dari runner)
   GET  /logs    -- ekor log run terakhir (teks biasa)
+  POST /schedule -- {"enabled": true|false}: nyalakan/matikan run terjadwal
+                   (hanya service dengan loop --watch; lainnya 404)
   GET  /        -- health check
 
 Konfigurasi via environment:
@@ -82,6 +84,34 @@ class JobRunner:
         self.last_params: dict = {}
         self.last_trigger: str | None = None
         self.last_result: dict | None = None
+        # Jadwal (--watch). None = service ini tidak punya run terjadwal.
+        # Saklarnya hanya di memori: restart container kembali ke nilai awal
+        # dari env (SCHEDULE_ENABLED, default mati) — arah yang aman.
+        self.jadwal: dict | None = None
+
+    # ── jadwal ──────────────────────────────────────────────────────────────
+
+    def pasang_jadwal(self, interval_menit: int, aktif: bool) -> None:
+        # Aktif sejak start = run pertama segera, seperti loop --watch dulu.
+        self.jadwal = {"aktif": bool(aktif), "interval_menit": interval_menit,
+                       "berikutnya": time.time() if aktif else None}
+
+    def set_jadwal(self, aktif: bool) -> dict:
+        j = self.jadwal
+        if bool(aktif) != j["aktif"]:
+            j["aktif"] = bool(aktif)
+            # Dinyalakan = run pertama satu interval dari sekarang, bukan seketika:
+            # yang perlu data segera tinggal menekan Jalankan.
+            j["berikutnya"] = time.time() + j["interval_menit"] * 60 if aktif else None
+            log.info("Jadwal %s %s.", self.nama, "DINYALAKAN" if aktif else "DIMATIKAN")
+        return dict(j)
+
+    def jadwal_jatuh_tempo(self) -> bool:
+        j = self.jadwal
+        if not j or not j["aktif"] or time.time() < j["berikutnya"]:
+            return False
+        j["berikutnya"] = time.time() + j["interval_menit"] * 60
+        return True
 
     # ── status ──────────────────────────────────────────────────────────────
 
@@ -103,6 +133,7 @@ class JobRunner:
             "last_trigger": self.last_trigger,
             "last_result": self.last_result,
             "duration_s": round(durasi, 1) if durasi is not None else None,
+            "schedule": dict(self.jadwal) if self.jadwal else None,
         }
 
     def logs(self) -> str:
@@ -200,6 +231,9 @@ def _make_handler(runner: JobRunner, validate=None):
 
         def do_POST(self):  # noqa: N802
             path = self.path.split("?", 1)[0].rstrip("/") or "/"
+            if path == "/schedule":
+                self._schedule()
+                return
             if path != "/run":
                 self._json(404, {"error": f"endpoint tidak dikenal: {path}"})
                 return
@@ -230,21 +264,41 @@ def _make_handler(runner: JobRunner, validate=None):
             log.info("Job %s dimulai lewat /run (params: %s).", runner.nama, params)
             self._json(202, {"started": True, **runner.status()})
 
+        def _schedule(self):
+            if runner.jadwal is None:
+                self._json(404, {"error": f"job {runner.nama} tidak punya jadwal"})
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                self._json(400, {"error": f"body bukan JSON valid: {exc}"})
+                return
+            aktif = body.get("enabled") if isinstance(body, dict) else None
+            if not isinstance(aktif, bool):
+                self._json(400, {"error": "field 'enabled' harus true/false"})
+                return
+            self._json(200, {"schedule": runner.set_jadwal(aktif)})
+
         def log_message(self, fmt, *args):  # redam akses-log bawaan
             log.debug("%s - %s", self.address_string(), fmt % args)
 
     return Handler
 
 
-def serve(nama: str, fn, validate=None, background: bool = False, info=None) -> JobRunner:
+def serve(nama: str, fn, validate=None, background: bool = False, info=None,
+          jadwal: tuple | None = None) -> JobRunner:
     """
     Nyalakan server kontrol untuk job `nama`.
 
     background=True menjalankannya di thread daemon (dipakai excel-loader yang
     thread utamanya sudah dipegang loop --watch).
     `info` dict/callable berisi config aktif yang ikut tampil di /status.
+    `jadwal` = (interval_menit, aktif_awal) untuk job dengan loop --watch.
     """
     runner = JobRunner(nama, fn, info)
+    if jadwal:
+        runner.pasang_jadwal(*jadwal)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), _make_handler(runner, validate))
     log.info("Server kontrol job '%s' mendengarkan di 0.0.0.0:%d", nama, PORT)
 

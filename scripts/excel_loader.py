@@ -30,7 +30,9 @@ Mode:
   python excel_loader.py A2/Finance [B1/Finance ...]
                                    -- jalankan sekali untuk folder tertentu saja
                                       (capil: python excel_loader.py A2 B1)
-  python excel_loader.py --watch   -- loop berkala (SCHEDULE_INTERVAL_MINUTES)
+  python excel_loader.py --watch   -- loop berkala (SCHEDULE_INTERVAL_MINUTES;
+                                      dengan --serve hanya jalan bila SCHEDULE_ENABLED
+                                      atau saklar Mini App menyala)
   python excel_loader.py --serve   -- server kontrol HTTP (job_control) di gisnet,
                                       dipakai bot Telegram untuk memicu run
 
@@ -81,6 +83,9 @@ NEXTCLOUD_URL      = os.environ["NEXTCLOUD_URL"]           # https://cloud.examp
 NEXTCLOUD_USER     = os.environ["NEXTCLOUD_USER"]
 NEXTCLOUD_PASSWORD = os.environ["NEXTCLOUD_PASSWORD"]
 SCHEDULE_MINUTES   = int(os.getenv("SCHEDULE_INTERVAL_MINUTES", "120"))
+# Run terjadwal (--watch) mati kecuali diminta. Bisa dinyalakan/dimatikan dari
+# Mini App tanpa restart; restart container kembali ke nilai ini.
+SCHEDULE_ENABLED   = os.getenv("SCHEDULE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
 # Retry saat Nextcloud membalas 423 Locked / 5xx sesaat ketika file diunduh.
 WEBDAV_MAX_RETRIES           = int(os.getenv("WEBDAV_MAX_RETRIES", "5"))
@@ -995,21 +1000,30 @@ def main() -> None:
                 **({"file": CAPIL_FILE, "sheet": CAPIL_SHEET or "(sheet pertama)"}
                    if CAPIL else {}),
             },
+            jadwal=(SCHEDULE_MINUTES, SCHEDULE_ENABLED) if "--watch" in flag else None,
         )
         if "--watch" not in flag:
             return
 
     if "--watch" in flag:
-        log.info("Mode watch aktif, interval: %d menit", SCHEDULE_MINUTES)
-        while True:
-            if runner is None:
+        if runner is None:
+            # Tanpa --serve tidak ada saklar; --watch berarti memang minta jadwal.
+            log.info("Mode watch aktif, interval: %d menit", SCHEDULE_MINUTES)
+            while True:
                 run_once()
-            elif not runner.run_now({}, trigger="jadwal"):
+                log.info("Tunggu %d menit...", SCHEDULE_MINUTES)
+                time.sleep(SCHEDULE_MINUTES * 60)
+        log.info("Mode watch: interval %d menit, jadwal %s (saklar di Mini App).",
+                 SCHEDULE_MINUTES, "AKTIF" if SCHEDULE_ENABLED else "MATI")
+        while True:
+            # Cek tiap 30 detik supaya saklar Mini App langsung berlaku.
+            time.sleep(30)
+            if not runner.jadwal_jatuh_tempo():
+                continue
+            if not runner.run_now({}, trigger="jadwal"):
                 # Run manual dari Telegram sedang jalan — dua run bersamaan akan
                 # berebut generation id, jadi jadwal ini dilewati saja.
                 log.info("Run terjadwal dilewati: run lain masih berjalan.")
-            log.info("Tunggu %d menit...", SCHEDULE_MINUTES)
-            time.sleep(SCHEDULE_MINUTES * 60)
     else:
         sys.exit(0 if run_once(pilihan)["ok"] else 1)
 

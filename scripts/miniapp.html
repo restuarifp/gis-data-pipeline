@@ -112,6 +112,21 @@
     padding: 7px 12px; border-radius: 9px; font: inherit; font-size: 13px; cursor: pointer;
   }
   .row { display: flex; align-items: center; gap: 8px; }
+
+  /* Saklar jadwal (run terjadwal loader). */
+  .sched { display: flex; align-items: center; gap: 10px; margin-top: 12px; padding-top: 10px;
+           border-top: 1px solid var(--line); font-size: 13px; }
+  .sched .grow { flex: 1; }
+  .sched small { display: block; font-size: 11.5px; color: var(--muted); }
+  .switch { position: relative; width: 46px; height: 28px; flex: none; border: 0; padding: 0;
+            border-radius: 999px; cursor: pointer; transition: background .15s;
+            background: color-mix(in srgb, var(--muted) 35%, transparent); }
+  .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px;
+                   border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.25);
+                   transition: transform .15s; }
+  .switch[aria-checked="true"] { background: var(--ok); }
+  .switch[aria-checked="true"]::after { transform: translateX(18px); }
+  .switch:disabled { opacity: .5; cursor: default; }
   .row .grow { flex: 1; }
 
   /* ── Log ─────────────────────────────────────────────────────────────── */
@@ -297,6 +312,14 @@ function kapan(ts) {
   return new Date(ts * 1000).toLocaleString("id-ID", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
+function nanti(ts) {
+  if (!ts) return "-";
+  const lagi = ts - Date.now() / 1000;
+  if (lagi < 60) return "sebentar lagi";
+  if (lagi < 3600) return Math.round(lagi / 60) + " menit lagi";
+  return new Date(ts * 1000).toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" });
+}
+
 /* ── State ───────────────────────────────────────────────────────────── */
 let state = { jobs: {}, user: null };
 let tab = "status", job = "load", grp = "sync", ds = "load", logJob = "load", logAuto = true;
@@ -316,6 +339,7 @@ function kodeKantor(s) {
     ? bagian[bagian.length - 2] : bagian.pop();
 }
 let sedangKirim = false;
+let sedangSaklar = false;
 let jenisLaporan = "rekap";      // tombol laporan terakhir; MainButton tab laporan ikut memakainya
 
 function statusPill(st) {
@@ -343,7 +367,6 @@ function renderCards() {
     if (info.sources && info.sources.length)
       baris.push(`<div><b>Sumber</b> · ${info.sources.map((s) => "<code>" + esc(s) + "</code>").join(" ")}</div>`);
     if (info.db) baris.push(`<div><b>Tujuan</b> · <code>${esc(info.db)}</code></div>`);
-    if (info.interval_menit) baris.push(`<div><b>Jadwal</b> · tiap ${esc(info.interval_menit)} menit</div>`);
     if (st.last_params && st.last_params.select)
       baris.push(`<div><b>Select</b> · <code>${esc(st.last_params.select)}</code></div>`);
     const kantor = (st.last_result && st.last_result.kantor) || [];
@@ -357,9 +380,17 @@ function renderCards() {
     if (LOADER[nama] && st.info && info.fitur !== "load-db")
       baris.push(`<div style="color:var(--warn)">⚠️ bukan image excel-loader — perlu rebuild</div>`);
     if (st.error) baris.push(`<div style="color:var(--warn)">${esc(st.error)}</div>`);
+    const j = st.schedule;
+    const saklar = !LOADER[nama] || st.error ? "" : `<div class="sched">
+        <div class="grow">Cek otomatis tiap ${esc(Math.round(((j && j.interval_menit) || info.interval_menit || 120) / 6) / 10)} jam
+          <small>${!j ? "loader belum mendukung saklar — perlu rebuild"
+            : j.aktif ? "menyala · berikutnya " + esc(nanti(j.berikutnya)) : "mati · hanya jalan manual"}</small></div>
+        <button class="switch" role="switch" data-sched="${esc(nama)}" aria-checked="${!!(j && j.aktif)}"
+          aria-label="Jadwal ${esc(LABEL[nama])}" ${j && !sedangSaklar ? "" : "disabled"}></button>
+      </div>`;
     return `<div class="card">
         <div class="top"><h2>${esc(LABEL[nama] || nama)}</h2><span class="pill ${p.cls}">${esc(p.text)}</span></div>
-        <div class="meta">${baris.join("")}</div>
+        <div class="meta">${baris.join("")}</div>${saklar}
         <button class="action" data-run="${esc(nama)}" ${st.running ? "disabled" : ""}>
           ${st.running ? "sedang berjalan…" : "▶ Jalankan " + esc(LABEL[nama] || nama)}</button>
       </div>`;
@@ -375,6 +406,8 @@ function renderCards() {
 
   $$("#cards [data-run]").forEach((b) =>
     b.addEventListener("click", () => { buzz(); jalankan(b.dataset.run, true); }));
+  $$("#cards [data-sched]").forEach((b) =>
+    b.addEventListener("click", () => { buzz(); saklarJadwal(b.dataset.sched, b.getAttribute("aria-checked") !== "true"); }));
   $$("#cards [data-goto]").forEach((b) =>
     b.addEventListener("click", () => { buzz(); bukaTab("run", b.dataset.goto); }));
 }
@@ -519,6 +552,23 @@ async function jalankan(nama, langsung) {
   } finally {
     sedangKirim = false;
     syncMainButton();
+  }
+}
+
+async function saklarJadwal(nama, aktif) {
+  if (sedangSaklar) return;
+  if (!(await konfirmasi((aktif ? "Nyalakan" : "Matikan") + " cek otomatis " + LABEL[nama] + "?"))) return;
+  sedangSaklar = true;
+  renderCards();
+  try {
+    const hasil = await api("schedule", { method: "POST", body: JSON.stringify({ job: nama, enabled: aktif }) });
+    notify("success");
+    toast(hasil.message || "Jadwal diubah.");
+  } catch (e) {
+    if (!fatal) { notify("error"); toast("Gagal: " + e.message); }
+  } finally {
+    sedangSaklar = false;
+    await muat();
   }
 }
 

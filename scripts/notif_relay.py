@@ -27,6 +27,7 @@ Endpoint:
   GET  /api/state   -- status semua job + config aktif (butuh initData)
   GET  /api/logs    -- ekor log satu job (butuh initData)
   POST /api/run     -- picu load/sync/dbt (butuh initData)
+  POST /api/schedule -- nyalakan/matikan run terjadwal loader {job, enabled} (butuh initData)
   POST /api/report  -- susun Rekap Bulanan / Laporan Keuangan (jenis) .xlsx lalu
                        kirim ke Telegram (butuh initData)
   GET  /            -- health check, balas 200 "ok"
@@ -639,6 +640,32 @@ def api_run(body: dict, user: dict) -> dict:
     if kode == 409:
         raise WebAppError(f"{label(nama)} masih berjalan.", 409)
     raise WebAppError(str((data or {}).get("error") or f"ditolak ({kode})")[:300], 400)
+
+
+def api_schedule(body: dict, user: dict) -> dict:
+    """Saklar run terjadwal (cek Excel tiap SCHEDULE_INTERVAL_MINUTES) per loader."""
+    nama = ALIAS_JOB.get(str(body.get("job") or "").lower(), str(body.get("job") or "").lower())
+    if nama not in JOB_LOADER:
+        raise WebAppError(f"job tanpa jadwal: {nama}", 400)
+    aktif = body.get("enabled")
+    if not isinstance(aktif, bool):
+        raise WebAppError("enabled harus true/false", 400)
+    resp = requests.post(f"{JOBS[nama]}/schedule", json={"enabled": aktif},
+                         timeout=REQUEST_TIMEOUT)
+    try:
+        data = resp.json()
+    except ValueError:
+        data = {"error": resp.text[:300]}
+    if resp.status_code != 200:
+        raise WebAppError(str(data.get("error") or f"ditolak ({resp.status_code})")[:300],
+                          400 if resp.status_code < 500 else 502)
+    jadwal = data.get("schedule") or {}
+    teks = (f"⏰ Jadwal <b>{label(nama)}</b> (tiap {jadwal.get('interval_menit')} menit) "
+            f"{'DINYALAKAN' if aktif else 'DIMATIKAN'} oleh {html.escape(sebut(user))} "
+            f"lewat Mini App.")
+    threading.Thread(target=send_telegram, args=(teks,), daemon=True).start()
+    return {"ok": True, "schedule": jadwal,
+            "message": f"Jadwal {label(nama)} {'menyala' if aktif else 'mati'}."}
 
 
 def api_report(body: dict, user: dict) -> dict:
@@ -1304,6 +1331,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                 return 200, api_run(body, user)
             if path == "/api/report":
                 return 200, api_report(body, user)
+            if path == "/api/schedule":
+                return 200, api_schedule(body, user)
             return 404, {"error": f"endpoint tidak dikenal: {path}"}
         except WebAppError as exc:
             if exc.kode in (401, 403):
