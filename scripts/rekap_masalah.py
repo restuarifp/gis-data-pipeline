@@ -35,6 +35,58 @@ CONTOH_SEL_PER_JENIS = 5    # sel "bukan angka" yang ditulis satu per satu per s
 JENIS_SISTEM = {"folder_gagal", "unduh_gagal", "gagal_simpan", "kontrak_gagal",
                 "nama_kantor_tidak_valid", "kantor_di_luar_pola"}
 
+# Kolom yang SENGAJA ada di file kantor tapi tidak dibaca loader (kolom_tambahan),
+# atau berumus yang memang dibiarkan tanpa hasil (formula_tanpa_hasil). Sama di
+# semua kantor, jadi tidak diulang per kantor: cukup satu catatan umum di rekap,
+# dan tidak ikut sidik (tidak memicu pengingat "belum diperbaiki").
+# Ganti lewat env KOLOM_SENGAJA (pisah koma; kosong = matikan).
+def _lipat_kolom(nama) -> str:
+    return " ".join(str(nama).replace("_", " ").split()).casefold()
+
+
+KOLOM_SENGAJA = [k.strip() for k in os.getenv(
+    "KOLOM_SENGAJA", "Nama Lengkap, Instansi Pekerjaan, Status Pemberdayaan").split(",")
+    if k.strip()]
+_SENGAJA = {_lipat_kolom(k) for k in KOLOM_SENGAJA}
+
+
+def _sengaja(nama) -> bool:
+    return _lipat_kolom(nama) in _SENGAJA
+
+
+def _pisah_sengaja(masalah: list) -> tuple:
+    """
+    (masalah tanpa kolom sengaja, nama kolom sengaja yang muncul). Catatan
+    kolom_tambahan dengan campuran kolom sengaja + lain disisakan kolom lainnya.
+    Galat (yang menolak data) tidak pernah disaring.
+    """
+    sisa, sengaja = [], []
+    for m in masalah:
+        if m.get("galat"):
+            sisa.append(m)
+        elif m.get("jenis") == "kolom_tambahan":
+            kolom = [k for k in str(m.get("kolom", "")).split(", ") if k]
+            lain = [k for k in kolom if not _sengaja(k)]
+            sengaja += [k for k in kolom if _sengaja(k)]
+            if lain:
+                sisa.append({**m, "kolom": ", ".join(lain)})
+        elif m.get("jenis") == "formula_tanpa_hasil" and _sengaja(m.get("kolom", "")):
+            sengaja.append(m.get("kolom", ""))
+        else:
+            sisa.append(m)
+    return sisa, sengaja
+
+
+def _catatan_sengaja(kolom: list) -> str:
+    """Satu kalimat umum untuk kolom sengaja yang muncul di run ini (urutan KOLOM_SENGAJA)."""
+    ada = {_lipat_kolom(k) for k in kolom}
+    nama = [k for k in KOLOM_SENGAJA if _lipat_kolom(k) in ada]
+    if not nama:
+        return ""
+    return (f"Kolom {', '.join(_c(k) for k in nama)} memang sengaja tidak dibaca / "
+            f"dibiarkan kosong di semua kantor — tidak perlu diperbaiki.")
+
+
 # Istilah per dataset (hasil["dataset"] dari loader; hasil lama tanpa field itu = finance).
 ISTILAH = {
     "finance": {"data": "data keuangan", "koneksi": "finance"},
@@ -253,7 +305,7 @@ def sidik(hasil: dict) -> str:
     if hasil.get("error"):
         butir.append(["run", hasil["error"]])
     for k in hasil.get("kantor") or []:
-        for m in k.get("masalah") or []:
+        for m in _pisah_sengaja(k.get("masalah") or [])[0]:
             butir.append([k.get("kantor"), m.get("jenis"), m.get("file"), m.get("sheet"),
                           m.get("sel"), m.get("kolom"), m.get("nilai")])
         for t in k.get("tabel") or []:
@@ -303,14 +355,15 @@ def susun(hasil: dict, durasi: str = "", diulang: bool = False) -> str:
                        "data terakhir yang benar. Setelah file diperbaiki di Nextcloud, "
                        "pengecekan berikutnya otomatis memasukkannya.</i>")
 
-    rincian, sistem, catatan, airbyte = [], [], [], []
+    rincian, sistem, catatan, airbyte, sengaja = [], [], [], [], []
     if hasil.get("error"):
         sistem.append("loader tidak bisa bekerja, tidak ada kantor yang diproses"
                       + _kutip(hasil["error"]))
     for k in kantor:
         nama = k.get("kantor", "?")
         per_tempat: dict = {}
-        masalah = k.get("masalah") or []
+        masalah, kolom_sengaja = _pisah_sengaja(k.get("masalah") or [])
+        sengaja += kolom_sengaja
         galat_di = {(m.get("file"), m.get("sheet")) for m in masalah if m.get("galat")}
         ada_sheet_hilang = any(m["jenis"] == "sheet_hilang" for m in masalah)
         sheet_lain = [m.get("sheet") for m in masalah if m["jenis"] == "sheet_tak_dikenal"]
@@ -356,8 +409,10 @@ def susun(hasil: dict, durasi: str = "", diulang: bool = False) -> str:
         badan += ["", f"⚠️ <b>Airbyte masih mengisi {istilah['data']}</b> "
                   f"{_e(', '.join(airbyte))} — matikan (disable, jangan reset) koneksi Airbyte "
                   f"{istilah['koneksi']} kantor tersebut."]
-    if catatan:
-        badan += ["", "ℹ️ <b>Catatan</b> (data tetap dimasukkan)"] + [f"• {x}" for x in catatan]
+    umum = _catatan_sengaja(sengaja)
+    if catatan or umum:
+        badan += ["", "ℹ️ <b>Catatan</b> (data tetap dimasukkan)"]
+        badan += [f"• {x}" for x in catatan] + ([f"• {umum}"] if umum else [])
 
     # Potong per baris supaya tag HTML tidak terbelah.
     hasil_teks, panjang = [], 0
