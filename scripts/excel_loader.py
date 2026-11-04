@@ -239,6 +239,13 @@ SESSION.headers.update({"Content-Type": "application/xml; charset=utf-8"})
 #
 # Kolom wajib hilang = kantor itu gagal dimuat (bukan dimuat dengan NULL):
 # kolom yang hilang diam-diam akan muncul di laporan sebagai angka nol.
+#
+# Pengecualian: `opsional` = {kolom: indeks kolom di template (0 = A)}. Judulnya
+# sering tidak diisi pengisi file; kantor tetap dimuat dengan catatan (bukan galat):
+#   * sel judul di posisi template kosong -> kolom itu dibaca sebagai kolom tersebut
+#     (`kolom_tanpa_judul`) — aman karena posisinya tetap di template dan sel judul
+#     itu memang kosong, bukan dipakai judul lain;
+#   * tidak ada sama sekali -> dimuat NULL (`kolom_opsional_hilang`).
 
 JENIS_FINANCE = ["FI", "ZF", "AQQ", "FDY", "IFQ", "LQT", "SDQ", "SNK", "TDY", "ZKT"]
 
@@ -247,6 +254,7 @@ KONTRAK_FINANCE = {
         "tabel": "raw_finance_rekap_{kantor}",
         "teks":  ["JENIS"],
         "angka": ["TOTAL_100_PERSEN", "DIKELOLA_KANWIL", "DISETOR", "PEMBULATAN_SETOR"],
+        "opsional": {"JENIS": 0},  # kolom A di template finance.xlsx
     },
     "RINCIAN": {
         "tabel": "raw_finance_rincian_{kantor}",
@@ -475,8 +483,19 @@ def baca_sheet(ws_nilai, ws_rumus, kontrak: dict) -> tuple[list[dict], list[dict
             continue
         posisi[nama] = i
 
+    opsional = kontrak.get("opsional") or {}
+    for k, i in opsional.items():
+        if k in posisi:
+            continue
+        if i < len(header) and (header[i] is None or not str(header[i]).strip()):
+            posisi[k] = i
+            masalah.append(_masalah("kolom_tanpa_judul", galat=False, kolom=k,
+                                    sel=f"{get_column_letter(i + 1)}1"))
+        else:
+            masalah.append(_masalah("kolom_opsional_hilang", galat=False, kolom=k))
+
     for k in wajib:
-        if k not in posisi:
+        if k not in posisi and k not in opsional:
             masalah.append(_masalah("kolom_hilang", kolom=k))
     tambahan = [k for k in posisi if k not in wajib]
     if tambahan:

@@ -258,6 +258,14 @@ def _kalimat_catatan(m: dict, hasil: dict) -> str:
                 f"({', '.join(_c(_kolom(k)) for k in str(m.get('kolom', '')).split(', '))})")
     if m["jenis"] == "formula_tanpa_hasil":
         return _rumus_kosong([m])
+    if m["jenis"] == "kolom_tanpa_judul":
+        return (f"sheet {_c(m.get('sheet'))}: judul kolom {_c(_kolom(m.get('kolom', '')))} "
+                f"kosong di {_c(m.get('sel'))}, isinya tetap dibaca sebagai "
+                f"{_c(_kolom(m.get('kolom', '')))} — isi judulnya")
+    if m["jenis"] == "kolom_opsional_hilang":
+        return (f"sheet {_c(m.get('sheet'))}: kolom {_c(_kolom(m.get('kolom', '')))} tidak ada, "
+                f"dimuat kosong — angka per {_e(_kolom(m.get('kolom', '')))} di laporan jadi 0 "
+                f"sampai kolomnya diisi")
     return _e(m["jenis"])
 
 
