@@ -21,20 +21,21 @@ from openpyxl import load_workbook  # noqa: E402
 
 def _rec(cad, ditarik, **lain):
     rec = {"cad": cad, "ditarik_finance": ditarik, "pemb_wajib": 0,
-           "pemb_sukarela": 0, "pemb_cad": 0}
+           "pemb_pokok": 0, "pemb_cad": 0}
     rec.update(lain)
     return rec
 
 
 class TestNilaiBaris(unittest.TestCase):
     def test_total_setor_dari_tiga_pembulatan(self):
-        n = rf._nilai_baris({"pemb_wajib": 57_960_000, "pemb_sukarela": 250_000,
-                             "pemb_cad": 2_400_000, "cad": 2_390_886.09}, 0)
-        self.assertEqual(n["setor"], 57_960_000 + 250_000 + 2_400_000)
-        self.assertEqual(n["cad"], 2_390_886.09)
+        # Data prod C1 Oktober 2026.
+        n = rf._nilai_baris({"pemb_wajib": 32_000_000, "pemb_pokok": 1_480_000,
+                             "pemb_cad": 1_420_000, "cad": 1_391_103}, 0)
+        self.assertEqual(n["setor"], 34_900_000)
+        self.assertEqual(n["cad"], 1_391_103)
 
     def test_pembulatan_kosong_jadi_nol(self):
-        n = rf._nilai_baris({"pemb_wajib": None, "pemb_sukarela": None, "pemb_cad": None}, 0)
+        n = rf._nilai_baris({"pemb_wajib": None, "pemb_pokok": None, "pemb_cad": None}, 0)
         self.assertEqual(n["setor"], 0)
 
     def test_daftar_jenis_wajib(self):
@@ -43,6 +44,7 @@ class TestNilaiBaris(unittest.TestCase):
         self.assertNotIn("NOMINAL ZKT", rf.JENIS_PEMBULATAN_WAJIB)
         sql = rf.SQL
         self.assertIn("'NOMINAL ZF'", sql)
+        self.assertIn("FILTER (WHERE j = 'NOMINAL ZKT') AS pemb_pokok", sql)
         self.assertNotIn("AS setor", sql)
 
 
@@ -86,9 +88,9 @@ class TestLaporan(unittest.TestCase):
         rf.rs._kunci_xlsx = lambda b: b
         rf.ambil_data = lambda bulan, tahun: {
             (2026, 1): {"A1": _rec(100, datetime(2026, 1, 31), pemb_wajib=1000,
-                                   pemb_sukarela=10, pemb_cad=100)},
+                                   pemb_pokok=10, pemb_cad=100)},
             (2026, 2): {"A1": _rec(200, datetime(2026, 2, 27), pemb_wajib=2000,
-                                   pemb_sukarela=20, pemb_cad=200)},
+                                   pemb_pokok=20, pemb_cad=200)},
         }
 
     def tearDown(self):
@@ -101,7 +103,7 @@ class TestLaporan(unittest.TestCase):
         kol = rf._peta_kolom(ws, hdr)
         a1 = rf._cari_baris(ws, "A1", hdr + 1)
         self.assertEqual(ws[f"{kol['pemb_wajib']}{a1}"].value, 2000)
-        self.assertEqual(ws[f"{kol['pemb_sukarela']}{a1}"].value, 20)
+        self.assertEqual(ws[f"{kol['pemb_pokok']}{a1}"].value, 20)
         self.assertEqual(ws[f"{kol['pemb_cad']}{a1}"].value, 200)
         self.assertEqual(ws[f"{kol['setor']}{a1}"].value, 2220)
         self.assertEqual(ws[f"{kol['akumulasi_cad']}{a1}"].value, 300)
