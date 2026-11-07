@@ -24,19 +24,15 @@ benar, dan judul yang hilang/berubah menggagalkan laporan dengan pesan jelas:
   PEMBULATAN SIMPANAN WAJIB     rekap PEMBULATAN SETOR, jumlah NOMINAL IFQ,
                                 SDQ, FDY, AQQ, FI, LQT, SNK, TDY, ZF
                                 (JENIS_PEMBULATAN_WAJIB)
-  PEMBULATAN SIMPANAN SUKARELA  rekap NOMINAL SDQ · PEMBULATAN SETOR
+  PEMBULATAN SIMPANAN POKOK     rekap NOMINAL ZKT · PEMBULATAN SETOR
   PEMBULATAN CAD BULAN INI      rekap CAD · PEMBULATAN SETOR
-  TOTAL SETOR          pembulatan wajib + pembulatan sukarela + pembulatan CAD
+  TOTAL SETOR          pembulatan wajib + pembulatan pokok + pembulatan CAD
   CAD BULAN INI        rekap CAD · DISETOR
   AKUMULASI CAD        jumlah CAD BULAN INI dari bulan tarikan finance
                        pertama s.d. bulan laporan; tiap bulan hanya tarikan
                        terakhir bulan itu, dan hanya bila tarikannya memang
                        dari bulan itu
   JUMLAH PETUGAS       capil dengan LMG bukan PRA / PJ% / KPJ% (= pengurus)
-
-Catatan: NOMINAL SDQ masuk ke PEMBULATAN SIMPANAN WAJIB *dan* PEMBULATAN
-SIMPANAN SUKARELA (sesuai permintaan), jadi ikut terhitung dua kali di TOTAL
-SETOR.
 
 Grafik dibuat oleh kode, BUKAN disimpan di template: openpyxl membuang chart
 yang sudah ada saat membuka workbook, jadi chart di template akan hilang dari
@@ -131,7 +127,7 @@ WITH
       SUM(total_100_persen) FILTER (WHERE j = 'NOMINAL SDQ') AS sukarela,
       SUM(pembulatan_setor) FILTER (WHERE j IN ({_daftar_sql(JENIS_PEMBULATAN_WAJIB)}))
                                                              AS pemb_wajib,
-      SUM(pembulatan_setor) FILTER (WHERE j = 'NOMINAL SDQ') AS pemb_sukarela,
+      SUM(pembulatan_setor) FILTER (WHERE j = 'NOMINAL ZKT') AS pemb_pokok,
       SUM(pembulatan_setor) FILTER (WHERE j = 'CAD')         AS pemb_cad,
       SUM(disetor)          FILTER (WHERE j = 'CAD')         AS cad
     FROM (SELECT *, upper(trim(jenis)) AS j FROM {rs._q(rs.VIEW_REKAP)}) r
@@ -171,7 +167,7 @@ SELECT
   k.awal_bulan, k.kantor_id,
   t.tunai,
   c.aktif_1, c.aktif_2, c.aktif_3, c.petugas,
-  r.wajib, r.pokok, r.sukarela, r.pemb_wajib, r.pemb_sukarela, r.pemb_cad, r.cad,
+  r.wajib, r.pokok, r.sukarela, r.pemb_wajib, r.pemb_pokok, r.pemb_cad, r.cad,
   c.ditarik_pada  AT TIME ZONE %(zona)s AS ditarik_capil,
   r.ditarik_pada  AT TIME ZONE %(zona)s AS ditarik_finance
 FROM kunci k
@@ -195,7 +191,7 @@ HEADER = {
     "SIMPANAN SUKARELA": ["sukarela"],
     "TOTAL KONTRIBUSI":  ["kontribusi"],
     "PEMBULATAN SIMPANAN WAJIB":    ["pemb_wajib"],
-    "PEMBULATAN SIMPANAN SUKARELA": ["pemb_sukarela"],
+    "PEMBULATAN SIMPANAN POKOK":    ["pemb_pokok"],
     "PEMBULATAN CAD BULAN INI":     ["pemb_cad"],
     "TOTAL SETOR":       ["setor"],
     "CAD BULAN INI":     ["cad"],
@@ -203,7 +199,7 @@ HEADER = {
     "JUMLAH PETUGAS":    ["petugas"],
 }
 NILAI = [n for daftar in HEADER.values() for n in daftar]
-UANG = {"wajib", "pokok", "sukarela", "kontribusi", "pemb_wajib", "pemb_sukarela",
+UANG = {"wajib", "pokok", "sukarela", "kontribusi", "pemb_wajib", "pemb_pokok",
         "pemb_cad", "setor", "cad", "akumulasi_cad"}
 # Nilai berjalan (saldo), bukan arus sebulan: total beberapa bulan = nilai
 # bulan terakhir, bukan jumlahnya.
@@ -257,11 +253,11 @@ def _nilai_baris(rec: dict, akumulasi: float) -> dict:
     """Nilai satu baris (kunci = nama di HEADER), termasuk kolom turunan."""
     n = {k: rs._angka(rec.get(k)) for k in
          ("tunai", "aktif_1", "aktif_2", "aktif_3", "petugas")}
-    for k in ("wajib", "pokok", "sukarela", "pemb_wajib", "pemb_sukarela", "pemb_cad", "cad"):
+    for k in ("wajib", "pokok", "sukarela", "pemb_wajib", "pemb_pokok", "pemb_cad", "cad"):
         n[k] = _uang(rec.get(k))
     n["total_anggota"] = n["aktif_1"] + n["aktif_2"] + n["aktif_3"]
     n["kontribusi"] = round(n["wajib"] + n["pokok"] + n["sukarela"], 2)
-    n["setor"] = round(n["pemb_wajib"] + n["pemb_sukarela"] + n["pemb_cad"], 2)
+    n["setor"] = round(n["pemb_wajib"] + n["pemb_pokok"] + n["pemb_cad"], 2)
     n["akumulasi_cad"] = round(akumulasi, 2)
     return n
 

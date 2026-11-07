@@ -232,9 +232,9 @@ a builder needs `laporan_aktif()` and `bangun_laporan(bulan, tahun)`).
 - Columns: NASABAH TUNAI = `SUM(TUNAI_IFQ)` from rincian; NASABAH AKTIF 1/2/3 = capil rows per K; WAJIB/POKOK/SUKARELA = rekap `NOMINAL IFQ/ZKT/SDQ`
   `total_100_persen`; PEMBULATAN SIMPANAN WAJIB = rekap `pembulatan_setor` summed over
   `NOMINAL IFQ, SDQ, FDY, AQQ, FI, LQT, SNK, TDY, ZF` (`JENIS_PEMBULATAN_WAJIB`);
-  PEMBULATAN SIMPANAN SUKARELA = `NOMINAL SDQ` `pembulatan_setor` (SDQ is in both, by
-  request); PEMBULATAN CAD BULAN INI = `CAD` `pembulatan_setor`; TOTAL SETOR = the three
-  PEMBULATAN columns added;
+  PEMBULATAN SIMPANAN POKOK = `NOMINAL ZKT` `pembulatan_setor`; PEMBULATAN CAD BULAN INI =
+  `CAD` `pembulatan_setor`; TOTAL SETOR = the three PEMBULATAN columns added (C1 Oct 2026:
+  32,000,000 + 1,480,000 + 1,420,000 = 34,900,000);
   CAD = rekap `CAD` (trimmed — the file has `'CAD '`) `disetor`; JUMLAH PETUGAS = capil
   pengurus (LMG not PRA/PJ%/KPJ%).
 - **AKUMULASI CAD** is recomputed from the warehouse, not archived (`susun_per_bulan`):
