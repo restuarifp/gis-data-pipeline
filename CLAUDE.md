@@ -238,11 +238,16 @@ a builder needs `laporan_aktif()` and `bangun_laporan(bulan, tahun)`).
   CAD = rekap `CAD` (trimmed — the file has `'CAD '`) `disetor`; JUMLAH PETUGAS = capil
   pengurus (LMG not PRA/PJ%/KPJ%).
 - **AKUMULASI CAD** is recomputed from the warehouse, not archived (`susun_per_bulan`):
-  running sum of CAD BULAN INI from the first finance pull's month, one value per month =
-  the month's *latest* pull, counted only if that pull is *from that month*. An office
-  reusing an older pull shows that pull's CAD BULAN INI but does not add it again. In the
-  bottom table's TOTAL row it is the last filled month (a balance), not the sum of months.
-  Accuracy depends on finance raw tables never being reset. Tests: `tests/test_report_finance.py`.
+  opening balance + running sum of **PEMBULATAN CAD** (not DISETOR) from the first finance
+  pull's month, one value per month = the month's *latest* pull, counted only if that pull
+  is *from that month*. Opening balance (`ambil_saldo_awal`) = `PEMBULATAN_SETOR` of the
+  `CAD` row in generation 0 (`_airbyte_extracted_at` = epoch) of each
+  `raw_finance_rekap_<k>` (schema `REPORT_RAW_SCHEMA`, default `public`) — read from raw
+  because `hist_pulls` drops epoch rows. C1: 62,245,000 + 1,300,000 (Aug) + 1,450,000 (Sep)
+  + 1,420,000 (Oct) + 1,420,000 (Nov) = 67,835,000. **Never delete generation 0** from the
+  finance rekap tables. An office reusing an older pull shows that pull's CAD but does not
+  add it again. In the bottom table's TOTAL row it is the last filled month (a balance),
+  not the sum of months. Tests: `tests/test_report_finance.py`.
 - **Columns are found by their row-4 header text** (`HEADER` in `report_finance.py`), and
   rows by column-A labels (office codes, `TOTAL`, `BULAN`, month names), so columns can be
   moved and offices added without code changes. A missing header, or a merged header
