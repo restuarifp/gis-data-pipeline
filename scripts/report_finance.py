@@ -28,10 +28,11 @@ benar, dan judul yang hilang/berubah menggagalkan laporan dengan pesan jelas:
   PEMBULATAN CAD BULAN INI      rekap CAD · PEMBULATAN SETOR
   TOTAL SETOR          pembulatan wajib + pembulatan pokok + pembulatan CAD
   CAD BULAN INI        rekap CAD · DISETOR
-  AKUMULASI CAD        jumlah CAD BULAN INI dari bulan tarikan finance
-                       pertama s.d. bulan laporan; tiap bulan hanya tarikan
-                       terakhir bulan itu, dan hanya bila tarikannya memang
-                       dari bulan itu
+  AKUMULASI CAD        saldo awal CAD (PEMBULATAN SETOR baris CAD generation 0
+                       di raw_finance_rekap_<k>) + PEMBULATAN CAD BULAN INI
+                       tiap bulan dari bulan tarikan finance pertama s.d.
+                       bulan laporan; tiap bulan hanya tarikan terakhir bulan
+                       itu, dan hanya bila tarikannya memang dari bulan itu
   JUMLAH PETUGAS       capil dengan LMG bukan PRA / PJ% / KPJ% (= pengurus)
 
 Grafik dibuat oleh kode, BUKAN disimpan di template: openpyxl membuang chart
@@ -40,19 +41,21 @@ setiap laporan. Grafik ditaruh di sheet yang sama, di bawah tabel bulanan.
 Grafik merujuk sel tabel itu sendiri; satu-satunya data tambahan adalah kolom
 indeks tersembunyi di kanan tabel bulanan.
 
-AKUMULASI CAD dihitung ulang dari warehouse setiap kali, mulai dari bulan
-tarikan finance pertama. Jadi ia hanya selengkap riwayat tarikan finance
-(Append) — kalau tabel raw finance pernah di-reset, bulan-bulan sebelumnya
-hilang dari akumulasi.
+AKUMULASI CAD dihitung ulang dari warehouse setiap kali: saldo awal
+(generation 0 tabel raw) + tarikan finance sejak bulan pertama. Jadi ia hanya
+selengkap riwayat tarikan finance (Append) — kalau tabel raw finance pernah
+di-reset, bulan-bulan sebelumnya dan saldo awalnya hilang dari akumulasi.
 
 Konfigurasi: sama dengan report_summary.py (REPORT_DB_*, REPORT_SCHEMA,
 REPORT_VIEW_HIST_*, REPORT_TIMEZONE, REPORT_XLSX_PASSWORD), ditambah
   REPORT_FINANCE_TEMPLATE  (default docs/template/monthly-finance-report.xlsx)
+  REPORT_RAW_SCHEMA        (default public; tabel raw_finance_rekap_<k>)
 """
 
 import io
 import logging
 import os
+import re
 from datetime import date
 from pathlib import Path
 
@@ -75,6 +78,9 @@ TEMPLATE = Path(os.getenv(
     "REPORT_FINANCE_TEMPLATE",
     Path(__file__).resolve().parent.parent / "docs" / "template" / "monthly-finance-report.xlsx",
 ))
+# Schema tabel raw finance (tempat baris saldo awal CAD generation 0).
+RAW_SCHEMA = os.getenv("REPORT_RAW_SCHEMA", "public")
+POLA_RAW_REKAP = r"^raw_finance_rekap_[a-z][0-9]+$"
 
 NAMA_BULAN = ["", "JANUARI", "FEBRUARI", "MARET", "APRIL", "MEI", "JUNI", "JULI",
               "AGUSTUS", "SEPTEMBER", "OKTOBER", "NOVEMBER", "DESEMBER"]
@@ -249,6 +255,34 @@ def ambil_data(bulan: int, tahun: int) -> dict:
     return hasil
 
 
+def ambil_saldo_awal() -> dict:
+    """
+    {kantor_id: saldo awal CAD} — PEMBULATAN SETOR baris CAD di generation 0
+    (ber-_airbyte_extracted_at epoch) tiap raw_finance_rekap_<k>. Baris itu
+    adalah saldo CAD sebelum tarikan finance pertama; view hist_* sengaja
+    membuangnya (bukan tarikan), jadi dibaca langsung dari tabel raw.
+    """
+    try:
+        with rs.psycopg2.connect(connect_timeout=10, **rs.DB) as conn, conn.cursor() as cur:
+            cur.execute("SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = %s AND table_name ~ %s ORDER BY 1",
+                        (RAW_SCHEMA, POLA_RAW_REKAP))
+            tabel = [t for (t,) in cur.fetchall() if re.fullmatch(POLA_RAW_REKAP, t)]
+            if not tabel:
+                return {}
+            bagian = [
+                f"""SELECT '{t.rsplit('_', 1)[1].upper()}' AS kantor_id,
+                       SUM("PEMBULATAN_SETOR") AS saldo
+                  FROM "{RAW_SCHEMA}"."{t}"
+                 WHERE _airbyte_extracted_at <= TIMESTAMPTZ '1970-01-02 00:00:00+00'
+                   AND upper(trim("JENIS")) = 'CAD'"""
+                for t in tabel]
+            cur.execute("\nUNION ALL\n".join(bagian))
+            return {k: _uang(s) for k, s in cur.fetchall() if s is not None}
+    except rs.psycopg2.Error as exc:
+        raise ReportError(f"query saldo awal CAD gagal: {str(exc).strip()[:300]}") from exc
+
+
 def _nilai_baris(rec: dict, akumulasi: float) -> dict:
     """Nilai satu baris (kunci = nama di HEADER), termasuk kolom turunan."""
     n = {k: rs._angka(rec.get(k)) for k in
@@ -262,19 +296,21 @@ def _nilai_baris(rec: dict, akumulasi: float) -> dict:
     return n
 
 
-def susun_per_bulan(data: dict, kantor: list, tahun: int) -> dict:
+def susun_per_bulan(data: dict, kantor: list, tahun: int, saldo_awal: dict = None) -> dict:
     """
     {bulan di `tahun`: {kantor: nilai_baris}} dari hasil ambil_data().
 
-    AKUMULASI CAD per kantor dijumlah berurutan dari bulan pertama di `data`
-    (= bulan tarikan finance pertama, menyeberang tahun bila perlu). Tiap
-    bulan menyumbang CAD dari tarikan TERAKHIR bulan itu (SQL sudah memilih
-    tarikan terakhir sebelum awal bulan berikutnya), dan hanya bila tarikan itu
-    memang dari bulan itu: kantor tanpa tarikan baru memakai potret bulan lalu
-    (seperti kolom lain), tapi CAD-nya bukan uang baru — kalau ditambahkan lagi,
-    akumulasinya terhitung dua kali.
+    AKUMULASI CAD per kantor = saldo awal (ambil_saldo_awal) + PEMBULATAN CAD
+    tiap bulan, dijumlah berurutan dari bulan pertama di `data` (= bulan
+    tarikan finance pertama, menyeberang tahun bila perlu). Tiap bulan
+    menyumbang PEMBULATAN CAD dari tarikan TERAKHIR bulan itu (SQL sudah
+    memilih tarikan terakhir sebelum awal bulan berikutnya), dan hanya bila
+    tarikan itu memang dari bulan itu: kantor tanpa tarikan baru memakai potret
+    bulan lalu (seperti kolom lain), tapi CAD-nya bukan uang baru — kalau
+    ditambahkan lagi, akumulasinya terhitung dua kali.
     """
-    akumulasi = {k: 0.0 for k in kantor}
+    saldo_awal = saldo_awal or {}
+    akumulasi = {k: float(saldo_awal.get(k, 0)) for k in kantor}
     per_bulan = {}
     for (t, b) in sorted(data):
         isi = {}
@@ -284,7 +320,7 @@ def susun_per_bulan(data: dict, kantor: list, tahun: int) -> dict:
                 continue
             waktu = rec.get("ditarik_finance")
             if waktu is not None and (waktu.year, waktu.month) == (t, b):
-                akumulasi[k] += _uang(rec.get("cad"))
+                akumulasi[k] += _uang(rec.get("pemb_cad"))
             isi[k] = _nilai_baris(rec, akumulasi[k])
         if t == tahun:
             per_bulan[b] = isi
@@ -361,7 +397,7 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
         if kode:
             kantor_template[kode] = baris
 
-    per_bulan = susun_per_bulan(data, list(kantor_template), tahun)
+    per_bulan = susun_per_bulan(data, list(kantor_template), tahun, ambil_saldo_awal())
 
     # Tabel atas: bulan laporan per kantor.
     ini = per_bulan.get(bulan, {})

@@ -15,9 +15,11 @@
     ditarik_pada dihitung per generation, bukan per baris: satu batch yang sama
     bisa menghasilkan _airbyte_extracted_at berbeda antar baris.
 
-    Baris ber-_airbyte_extracted_at epoch (1970-01-01) dibuang — Airbyte
-    meninggalkan satu baris seperti itu di generation 0 beberapa tabel, dan
-    tanggal itu akan membuatnya lolos sebagai "tarikan" untuk bulan mana pun.
+    Baris ber-_airbyte_extracted_at epoch (1970-01-01) dibuang — itu baris
+    generation 0, bukan tarikan, dan tanggal itu akan membuatnya lolos sebagai
+    "tarikan" untuk bulan mana pun. Di raw_finance_rekap_<k> baris itu adalah
+    SALDO AWAL CAD (baris CAD, PEMBULATAN_SETOR); laporan keuangan membacanya
+    langsung dari tabel raw (report_finance.ambil_saldo_awal). Jangan dihapus.
 
     Kantor diambil dari sources.yml, jadi kantor baru ikut otomatis begitu
     tabel raw-nya dideklarasikan di sana. Tabel yang belum ada fisiknya
