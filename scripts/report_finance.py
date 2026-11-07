@@ -21,11 +21,22 @@ benar, dan judul yang hilang/berubah menggagalkan laporan dengan pesan jelas:
   SIMPANAN POKOK       rekap NOMINAL ZKT · TOTAL 100%
   SIMPANAN SUKARELA    rekap NOMINAL SDQ · TOTAL 100%
   TOTAL KONTRIBUSI     wajib + pokok + sukarela
-  TOTAL SETOR          SUM(rekap DISETOR) semua baris kecuali TOTAL
+  PEMBULATAN SIMPANAN WAJIB     rekap PEMBULATAN SETOR, jumlah NOMINAL IFQ,
+                                SDQ, FDY, AQQ, FI, LQT, SNK, TDY, ZF
+                                (JENIS_PEMBULATAN_WAJIB)
+  PEMBULATAN SIMPANAN SUKARELA  rekap NOMINAL SDQ · PEMBULATAN SETOR
+  PEMBULATAN CAD BULAN INI      rekap CAD · PEMBULATAN SETOR
+  TOTAL SETOR          pembulatan wajib + pembulatan sukarela + pembulatan CAD
   CAD BULAN INI        rekap CAD · DISETOR
-  AKUMULASI CAD        jumlah CAD semua bulan s.d. bulan laporan, hanya
-                       bulan yang punya tarikan finance sendiri
+  AKUMULASI CAD        jumlah CAD BULAN INI dari bulan tarikan finance
+                       pertama s.d. bulan laporan; tiap bulan hanya tarikan
+                       terakhir bulan itu, dan hanya bila tarikannya memang
+                       dari bulan itu
   JUMLAH PETUGAS       capil dengan LMG bukan PRA / PJ% / KPJ% (= pengurus)
+
+Catatan: NOMINAL SDQ masuk ke PEMBULATAN SIMPANAN WAJIB *dan* PEMBULATAN
+SIMPANAN SUKARELA (sesuai permintaan), jadi ikut terhitung dua kali di TOTAL
+SETOR.
 
 Grafik dibuat oleh kode, BUKAN disimpan di template: openpyxl membuang chart
 yang sudah ada saat membuka workbook, jadi chart di template akan hilang dari
@@ -73,6 +84,17 @@ NAMA_BULAN = ["", "JANUARI", "FEBRUARI", "MARET", "APRIL", "MEI", "JUNI", "JULI"
               "AGUSTUS", "SEPTEMBER", "OKTOBER", "NOVEMBER", "DESEMBER"]
 
 
+# Baris rekap (JENIS, sudah trim + upper) yang PEMBULATAN SETOR-nya dijumlah
+# menjadi PEMBULATAN SIMPANAN WAJIB.
+JENIS_PEMBULATAN_WAJIB = [f"NOMINAL {k}" for k in
+                          ("IFQ", "SDQ", "FDY", "AQQ", "FI", "LQT", "SNK", "TDY", "ZF")]
+
+
+def _daftar_sql(daftar) -> str:
+    # Konstanta kode, bukan masukan pengguna — aman disisipkan sebagai literal.
+    return ", ".join("'" + s.replace("'", "''") + "'" for s in daftar)
+
+
 def _pilih(tarikan: str) -> str:
     """
     Untuk tiap bulan di `bulan` dan tiap kantor: tarikan terakhir (`tarikan`
@@ -107,7 +129,10 @@ WITH
       SUM(total_100_persen) FILTER (WHERE j = 'NOMINAL IFQ') AS wajib,
       SUM(total_100_persen) FILTER (WHERE j = 'NOMINAL ZKT') AS pokok,
       SUM(total_100_persen) FILTER (WHERE j = 'NOMINAL SDQ') AS sukarela,
-      SUM(disetor)          FILTER (WHERE j <> 'TOTAL')      AS setor,
+      SUM(pembulatan_setor) FILTER (WHERE j IN ({_daftar_sql(JENIS_PEMBULATAN_WAJIB)}))
+                                                             AS pemb_wajib,
+      SUM(pembulatan_setor) FILTER (WHERE j = 'NOMINAL SDQ') AS pemb_sukarela,
+      SUM(pembulatan_setor) FILTER (WHERE j = 'CAD')         AS pemb_cad,
       SUM(disetor)          FILTER (WHERE j = 'CAD')         AS cad
     FROM (SELECT *, upper(trim(jenis)) AS j FROM {rs._q(rs.VIEW_REKAP)}) r
     GROUP BY kantor_id, tarikan_id
@@ -146,7 +171,7 @@ SELECT
   k.awal_bulan, k.kantor_id,
   t.tunai,
   c.aktif_1, c.aktif_2, c.aktif_3, c.petugas,
-  r.wajib, r.pokok, r.sukarela, r.setor, r.cad,
+  r.wajib, r.pokok, r.sukarela, r.pemb_wajib, r.pemb_sukarela, r.pemb_cad, r.cad,
   c.ditarik_pada  AT TIME ZONE %(zona)s AS ditarik_capil,
   r.ditarik_pada  AT TIME ZONE %(zona)s AS ditarik_finance
 FROM kunci k
@@ -169,13 +194,20 @@ HEADER = {
     "SIMPANAN POKOK":    ["pokok"],
     "SIMPANAN SUKARELA": ["sukarela"],
     "TOTAL KONTRIBUSI":  ["kontribusi"],
+    "PEMBULATAN SIMPANAN WAJIB":    ["pemb_wajib"],
+    "PEMBULATAN SIMPANAN SUKARELA": ["pemb_sukarela"],
+    "PEMBULATAN CAD BULAN INI":     ["pemb_cad"],
     "TOTAL SETOR":       ["setor"],
     "CAD BULAN INI":     ["cad"],
     "AKUMULASI CAD":     ["akumulasi_cad"],
     "JUMLAH PETUGAS":    ["petugas"],
 }
 NILAI = [n for daftar in HEADER.values() for n in daftar]
-UANG = {"wajib", "pokok", "sukarela", "kontribusi", "setor", "cad", "akumulasi_cad"}
+UANG = {"wajib", "pokok", "sukarela", "kontribusi", "pemb_wajib", "pemb_sukarela",
+        "pemb_cad", "setor", "cad", "akumulasi_cad"}
+# Nilai berjalan (saldo), bukan arus sebulan: total beberapa bulan = nilai
+# bulan terakhir, bukan jumlahnya.
+SALDO = {"akumulasi_cad"}
 
 KOL_JUDUL_BULAN = "A2"    # baris kedua judul (merge selebar tabel), kosong di template
 LABEL_HEADER    = "NAMA KOPERASI"   # kolom A baris header tabel atas
@@ -225,12 +257,42 @@ def _nilai_baris(rec: dict, akumulasi: float) -> dict:
     """Nilai satu baris (kunci = nama di HEADER), termasuk kolom turunan."""
     n = {k: rs._angka(rec.get(k)) for k in
          ("tunai", "aktif_1", "aktif_2", "aktif_3", "petugas")}
-    for k in ("wajib", "pokok", "sukarela", "setor", "cad"):
+    for k in ("wajib", "pokok", "sukarela", "pemb_wajib", "pemb_sukarela", "pemb_cad", "cad"):
         n[k] = _uang(rec.get(k))
     n["total_anggota"] = n["aktif_1"] + n["aktif_2"] + n["aktif_3"]
     n["kontribusi"] = round(n["wajib"] + n["pokok"] + n["sukarela"], 2)
+    n["setor"] = round(n["pemb_wajib"] + n["pemb_sukarela"] + n["pemb_cad"], 2)
     n["akumulasi_cad"] = round(akumulasi, 2)
     return n
+
+
+def susun_per_bulan(data: dict, kantor: list, tahun: int) -> dict:
+    """
+    {bulan di `tahun`: {kantor: nilai_baris}} dari hasil ambil_data().
+
+    AKUMULASI CAD per kantor dijumlah berurutan dari bulan pertama di `data`
+    (= bulan tarikan finance pertama, menyeberang tahun bila perlu). Tiap
+    bulan menyumbang CAD dari tarikan TERAKHIR bulan itu (SQL sudah memilih
+    tarikan terakhir sebelum awal bulan berikutnya), dan hanya bila tarikan itu
+    memang dari bulan itu: kantor tanpa tarikan baru memakai potret bulan lalu
+    (seperti kolom lain), tapi CAD-nya bukan uang baru — kalau ditambahkan lagi,
+    akumulasinya terhitung dua kali.
+    """
+    akumulasi = {k: 0.0 for k in kantor}
+    per_bulan = {}
+    for (t, b) in sorted(data):
+        isi = {}
+        for k in kantor:
+            rec = data[(t, b)].get(k)
+            if rec is None:
+                continue
+            waktu = rec.get("ditarik_finance")
+            if waktu is not None and (waktu.year, waktu.month) == (t, b):
+                akumulasi[k] += _uang(rec.get("cad"))
+            isi[k] = _nilai_baris(rec, akumulasi[k])
+        if t == tahun:
+            per_bulan[b] = isi
+    return per_bulan
 
 
 def _cari_baris(ws, label: str, mulai: int) -> int:
@@ -303,26 +365,7 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
         if kode:
             kantor_template[kode] = baris
 
-    # Semua bulan berurutan: akumulasi CAD per kantor berjalan dari bulan
-    # tarikan pertama, menyeberang tahun bila perlu.
-    akumulasi = {k: 0.0 for k in kantor_template}
-    per_bulan = {}      # bulan di tahun laporan → {kantor: nilai_baris}
-    for (t, b) in sorted(data):
-        isi = {}
-        for kantor in kantor_template:
-            rec = data[(t, b)].get(kantor)
-            if rec is None:
-                continue
-            # Hanya tarikan finance dari bulan itu sendiri yang menambah
-            # akumulasi. Kantor tanpa tarikan baru memakai potret bulan lalu
-            # (seperti kolom lain), tapi CAD-nya bukan uang baru — kalau
-            # ditambahkan lagi, akumulasinya terhitung dua kali.
-            waktu = rec.get("ditarik_finance")
-            if waktu is not None and (waktu.year, waktu.month) == (t, b):
-                akumulasi[kantor] += _uang(rec.get("cad"))
-            isi[kantor] = _nilai_baris(rec, akumulasi[kantor])
-        if t == tahun:
-            per_bulan[b] = isi
+    per_bulan = susun_per_bulan(data, list(kantor_template), tahun)
 
     # Tabel atas: bulan laporan per kantor.
     ini = per_bulan.get(bulan, {})
@@ -350,7 +393,9 @@ def bangun_laporan(bulan: int, tahun: int) -> tuple:
         _tulis(ws, kolom, baris, sebulan)
         total_bulan[baris] = sebulan
         for nama, v in sebulan.items():
-            total_bawah[nama] += v
+            # Saldo (AKUMULASI CAD): bulan terakhir yang terisi, bukan jumlah
+            # semua bulan — menjumlah saldo bulanan menghitung CAD berkali-kali.
+            total_bawah[nama] = v if nama in SALDO else total_bawah[nama] + v
     _tulis(ws, kolom, baris_total_bawah, total_bawah)
 
     _tambah_grafik(ws, kolom, bulan, tahun, total_bulan, baris_total_bawah + 2,

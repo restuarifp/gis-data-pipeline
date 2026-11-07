@@ -230,13 +230,19 @@ a builder needs `laporan_aktif()` and `bangun_laporan(bulan, tahun)`).
   table is the report month per office, the bottom table is all-office totals per month
   of that year (later months stay empty).
 - Columns: NASABAH TUNAI = `SUM(TUNAI_IFQ)` from rincian; NASABAH AKTIF 1/2/3 = capil rows per K; WAJIB/POKOK/SUKARELA = rekap `NOMINAL IFQ/ZKT/SDQ`
-  `total_100_persen`; TOTAL SETOR = `SUM(disetor)` over all rekap rows except `TOTAL`;
+  `total_100_persen`; PEMBULATAN SIMPANAN WAJIB = rekap `pembulatan_setor` summed over
+  `NOMINAL IFQ, SDQ, FDY, AQQ, FI, LQT, SNK, TDY, ZF` (`JENIS_PEMBULATAN_WAJIB`);
+  PEMBULATAN SIMPANAN SUKARELA = `NOMINAL SDQ` `pembulatan_setor` (SDQ is in both, by
+  request); PEMBULATAN CAD BULAN INI = `CAD` `pembulatan_setor`; TOTAL SETOR = the three
+  PEMBULATAN columns added;
   CAD = rekap `CAD` (trimmed — the file has `'CAD '`) `disetor`; JUMLAH PETUGAS = capil
   pengurus (LMG not PRA/PJ%/KPJ%).
-- **AKUMULASI CAD** is recomputed from the warehouse, not archived: running sum of CAD over
-  months whose finance pull is *from that month*. An office reusing an older pull shows
-  that pull's CAD BULAN INI but does not add it again. Accuracy depends on finance raw
-  tables never being reset.
+- **AKUMULASI CAD** is recomputed from the warehouse, not archived (`susun_per_bulan`):
+  running sum of CAD BULAN INI from the first finance pull's month, one value per month =
+  the month's *latest* pull, counted only if that pull is *from that month*. An office
+  reusing an older pull shows that pull's CAD BULAN INI but does not add it again. In the
+  bottom table's TOTAL row it is the last filled month (a balance), not the sum of months.
+  Accuracy depends on finance raw tables never being reset. Tests: `tests/test_report_finance.py`.
 - **Columns are found by their row-4 header text** (`HEADER` in `report_finance.py`), and
   rows by column-A labels (office codes, `TOTAL`, `BULAN`, month names), so columns can be
   moved and offices added without code changes. A missing header, or a merged header
