@@ -106,6 +106,22 @@ class TestAkumulasiCad(unittest.TestCase):
         self.assertEqual(rf.bulan_tarikan(datetime(2027, 1, 10)), (2026, 12))
         self.assertIn("%(geser)s * INTERVAL '1 day'", rf.SQL)
 
+    def test_rekap_bulanan_tanggal_tutup_sama(self):
+        # Rekap Bulanan dan Laporan Keuangan harus memotret bulan yang sama.
+        rs = rf.rs
+        self.assertIs(rf.bulan_tarikan, rs.bulan_tarikan)
+        self.assertEqual(rs.TANGGAL_TUTUP, 25)
+        # Kolom CAD Rekap tidak boleh bergantung pada spasi 'CAD '.
+        self.assertIn("upper(trim(jenis)) = 'CAD'", rs.SQL)
+        self.assertNotIn("IN ('CAD ')", rs.SQL)
+        catatan = rs._catatan_tarikan(
+            {"C3": {"ditarik_capil": datetime(2026, 11, 1), "ditarik_finance": datetime(2026, 11, 3)},
+             "C1": {"ditarik_capil": datetime(2026, 9, 30), "ditarik_finance": datetime(2026, 10, 1)}},
+            10, 2026)
+        self.assertEqual(len(catatan), 1)
+        self.assertIn("C1 capil 2026-09-30", catatan[0])
+        self.assertNotIn("C3", catatan[0])
+
     def test_saldo_awal_tanpa_tarikan_bulan_itu(self):
         feb = _rec(300, datetime(2026, 2, 28))
         pb = rf.susun_per_bulan({(2026, 2): {"A1": feb}, (2026, 3): {"A1": feb}},

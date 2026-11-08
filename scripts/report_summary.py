@@ -19,10 +19,10 @@ tarikan Airbyte (koneksinya memakai mode Append), lalu untuk tiap kantor dan
 tiap sumber memilih tarikan terakhir yang terjadi sebelum bulan berikutnya
 dimulai (zona waktu REPORT_TIMEZONE). Konsekuensinya:
 
-  * Laporan bulan X adalah potret data seperti pada akhir bulan X. Sync yang
-    terlambat (mis. data Agustus baru ditarik 2 September) masuk ke bulan
-    tarikannya, bukan bulan datanya.
-  * Kantor yang belum punya tarikan sebelum akhir bulan itu tidak punya data.
+  * Laporan bulan X = tarikan terakhir SEBELUM tanggal TANGGAL_TUTUP (default
+    25) bulan X+1 — sama dengan Laporan Keuangan (report_finance). Isian atau
+    koreksi data bulan X yang ditarik 1-24 bulan berikutnya ikut ke bulan X.
+  * Kantor yang belum punya tarikan sebelum tanggal tutup itu tidak punya data.
     Kantor yang tarikan terakhirnya jatuh di bulan sebelumnya memakai tarikan
     lama itu — keduanya disebut di catatan (log relay).
   * Pengecualian: DAKWAH HASIL (kolom X) dihitung dari tarikan capil
@@ -50,7 +50,9 @@ Konfigurasi via environment:
   REPORT_VIEW_HIST_CAPIL           (default hist_capil)
   REPORT_VIEW_HIST_FINANCE_REKAP   (default hist_finance_rekap)
   REPORT_VIEW_HIST_FINANCE_RINCIAN (default hist_finance_rincian)
-  REPORT_TIMEZONE     (default Asia/Jakarta) -- batas "akhir bulan" tarikan
+  REPORT_TIMEZONE     (default Asia/Jakarta) -- zona jam tanggal tutup
+  REPORT_CUTOFF_DAY   (default 25; 1-28) -- tanggal tutup bulan laporan di bulan
+                      berikutnya (nama lama: REPORT_FINANCE_CUTOFF_DAY)
   REPORT_TEMPLATE     (default docs/template/summary.xlsx di sebelah modul ini)
   REPORT_HISTORY_DIR  (default /data/laporan) -- arsip potret bulanan
 """
@@ -59,7 +61,7 @@ import io
 import json
 import logging
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -101,6 +103,23 @@ VIEW_REKAP      = os.getenv("REPORT_VIEW_HIST_FINANCE_REKAP", "hist_finance_reka
 VIEW_RINCIAN    = os.getenv("REPORT_VIEW_HIST_FINANCE_RINCIAN", "hist_finance_rincian")
 ZONA_WAKTU      = os.getenv("REPORT_TIMEZONE", "Asia/Jakarta")
 
+# Tanggal tutup, dipakai Rekap Bulanan DAN Laporan Keuangan: data bulan X =
+# tarikan terakhir SEBELUM tanggal ini di bulan X+1 (jam lokal), supaya
+# isian/koreksi file bulan X yang masuk awal bulan berikutnya ikut ke laporan
+# bulan X. Tarikan pada waktu t "milik" bulan X bila t jatuh di
+# [tgl TUTUP bulan X, tgl TUTUP bulan X+1). REPORT_FINANCE_CUTOFF_DAY = nama lama.
+TANGGAL_TUTUP = int(os.getenv("REPORT_CUTOFF_DAY",
+                              os.getenv("REPORT_FINANCE_CUTOFF_DAY", "25")))
+if not 1 <= TANGGAL_TUTUP <= 28:
+    raise ValueError(f"REPORT_CUTOFF_DAY harus 1-28, bukan {TANGGAL_TUTUP}")
+GESER_HARI = TANGGAL_TUTUP - 1
+
+
+def bulan_tarikan(waktu) -> tuple:
+    """(tahun, bulan) laporan yang memiliki tarikan pada `waktu` (jam lokal)."""
+    t = waktu - timedelta(days=GESER_HARI)
+    return t.year, t.month
+
 TEMPLATE = Path(os.getenv(
     "REPORT_TEMPLATE",
     Path(__file__).resolve().parent.parent / "docs" / "template" / "summary.xlsx",
@@ -125,8 +144,8 @@ def _q(nama: str) -> str:
 
 def _potret(view: str) -> str:
     """
-    Isi satu view riwayat pada akhir bulan laporan: per kantor, tarikan terakhir
-    yang ditarik sebelum %(batas)s (awal bulan berikutnya, jam lokal).
+    Isi satu view riwayat untuk bulan laporan: per kantor, tarikan terakhir
+    yang ditarik sebelum %(batas)s (tgl TANGGAL_TUTUP bulan berikutnya, jam lokal).
 
     Dipilih lewat tarikan_id (= _airbyte_generation_id), bukan per baris:
     satu tarikan bisa punya _airbyte_extracted_at yang berbeda antar baris.
@@ -143,7 +162,7 @@ def _potret(view: str) -> str:
 
 
 # Query rekap. Sama dengan pertanyaan yang dipakai di Metabase, kecuali:
-#  * sumbernya potret akhir bulan dari view riwayat (CTE capil/rekap/rincian),
+#  * sumbernya potret per tanggal tutup dari view riwayat (CTE capil/rekap/rincian),
 #    bukan staging yang hanya berisi tarikan terakhir;
 #  * CTE `rekrut` memakai parameter %(bulan)s / %(tahun)s alih-alih
 #    CURRENT_DATE - 1 bulan, supaya laporan bulan mana pun bisa diminta. Ia
@@ -230,14 +249,14 @@ WITH
   ),
   income_ip AS (
     SELECT kantor_id,
-      SUM(CASE WHEN jenis IN {JENIS_IP} THEN total_100_persen ELSE 0 END)
+      SUM(CASE WHEN upper(trim(jenis)) IN {JENIS_IP} THEN total_100_persen ELSE 0 END)
         AS ip_penerimaan_100_persen
     FROM rekap
     GROUP BY kantor_id
   ),
   transfer_ip AS (
     SELECT kantor_id,
-      SUM(CASE WHEN jenis IN {JENIS_IP} THEN pembulatan_setor ELSE 0 END)
+      SUM(CASE WHEN upper(trim(jenis)) IN {JENIS_IP} THEN pembulatan_setor ELSE 0 END)
         AS ip_terima_dpp
     FROM rekap
     GROUP BY kantor_id
@@ -249,14 +268,15 @@ WITH
   ),
   transfer_sd AS (
     SELECT kantor_id,
-      SUM(CASE WHEN jenis IN ('NOMINAL ZKT') THEN pembulatan_setor ELSE 0 END)
+      SUM(CASE WHEN upper(trim(jenis)) = 'NOMINAL ZKT' THEN pembulatan_setor ELSE 0 END)
         AS sd_terima_dpp
     FROM rekap
     GROUP BY kantor_id
   ),
   cadangan AS (
     SELECT kantor_id,
-      SUM(CASE WHEN jenis IN ('CAD ') THEN pembulatan_setor ELSE 0 END) AS cad
+      -- trim: file finance menulis 'CAD ' (spasi di belakang); jangan bergantung padanya.
+      SUM(CASE WHEN upper(trim(jenis)) = 'CAD' THEN pembulatan_setor ELSE 0 END) AS cad
     FROM rekap
     GROUP BY kantor_id
   ),
@@ -276,7 +296,7 @@ WITH
   ),
   transfer_lainnya AS (
     SELECT kantor_id,
-      SUM(CASE WHEN jenis IN ('NOMINAL ZF','NOMINAL TDY') THEN pembulatan_setor
+      SUM(CASE WHEN upper(trim(jenis)) IN ('NOMINAL ZF','NOMINAL TDY') THEN pembulatan_setor
                ELSE 0 END) AS lainnya_terima_dpp
     FROM rekap
     GROUP BY kantor_id
@@ -429,13 +449,13 @@ def _angka(nilai):
 
 def ambil_data(bulan: int, tahun: int) -> dict:
     """Jalankan query rekap; kembalikan {kantor_id: {kolom: nilai}}."""
-    # Awal bulan berikutnya: tarikan sebelum titik ini = potret akhir bulan laporan.
+    # Tanggal tutup bulan berikutnya: tarikan sebelum titik ini = data bulan laporan.
     b_depan, t_depan = _bulan_sesudah(bulan, tahun)
     try:
         with psycopg2.connect(connect_timeout=10, **DB) as conn, conn.cursor() as cur:
             cur.execute(SQL, {
                 "bulan": bulan, "tahun": tahun, "zona": ZONA_WAKTU,
-                "batas": date(t_depan, b_depan, 1).isoformat(),
+                "batas": date(t_depan, b_depan, TANGGAL_TUTUP).isoformat(),
             })
             nama_kolom = [d[0] for d in cur.description]
             baris = cur.fetchall()
@@ -465,9 +485,10 @@ def _bulan_sesudah(bulan: int, tahun: int) -> tuple:
 
 def _catatan_tarikan(data: dict, bulan: int, tahun: int) -> list:
     """
-    Sebut kantor yang potretnya tidak berasal dari bulan laporan: tarikan
-    terakhirnya sebelum akhir bulan itu jatuh di bulan yang lebih awal, atau
-    finance-nya belum pernah ditarik sama sekali sampai saat itu.
+    Sebut kantor yang potretnya bukan milik bulan laporan (bulan_tarikan):
+    tarikan terakhirnya sebelum tanggal tutup jatuh di periode lebih awal, atau
+    finance-nya belum pernah ditarik sama sekali sampai saat itu. Dipakai juga
+    oleh report_finance.
     """
     lama, tanpa_finance = [], []
     for kantor, rec in sorted(data.items()):
@@ -476,16 +497,17 @@ def _catatan_tarikan(data: dict, bulan: int, tahun: int) -> list:
             if waktu is None:
                 if kunci == "ditarik_finance":
                     tanpa_finance.append(kantor)
-            elif (waktu.year, waktu.month) != (tahun, bulan):
+            elif bulan_tarikan(waktu) != (tahun, bulan):
                 lama.append(f"{kantor} {label} {waktu:%Y-%m-%d}")
         log.info("Laporan %s-%02d: %s memakai tarikan capil %s, finance %s.",
                  tahun, bulan, kantor, rec.get("ditarik_capil"), rec.get("ditarik_finance"))
     catatan = []
     if lama:
-        catatan.append(f"Tidak ada tarikan di {BULAN_SINGKAT[bulan]} {tahun}, "
-                       f"memakai tarikan lebih lama: " + ", ".join(lama))
+        catatan.append(f"Tidak ada tarikan untuk {BULAN_SINGKAT[bulan]} {tahun} "
+                       f"(s.d. tgl {TANGGAL_TUTUP} bulan berikutnya), memakai tarikan "
+                       "lebih lama: " + ", ".join(lama))
     if tanpa_finance:
-        catatan.append("Belum ada tarikan finance sampai akhir bulan itu: "
+        catatan.append("Belum ada tarikan finance sampai tanggal tutup: "
                        + ", ".join(tanpa_finance))
     return catatan
 
