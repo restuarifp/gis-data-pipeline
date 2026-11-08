@@ -73,27 +73,38 @@ class TestAkumulasiCad(unittest.TestCase):
         self.assertEqual(pb[4]["A1"]["akumulasi_cad"], 350)
 
     def test_per_kantor_terpisah(self):
-        data = {(2026, 1): {"A1": _rec(10, datetime(2026, 1, 5)),
-                            "B2": _rec(1, datetime(2026, 1, 6))},
-                (2026, 2): {"A1": _rec(20, datetime(2026, 2, 5))}}
+        data = {(2026, 1): {"A1": _rec(10, datetime(2026, 1, 26)),
+                            "B2": _rec(1, datetime(2026, 1, 27))},
+                (2026, 2): {"A1": _rec(20, datetime(2026, 2, 26))}}
         pb = rf.susun_per_bulan(data, ["A1", "B2"], 2026)
         self.assertEqual(pb[2]["A1"]["akumulasi_cad"], 30)
         self.assertNotIn("B2", pb[2])
 
     def test_data_prod_c1(self):
-        # Prod C1: saldo awal (generation 0) 62.245.000, lalu PEMBULATAN CAD
-        # tarikan terakhir tiap bulan. Tarikan 1 Okt (1.405.000) tergantikan
-        # tarikan 30 Okt (1.420.000). Angka acuan pengguna: 67.835.000.
+        # Prod C1 dengan tanggal tutup 25: saldo awal (generation 0)
+        # 62.245.000, lalu PEMBULATAN CAD tarikan terakhir sebelum tgl 25
+        # bulan berikutnya: Jul <- 8 Agu (1.300.000), Agu <- 4 Sep (1.450.000),
+        # Sep <- 1 Okt (1.405.000, koreksi atas 30 Sep), Okt <- 1 Nov (1.420.000).
         c1 = lambda cad, pemb, w: _rec(cad, w, pemb_cad=pemb)  # noqa: E731
+        nov1 = c1(1_391_103, 1_420_000, datetime(2026, 11, 1, 0, 33))
         data = {
-            (2026, 8):  {"C1": c1(1_278_396, 1_300_000, datetime(2026, 8, 8, 7, 14))},
-            (2026, 9):  {"C1": c1(1_424_756.25, 1_450_000, datetime(2026, 9, 30, 12, 1))},
-            (2026, 10): {"C1": c1(1_391_103, 1_420_000, datetime(2026, 10, 30, 20, 32))},
-            (2026, 11): {"C1": c1(1_391_103, 1_420_000, datetime(2026, 11, 1, 0, 33))},
+            (2026, 7):  {"C1": c1(1_278_396, 1_300_000, datetime(2026, 8, 8, 7, 14))},
+            (2026, 8):  {"C1": c1(1_424_756.25, 1_450_000, datetime(2026, 9, 4, 19, 48))},
+            (2026, 9):  {"C1": c1(1_403_001, 1_405_000, datetime(2026, 10, 1, 9, 31))},
+            (2026, 10): {"C1": nov1},
+            (2026, 11): {"C1": nov1},       # belum ada tarikan sejak 25 Nov
         }
         pb = rf.susun_per_bulan(data, ["C1"], 2026, {"C1": 62_245_000})
-        self.assertEqual(pb[10]["C1"]["akumulasi_cad"], 66_415_000)
-        self.assertEqual(pb[11]["C1"]["akumulasi_cad"], 67_835_000)
+        self.assertEqual(pb[10]["C1"]["akumulasi_cad"], 67_820_000)
+        self.assertEqual(pb[11]["C1"]["akumulasi_cad"], 67_820_000)
+
+    def test_bulan_tarikan_tanggal_tutup(self):
+        self.assertEqual(rf.TANGGAL_TUTUP, 25)
+        self.assertEqual(rf.bulan_tarikan(datetime(2026, 11, 3, 20, 45)), (2026, 10))
+        self.assertEqual(rf.bulan_tarikan(datetime(2026, 11, 24, 23, 59)), (2026, 10))
+        self.assertEqual(rf.bulan_tarikan(datetime(2026, 11, 25, 0, 0)), (2026, 11))
+        self.assertEqual(rf.bulan_tarikan(datetime(2027, 1, 10)), (2026, 12))
+        self.assertIn("%(geser)s * INTERVAL '1 day'", rf.SQL)
 
     def test_saldo_awal_tanpa_tarikan_bulan_itu(self):
         feb = _rec(300, datetime(2026, 2, 28))
@@ -103,7 +114,7 @@ class TestAkumulasiCad(unittest.TestCase):
         self.assertEqual(pb[3]["A1"]["akumulasi_cad"], 1300)
 
     def test_akumulasi_pakai_pembulatan_bukan_disetor(self):
-        pb = rf.susun_per_bulan({(2026, 1): {"A1": _rec(99.5, datetime(2026, 1, 9),
+        pb = rf.susun_per_bulan({(2026, 1): {"A1": _rec(99.5, datetime(2026, 1, 26),
                                                         pemb_cad=100)}}, ["A1"], 2026)
         self.assertEqual(pb[1]["A1"]["akumulasi_cad"], 100)
 

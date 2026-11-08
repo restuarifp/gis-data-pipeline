@@ -225,7 +225,7 @@ and send it with `sendDocument`. Delivery, password, locking and the empty capti
 shared with the Rekap Bulanan (`LAPORAN` in `notif_relay.py` maps `jenis` → builder module;
 a builder needs `laporan_aktif()` and `bangun_laporan(bulan, tahun)`).
 
-- Same snapshot rule and `hist_*` views as the Rekap Bulanan. One query returns
+- Same `hist_*` views as the Rekap Bulanan, but a different snapshot cutoff (see below). One query returns
   per-(month, office) rows from the first finance pull up to the report month; the top
   table is the report month per office, the bottom table is all-office totals per month
   of that year (later months stay empty).
@@ -237,14 +237,19 @@ a builder needs `laporan_aktif()` and `bangun_laporan(bulan, tahun)`).
   32,000,000 + 1,480,000 + 1,420,000 = 34,900,000);
   CAD = rekap `CAD` (trimmed — the file has `'CAD '`) `disetor`; JUMLAH PETUGAS = capil
   pengurus (LMG not PRA/PJ%/KPJ%).
+- **Cutoff day (not end of month)**: month X = each office's latest pull before the
+  **25th of month X+1** (`REPORT_FINANCE_CUTOFF_DAY`, local time), for every column — late
+  fills/corrections of month X's Excel made early in X+1 count for X. A pull at time t
+  belongs to month `bulan_tarikan(t)` = month of (t − 24 days). The Rekap Bulanan
+  (`report_summary.py`) keeps the end-of-month rule.
 - **AKUMULASI CAD** is recomputed from the warehouse, not archived (`susun_per_bulan`):
   opening balance + running sum of **PEMBULATAN CAD** (not DISETOR) from the first finance
   pull's month, one value per month = the month's *latest* pull, counted only if that pull
-  is *from that month*. Opening balance (`ambil_saldo_awal`) = `PEMBULATAN_SETOR` of the
+  *belongs to that month* (25th X … 24th X+1). Opening balance (`ambil_saldo_awal`) = `PEMBULATAN_SETOR` of the
   `CAD` row in generation 0 (`_airbyte_extracted_at` = epoch) of each
   `raw_finance_rekap_<k>` (schema `REPORT_RAW_SCHEMA`, default `public`) — read from raw
-  because `hist_pulls` drops epoch rows. C1: 62,245,000 + 1,300,000 (Aug) + 1,450,000 (Sep)
-  + 1,420,000 (Oct) + 1,420,000 (Nov) = 67,835,000. **Never delete generation 0** from the
+  because `hist_pulls` drops epoch rows. C1 (Oct 2026 report): 62,245,000 + 1,300,000 (Jul)
+  + 1,450,000 (Aug) + 1,405,000 (Sep) + 1,420,000 (Oct) = 67,820,000. **Never delete generation 0** from the
   finance rekap tables. An office reusing an older pull shows that pull's CAD but does not
   add it again. In the bottom table's TOTAL row it is the last filled month (a balance),
   not the sum of months. Tests: `tests/test_report_finance.py`.
