@@ -9,10 +9,9 @@ per bulan (Januari s.d. bulan laporan, tahun yang sama).
 Dipakai oleh notif_relay.py: perintah /keuangan dan tombol "Laporan keuangan"
 di Mini App memanggil bangun_laporan(), lalu hasilnya dikirim ke Telegram
 sebagai dokumen — sama seperti Rekap Bulanan (report_summary.py), dari view
-`hist_*`, bukan staging. BEDA dengan Rekap Bulanan: data bulan X adalah
-tarikan terakhir sebelum tanggal TANGGAL_TUTUP (default 25) bulan X+1, bukan
-sebelum akhir bulan X — isian/koreksi file finance bulan X yang masuk awal
-bulan berikutnya ikut terhitung.
+`hist_*`, bukan staging, dan aturan potret yang sama: data bulan X adalah
+tarikan terakhir sebelum tanggal TANGGAL_TUTUP (default 25) bulan X+1 —
+isian/koreksi file bulan X yang masuk awal bulan berikutnya ikut terhitung.
 
 Isi kolom (per kantor, per bulan). Kolom dicari dari judulnya di baris header
 (HEADER), bukan dari hurufnya — template yang kolomnya digeser tetap terisi
@@ -54,14 +53,14 @@ Konfigurasi: sama dengan report_summary.py (REPORT_DB_*, REPORT_SCHEMA,
 REPORT_VIEW_HIST_*, REPORT_TIMEZONE, REPORT_XLSX_PASSWORD), ditambah
   REPORT_FINANCE_TEMPLATE  (default docs/template/monthly-finance-report.xlsx)
   REPORT_RAW_SCHEMA        (default public; tabel raw_finance_rekap_<k>)
-  REPORT_FINANCE_CUTOFF_DAY (default 25; 1-28) tanggal tutup bulan laporan
+  (tanggal tutup: REPORT_CUTOFF_DAY di report_summary.py)
 """
 
 import io
 import logging
 import os
 import re
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
 import report_summary as rs
@@ -102,20 +101,11 @@ def _daftar_sql(daftar) -> str:
     return ", ".join("'" + s.replace("'", "''") + "'" for s in daftar)
 
 
-# Tanggal tutup buku: data bulan X = tarikan terakhir SEBELUM tanggal ini di
-# bulan X+1 (jam lokal). Isian/koreksi file finance bulan X yang masuk awal
-# bulan berikutnya ikut ke laporan bulan X. Tarikan pada waktu t "milik"
-# bulan X bila t jatuh di [TUTUP bulan X, TUTUP bulan X+1).
-TANGGAL_TUTUP = int(os.getenv("REPORT_FINANCE_CUTOFF_DAY", "25"))
-if not 1 <= TANGGAL_TUTUP <= 28:
-    raise ValueError(f"REPORT_FINANCE_CUTOFF_DAY harus 1-28, bukan {TANGGAL_TUTUP}")
-GESER_HARI = TANGGAL_TUTUP - 1
-
-
-def bulan_tarikan(waktu) -> tuple:
-    """(tahun, bulan) laporan yang memiliki tarikan pada `waktu` (jam lokal)."""
-    t = waktu - timedelta(days=GESER_HARI)
-    return t.year, t.month
+# Tanggal tutup (tgl 25 bulan X+1) didefinisikan sekali di report_summary,
+# supaya Rekap Bulanan dan Laporan Keuangan memotret bulan yang sama.
+TANGGAL_TUTUP = rs.TANGGAL_TUTUP
+GESER_HARI = rs.GESER_HARI
+bulan_tarikan = rs.bulan_tarikan
 
 
 def _pilih(tarikan: str) -> str:
@@ -657,36 +647,9 @@ def _tambah_grafik(ws, kolom: dict, bulan: int, tahun: int, total_bulan: dict,
     ws.print_area = f"A1:{get_column_letter(akhir)}{baris_grafik + TINGKAT[-1][1] + 1}"
 
 
-def _catatan_tarikan(data: dict, bulan: int, tahun: int) -> list:
-    """
-    Seperti report_summary._catatan_tarikan, tapi memakai bulan tarikan
-    menurut TANGGAL_TUTUP (bulan_tarikan), bukan bulan kalender.
-    """
-    lama, tanpa_finance = [], []
-    for kantor, rec in sorted(data.items()):
-        for label, kunci in (("capil", "ditarik_capil"), ("finance", "ditarik_finance")):
-            waktu = rec.get(kunci)
-            if waktu is None:
-                if kunci == "ditarik_finance":
-                    tanpa_finance.append(kantor)
-            elif bulan_tarikan(waktu) != (tahun, bulan):
-                lama.append(f"{kantor} {label} {waktu:%Y-%m-%d}")
-        log.info("Laporan keuangan %s-%02d: %s memakai tarikan capil %s, finance %s.",
-                 tahun, bulan, kantor, rec.get("ditarik_capil"), rec.get("ditarik_finance"))
-    catatan = []
-    if lama:
-        catatan.append(f"Tidak ada tarikan untuk {NAMA_BULAN[bulan].title()} {tahun} "
-                       f"(s.d. tgl {TANGGAL_TUTUP} bulan berikutnya), memakai tarikan "
-                       "lebih lama: " + ", ".join(lama))
-    if tanpa_finance:
-        catatan.append("Belum ada tarikan finance sampai tanggal tutup: "
-                       + ", ".join(tanpa_finance))
-    return catatan
-
-
 def _catatan(data_bulan: dict, kantor_template: dict, bulan: int, tahun: int) -> list:
     """Hal yang perlu diketahui operator; ditulis ke log relay, bukan ke Telegram."""
-    catatan = _catatan_tarikan(data_bulan, bulan, tahun)
+    catatan = rs._catatan_tarikan(data_bulan, bulan, tahun)
     kosong = sorted(set(kantor_template) - set(data_bulan))
     if kosong:
         catatan.append("Tanpa data di warehouse: " + ", ".join(kosong))

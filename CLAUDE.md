@@ -225,7 +225,7 @@ and send it with `sendDocument`. Delivery, password, locking and the empty capti
 shared with the Rekap Bulanan (`LAPORAN` in `notif_relay.py` maps `jenis` → builder module;
 a builder needs `laporan_aktif()` and `bangun_laporan(bulan, tahun)`).
 
-- Same `hist_*` views as the Rekap Bulanan, but a different snapshot cutoff (see below). One query returns
+- Same `hist_*` views and snapshot cutoff as the Rekap Bulanan (see below). One query returns
   per-(month, office) rows from the first finance pull up to the report month; the top
   table is the report month per office, the bottom table is all-office totals per month
   of that year (later months stay empty).
@@ -237,11 +237,12 @@ a builder needs `laporan_aktif()` and `bangun_laporan(bulan, tahun)`).
   32,000,000 + 1,480,000 + 1,420,000 = 34,900,000);
   CAD = rekap `CAD` (trimmed — the file has `'CAD '`) `disetor`; JUMLAH PETUGAS = capil
   pengurus (LMG not PRA/PJ%/KPJ%).
-- **Cutoff day (not end of month)**: month X = each office's latest pull before the
-  **25th of month X+1** (`REPORT_FINANCE_CUTOFF_DAY`, local time), for every column — late
-  fills/corrections of month X's Excel made early in X+1 count for X. A pull at time t
-  belongs to month `bulan_tarikan(t)` = month of (t − 24 days). The Rekap Bulanan
-  (`report_summary.py`) keeps the end-of-month rule.
+- **Cutoff day (not end of month), shared with the Rekap Bulanan**: month X = each
+  office's latest pull before the **25th of month X+1** (`REPORT_CUTOFF_DAY`, old name
+  `REPORT_FINANCE_CUTOFF_DAY`, local time), for every column — late fills/corrections of
+  month X's Excel made early in X+1 count for X. A pull at time t belongs to month
+  `bulan_tarikan(t)` = month of (t − 24 days). Defined once in `report_summary.py`
+  (`TANGGAL_TUTUP`, `bulan_tarikan`, `_catatan_tarikan`); `report_finance` reuses it.
 - **AKUMULASI CAD** is recomputed from the warehouse, not archived (`susun_per_bulan`):
   opening balance + running sum of **PEMBULATAN CAD** (not DISETOR) from the first finance
   pull's month, one value per month = the month's *latest* pull, counted only if that pull
